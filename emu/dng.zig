@@ -1,17 +1,21 @@
 //! DNG (TIFF container) decode: the subset of the format emu needs.
 //!
-//! Supported today: uncompressed (Compression = 1) 16-bit CFA mosaics with
-//! 2x2 Bayer patterns, strip layout, either byte order, and the raw IFD
-//! located through the IFD0 / SubIFD chain. Lossless-JPEG DNG and vendor
-//! formats arrive behind this same interface later (plan.md).
+//! Supported today: 16-bit CFA mosaics with 2x2 Bayer patterns, either byte
+//! order, strip or tile layout, uncompressed (Compression = 1) or lossless
+//! JPEG (Compression = 7 — what real cameras and Adobe DNG Converter
+//! write), the raw IFD located through the IFD0 / SubIFD chain, and
+//! AsShotNeutral from the raw IFD or its IFD0 home. Vendor formats (CR3,
+//! NEF, ARW) arrive behind this same interface later (plan.md, Phase 6).
 //!
 //! Parsing is control plane over untrusted input: malformed input returns
-//! `error.Corrupt` / `error.Unsupported`, never trips an assertion. The
-//! assertions here guard *our* invariants, on data we produced.
+//! `error.Corrupt`, unimplemented features return an `Unsupported*` error
+//! naming what is missing, and nothing trips an assertion. The assertions
+//! here guard *our* invariants, on data we produced.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const image = @import("image.zig");
+const jpeg_lossless = @import("jpeg_lossless.zig");
 
 pub const CfaColor = enum(u8) { red = 0, green = 1, blue = 2 };
 
@@ -34,12 +38,39 @@ pub const SensorData = struct {
     }
 };
 
-pub const Error = error{ Corrupt, Unsupported, OutOfMemory };
+/// Malformed input is `Corrupt`; valid DNG using a feature this decoder
+/// lacks gets an error naming the feature, so "cannot open" self-diagnoses
+/// at the CLI and across the C ABI (both print the error name).
+pub const Error = error{
+    Corrupt,
+    OutOfMemory,
+    /// Compression other than uncompressed (1) or lossless JPEG (7).
+    UnsupportedCompression,
+    /// Neither a strip layout nor a tile layout (or, corruptly, both).
+    UnsupportedLayout,
+    /// Sample storage other than 16 bits per sample, one sample per pixel.
+    UnsupportedBitDepth,
+    /// CFA patterns beyond the 2x2 Bayer family.
+    UnsupportedCfa,
+    /// Per-site black levels that differ within the repeat pattern.
+    UnsupportedBlackLevel,
+    /// Image larger than `image.edge_px_max` on a side.
+    UnsupportedDimensions,
+    /// TIFF structure outside the profile: exotic tag types, IFD chains
+    /// deeper than the walk bound, or no CFA IFD at all.
+    UnsupportedStructure,
+    /// Lossless JPEG features outside DNG's use of it (restart intervals,
+    /// subsampling, arithmetic coding).
+    UnsupportedJpeg,
+};
 
 /// Bounds on the container walk. Every loop below is capped by one of these.
 const ifd_visit_max: u32 = 8;
 const ifd_entries_max: u32 = 512;
-const strips_max: u32 = 4096;
+const segments_max: u32 = 65536;
+/// Cap on one segment's decoded samples (a 256x240 tile is 61k; this is
+/// generous) so a hostile tile size cannot demand gigabytes of scratch.
+const segment_samples_max: u32 = 1 << 26;
 
 const tag_new_subfile_type: u16 = 254;
 const tag_image_width: u16 = 256;
@@ -52,6 +83,10 @@ const tag_samples_per_pixel: u16 = 277;
 const tag_rows_per_strip: u16 = 278;
 const tag_strip_byte_counts: u16 = 279;
 const tag_sub_ifds: u16 = 330;
+const tag_tile_width: u16 = 322;
+const tag_tile_height: u16 = 323;
+const tag_tile_offsets: u16 = 324;
+const tag_tile_byte_counts: u16 = 325;
 const tag_cfa_repeat_dim: u16 = 33421;
 const tag_cfa_pattern: u16 = 33422;
 const tag_black_level: u16 = 50714;
@@ -115,7 +150,7 @@ fn type_size(typ: u16) Error!u32 {
         type_short => 2,
         type_long => 4,
         type_rational, type_srational => 8,
-        else => error.Unsupported,
+        else => error.UnsupportedStructure,
     };
 }
 
@@ -138,7 +173,7 @@ fn value_scalar(r: *const Reader, e: Entry, index: u32) Error!u32 {
         type_byte => (try r.slice(off, 1))[0],
         type_short => try r.read_u16(off),
         type_long => try r.read_u32(off),
-        else => error.Unsupported,
+        else => error.UnsupportedStructure,
     };
 }
 
@@ -161,13 +196,14 @@ fn value_fraction(r: *const Reader, e: Entry, index: u32) Error!f32 {
             return @as(f32, @floatFromInt(numerator)) /
                 @as(f32, @floatFromInt(denominator));
         },
-        else => return error.Unsupported,
+        else => return error.UnsupportedStructure,
     }
 }
 
 fn ifd_parse(r: *const Reader, off: u32) Error!struct { ifd: Ifd, next: u32 } {
     const count = try r.read_u16(off);
-    if (count == 0 or count > ifd_entries_max) return error.Unsupported;
+    if (count == 0) return error.Corrupt;
+    if (count > ifd_entries_max) return error.UnsupportedStructure;
     var ifd = Ifd{ .entries = undefined, .len = count };
     var i: u32 = 0;
     while (i < count) : (i += 1) {
@@ -208,16 +244,20 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!SensorData {
     pending[0] = try r.read_u32(4);
     var visited: u32 = 0;
     var raw: ?Ifd = null;
+    // IFD0 is retained: DNG keeps camera-wide tags (AsShotNeutral) there
+    // even when the raw mosaic lives in a SubIFD.
+    var first: ?Ifd = null;
 
     while (pending_len > 0 and raw == null) {
         visited += 1;
-        if (visited > ifd_visit_max) return error.Unsupported;
+        if (visited > ifd_visit_max) return error.UnsupportedStructure;
         pending_len -= 1;
         const off = pending[pending_len];
         if (off == 0) continue;
 
         const parsed = try ifd_parse(&r, off);
         const ifd = parsed.ifd;
+        if (first == null) first = ifd;
         if (ifd.find(tag_photometric)) |p| {
             if (try value_scalar(&r, p, 0) == photometric_cfa) {
                 raw = ifd;
@@ -237,27 +277,44 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!SensorData {
         }
     }
 
-    const ifd = raw orelse return error.Unsupported;
-    return sensor_from_ifd(gpa, &r, &ifd);
+    const ifd = raw orelse return error.UnsupportedStructure;
+    assert(first != null); // the loop parsed at least the IFD that broke it
+    return sensor_from_ifd(gpa, &r, &ifd, &first.?);
 }
 
-fn sensor_from_ifd(gpa: std.mem.Allocator, r: *const Reader, ifd: *const Ifd) Error!SensorData {
+const compression_none: u32 = 1;
+const compression_lossless_jpeg: u32 = 7;
+
+fn sensor_from_ifd(
+    gpa: std.mem.Allocator,
+    r: *const Reader,
+    ifd: *const Ifd,
+    ifd0: *const Ifd,
+) Error!SensorData {
     const width = try require_scalar(r, ifd, tag_image_width);
     const height = try require_scalar(r, ifd, tag_image_height);
-    if (width == 0 or width > image.edge_px_max) return error.Unsupported;
-    if (height == 0 or height > image.edge_px_max) return error.Unsupported;
+    if (width == 0 or height == 0) return error.Corrupt;
+    if (width > image.edge_px_max) return error.UnsupportedDimensions;
+    if (height > image.edge_px_max) return error.UnsupportedDimensions;
 
-    if (try require_scalar(r, ifd, tag_bits_per_sample) != 16) return error.Unsupported;
-    if (try require_scalar(r, ifd, tag_compression) != 1) return error.Unsupported;
-    if (try scalar_or(r, ifd, tag_samples_per_pixel, 1) != 1) return error.Unsupported;
+    if (try require_scalar(r, ifd, tag_bits_per_sample) != 16) {
+        return error.UnsupportedBitDepth;
+    }
+    if (try scalar_or(r, ifd, tag_samples_per_pixel, 1) != 1) {
+        return error.UnsupportedBitDepth;
+    }
+    const compression = try require_scalar(r, ifd, tag_compression);
+    if (compression != compression_none and compression != compression_lossless_jpeg) {
+        return error.UnsupportedCompression;
+    }
 
     const cfa = try cfa_pattern(r, ifd);
-    const black_level = try fraction_or(r, ifd, tag_black_level, 0.0);
+    const black_level = try black_level_read(r, ifd);
     const white_level: f32 = @floatFromInt(try scalar_or(r, ifd, tag_white_level, 65535));
     if (white_level <= black_level) return error.Corrupt;
-    const wb_neutral = try as_shot_neutral(r, ifd);
+    const wb_neutral = try as_shot_neutral(r, ifd, ifd0);
 
-    const bayer = try bayer_read(gpa, r, ifd, width, height);
+    const bayer = try bayer_read(gpa, r, ifd, width, height, compression);
     errdefer comptime unreachable; // no failure paths after this point
 
     // Postconditions: this is the trust boundary. Everything downstream may
@@ -276,7 +333,7 @@ fn sensor_from_ifd(gpa: std.mem.Allocator, r: *const Reader, ifd: *const Ifd) Er
 }
 
 fn require_scalar(r: *const Reader, ifd: *const Ifd, tag: u16) Error!u32 {
-    const e = ifd.find(tag) orelse return error.Unsupported;
+    const e = ifd.find(tag) orelse return error.UnsupportedStructure;
     return value_scalar(r, e, 0);
 }
 
@@ -285,18 +342,26 @@ fn scalar_or(r: *const Reader, ifd: *const Ifd, tag: u16, default: u32) Error!u3
     return value_scalar(r, e, 0);
 }
 
-fn fraction_or(r: *const Reader, ifd: *const Ifd, tag: u16, default: f32) Error!f32 {
-    const e = ifd.find(tag) orelse return default;
-    return value_fraction(r, e, 0);
+/// BlackLevel may repeat per CFA site; the pipeline models one scalar, so
+/// per-site values are accepted only when they agree.
+fn black_level_read(r: *const Reader, ifd: *const Ifd) Error!f32 {
+    const e = ifd.find(tag_black_level) orelse return 0;
+    if (e.count == 0 or e.count > 16) return error.Corrupt;
+    const first = try value_fraction(r, e, 0);
+    var i: u32 = 1;
+    while (i < e.count) : (i += 1) {
+        if (try value_fraction(r, e, i) != first) return error.UnsupportedBlackLevel;
+    }
+    return first;
 }
 
 fn cfa_pattern(r: *const Reader, ifd: *const Ifd) Error![4]CfaColor {
-    const dims = ifd.find(tag_cfa_repeat_dim) orelse return error.Unsupported;
-    if (try value_scalar(r, dims, 0) != 2) return error.Unsupported;
-    if (try value_scalar(r, dims, 1) != 2) return error.Unsupported;
+    const dims = ifd.find(tag_cfa_repeat_dim) orelse return error.UnsupportedCfa;
+    if (try value_scalar(r, dims, 0) != 2) return error.UnsupportedCfa;
+    if (try value_scalar(r, dims, 1) != 2) return error.UnsupportedCfa;
 
-    const pattern = ifd.find(tag_cfa_pattern) orelse return error.Unsupported;
-    if (pattern.count != 4) return error.Unsupported;
+    const pattern = ifd.find(tag_cfa_pattern) orelse return error.UnsupportedCfa;
+    if (pattern.count != 4) return error.UnsupportedCfa;
     var cfa: [4]CfaColor = undefined;
     var greens: u32 = 0;
     var reds: u32 = 0;
@@ -307,7 +372,7 @@ fn cfa_pattern(r: *const Reader, ifd: *const Ifd) Error![4]CfaColor {
             0 => .red,
             1 => .green,
             2 => .blue,
-            else => return error.Unsupported,
+            else => return error.UnsupportedCfa,
         };
         switch (c.*) {
             .red => reds += 1,
@@ -317,15 +382,17 @@ fn cfa_pattern(r: *const Reader, ifd: *const Ifd) Error![4]CfaColor {
     }
     // A Bayer mosaic is exactly two greens on one diagonal, one red, one
     // blue — equivalently, no row or column of the 2x2 repeats a colour.
-    if (greens != 2 or reds != 1 or blues != 1) return error.Unsupported;
-    if (cfa[0] == cfa[1] or cfa[2] == cfa[3]) return error.Unsupported;
-    if (cfa[0] == cfa[2] or cfa[1] == cfa[3]) return error.Unsupported;
+    if (greens != 2 or reds != 1 or blues != 1) return error.UnsupportedCfa;
+    if (cfa[0] == cfa[1] or cfa[2] == cfa[3]) return error.UnsupportedCfa;
+    if (cfa[0] == cfa[2] or cfa[1] == cfa[3]) return error.UnsupportedCfa;
     return cfa;
 }
 
-fn as_shot_neutral(r: *const Reader, ifd: *const Ifd) Error![3]f32 {
-    const e = ifd.find(tag_as_shot_neutral) orelse return .{ 1, 1, 1 };
-    if (e.count != 3) return error.Unsupported;
+fn as_shot_neutral(r: *const Reader, ifd: *const Ifd, ifd0: *const Ifd) Error![3]f32 {
+    // The raw IFD wins if it carries the tag, but its spec home is IFD0.
+    const e = ifd.find(tag_as_shot_neutral) orelse
+        ifd0.find(tag_as_shot_neutral) orelse return .{ 1, 1, 1 };
+    if (e.count != 3) return error.Corrupt;
     var neutral: [3]f32 = undefined;
     for (&neutral, 0..) |*n, i| {
         n.* = try value_fraction(r, e, @intCast(i));
@@ -334,39 +401,183 @@ fn as_shot_neutral(r: *const Reader, ifd: *const Ifd) Error![3]f32 {
     return neutral;
 }
 
+/// The segment grid: strips are tiles the width of the image in a 1-wide
+/// grid, so one geometry serves both layouts. `source_*` is what a segment
+/// stores (tiles pad the edges; strips clip), `copy_*` is what lands in
+/// the mosaic.
+const Layout = struct {
+    kind: enum { strips, tiles },
+    offsets: Entry,
+    byte_counts: Entry,
+    segment_width: u32,
+    segment_height: u32,
+    across: u32,
+    down: u32,
+
+    fn segment_count(self: *const Layout) u32 {
+        assert(self.across >= 1);
+        assert(self.down >= 1);
+        return self.across * self.down;
+    }
+
+    fn segment(self: *const Layout, index: u32, width: u32, height: u32) Segment {
+        assert(index < self.segment_count());
+        const x = (index % self.across) * self.segment_width;
+        const y = (index / self.across) * self.segment_height;
+        assert(x < width);
+        assert(y < height);
+        const copy_width = @min(self.segment_width, width - x);
+        const copy_height = @min(self.segment_height, height - y);
+        return .{
+            .x = x,
+            .y = y,
+            .copy_width = copy_width,
+            .copy_height = copy_height,
+            .source_width = self.segment_width,
+            // Tiles store full (padded) tiles; strips store exactly the
+            // rows that exist.
+            .source_height = if (self.kind == .tiles) self.segment_height else copy_height,
+        };
+    }
+};
+
+const Segment = struct {
+    x: u32,
+    y: u32,
+    copy_width: u32,
+    copy_height: u32,
+    source_width: u32,
+    source_height: u32,
+};
+
+fn layout_parse(r: *const Reader, ifd: *const Ifd, width: u32, height: u32) Error!Layout {
+    const strip_offsets = ifd.find(tag_strip_offsets);
+    const tile_offsets = ifd.find(tag_tile_offsets);
+    // Exactly one layout: neither is undecodable, both is malformed.
+    if (strip_offsets == null and tile_offsets == null) return error.UnsupportedLayout;
+    if (strip_offsets != null and tile_offsets != null) return error.Corrupt;
+
+    var layout: Layout = undefined;
+    if (strip_offsets) |offsets| {
+        const rows = @min(try scalar_or(r, ifd, tag_rows_per_strip, height), height);
+        if (rows == 0) return error.Corrupt;
+        layout = .{
+            .kind = .strips,
+            .offsets = offsets,
+            .byte_counts = ifd.find(tag_strip_byte_counts) orelse return error.Corrupt,
+            .segment_width = width,
+            .segment_height = rows,
+            .across = 1,
+            .down = (height + rows - 1) / rows,
+        };
+    } else {
+        const tile_width = try require_scalar(r, ifd, tag_tile_width);
+        const tile_height = try require_scalar(r, ifd, tag_tile_height);
+        if (tile_width == 0 or tile_height == 0) return error.Corrupt;
+        if (@as(u64, tile_width) * tile_height > segment_samples_max) {
+            return error.UnsupportedDimensions;
+        }
+        layout = .{
+            .kind = .tiles,
+            .offsets = tile_offsets.?,
+            .byte_counts = ifd.find(tag_tile_byte_counts) orelse return error.Corrupt,
+            .segment_width = tile_width,
+            .segment_height = tile_height,
+            .across = (width + tile_width - 1) / tile_width,
+            .down = (height + tile_height - 1) / tile_height,
+        };
+    }
+    if (layout.segment_count() > segments_max) return error.UnsupportedLayout;
+    if (layout.offsets.count != layout.segment_count()) return error.Corrupt;
+    if (layout.byte_counts.count != layout.segment_count()) return error.Corrupt;
+    return layout;
+}
+
 fn bayer_read(
     gpa: std.mem.Allocator,
     r: *const Reader,
     ifd: *const Ifd,
     width: u32,
     height: u32,
+    compression: u32,
 ) Error![]u16 {
-    const offsets = ifd.find(tag_strip_offsets) orelse return error.Unsupported;
-    const counts = ifd.find(tag_strip_byte_counts) orelse return error.Unsupported;
-    if (offsets.count != counts.count) return error.Corrupt;
-    if (offsets.count == 0 or offsets.count > strips_max) return error.Unsupported;
-
+    const layout = try layout_parse(r, ifd, width, height);
     const sample_count = @as(u64, width) * height;
     const bayer = try gpa.alloc(u16, @intCast(sample_count));
     errdefer gpa.free(bayer);
 
-    var filled: u64 = 0;
-    var strip: u32 = 0;
-    while (strip < offsets.count) : (strip += 1) {
-        const off = try value_scalar(r, offsets, strip);
-        const byte_count = try value_scalar(r, counts, strip);
-        if (byte_count % 2 != 0) return error.Corrupt;
-        const data = try r.slice(off, byte_count);
-        var i: u32 = 0;
-        while (i < byte_count) : (i += 2) {
-            if (filled >= sample_count) return error.Corrupt;
-            bayer[@intCast(filled)] =
-                std.mem.readInt(u16, data[i..][0..2], r.endian);
-            filled += 1;
+    // Lossless JPEG decodes a whole segment (padding included) before the
+    // in-bounds region is copied out; one scratch serves every segment.
+    var scratch: []u16 = &.{};
+    defer gpa.free(scratch);
+    if (compression == compression_lossless_jpeg) {
+        scratch = try gpa.alloc(
+            u16,
+            @as(usize, layout.segment_width) * layout.segment_height,
+        );
+    }
+
+    var index: u32 = 0;
+    while (index < layout.segment_count()) : (index += 1) {
+        const seg = layout.segment(index, width, height);
+        const offset = try value_scalar(r, layout.offsets, index);
+        const byte_count = try value_scalar(r, layout.byte_counts, index);
+        const data = try r.slice(offset, byte_count);
+
+        if (compression == compression_none) {
+            const expected = @as(u64, seg.source_width) * seg.source_height * 2;
+            if (byte_count != expected) return error.Corrupt;
+            segment_copy_raw(bayer, width, seg, data, r.endian);
+        } else {
+            const samples = scratch[0 .. @as(usize, seg.source_width) * seg.source_height];
+            try jpeg_lossless.decode(data, samples, seg.source_width, seg.source_height);
+            segment_copy_decoded(bayer, width, seg, samples);
         }
     }
-    if (filled != sample_count) return error.Corrupt;
+    // The grid covers the image exactly by construction: segment origins
+    // step by segment size and every copy region clips to the border, so
+    // each mosaic site was written exactly once.
     return bayer;
+}
+
+fn segment_copy_raw(
+    bayer: []u16,
+    width: u32,
+    seg: Segment,
+    data: []const u8,
+    endian: std.builtin.Endian,
+) void {
+    assert(data.len == @as(u64, seg.source_width) * seg.source_height * 2);
+    assert(seg.copy_width <= seg.source_width);
+    assert(seg.x + seg.copy_width <= width);
+    var row: u32 = 0;
+    while (row < seg.copy_height) : (row += 1) {
+        const source_base = @as(usize, row) * seg.source_width * 2;
+        const target_base = @as(usize, seg.y + row) * width + seg.x;
+        var column: u32 = 0;
+        while (column < seg.copy_width) : (column += 1) {
+            bayer[target_base + column] = std.mem.readInt(
+                u16,
+                data[source_base + @as(usize, column) * 2 ..][0..2],
+                endian,
+            );
+        }
+    }
+}
+
+fn segment_copy_decoded(bayer: []u16, width: u32, seg: Segment, samples: []const u16) void {
+    assert(samples.len == @as(u64, seg.source_width) * seg.source_height);
+    assert(seg.copy_width <= seg.source_width);
+    assert(seg.x + seg.copy_width <= width);
+    var row: u32 = 0;
+    while (row < seg.copy_height) : (row += 1) {
+        const source_base = @as(usize, row) * seg.source_width;
+        const target_base = @as(usize, seg.y + row) * width + seg.x;
+        @memcpy(
+            bayer[target_base..][0..seg.copy_width],
+            samples[source_base..][0..seg.copy_width],
+        );
+    }
 }
 
 test "truncated and garbage input is Corrupt, never a crash" {
@@ -379,4 +590,66 @@ test "truncated and garbage input is Corrupt, never a crash" {
         error.Corrupt,
         decode(gpa, "II\x2a\x00\xff\xff\xff\xff"),
     );
+}
+
+/// Overwrite one IFD0 entry of a little-endian fixture in place. Tests
+/// know the writer's layout (IFD at offset 8); this keeps negative-space
+/// cases one field away from a valid file instead of hand-built blobs.
+fn test_entry_patch(blob: []u8, tag: u16, payload: u32) void {
+    const count = std.mem.readInt(u16, blob[8..10], .little);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const off = 10 + i * 12;
+        if (std.mem.readInt(u16, blob[off..][0..2], .little) == tag) {
+            std.mem.writeInt(u32, blob[off + 8 ..][0..4], payload, .little);
+            return;
+        }
+    }
+    unreachable; // the fixture writer always emits the tag under test
+}
+
+fn test_entry_retag(blob: []u8, tag: u16, tag_new: u16) void {
+    const count = std.mem.readInt(u16, blob[8..10], .little);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const off = 10 + i * 12;
+        if (std.mem.readInt(u16, blob[off..][0..2], .little) == tag) {
+            std.mem.writeInt(u16, blob[off..][0..2], tag_new, .little);
+            return;
+        }
+    }
+    unreachable;
+}
+
+test "unsupported features fail by name, one field away from valid" {
+    const gpa = std.testing.allocator;
+    const dng_write = @import("dng_write.zig");
+    const bayer = [_]u16{ 100, 200, 300, 400 };
+    const pristine = try dng_write.write(gpa, .{ .width = 2, .height = 2, .bayer = &bayer });
+    defer gpa.free(pristine);
+
+    const cases = [_]struct { tag: u16, payload: u32, expected: Error }{
+        // Deflate-compressed DNG exists in the wild; name it, don't lump it.
+        .{ .tag = tag_compression, .payload = 8, .expected = error.UnsupportedCompression },
+        .{ .tag = tag_bits_per_sample, .payload = 8, .expected = error.UnsupportedBitDepth },
+        .{ .tag = tag_samples_per_pixel, .payload = 3, .expected = error.UnsupportedBitDepth },
+        // Photometric that never becomes CFA: the walk finds no raw IFD.
+        .{ .tag = tag_photometric, .payload = 1, .expected = error.UnsupportedStructure },
+        // A 3x3 repeat pattern (X-Trans territory) is not Bayer.
+        .{ .tag = tag_cfa_repeat_dim, .payload = 3 | (3 << 16), .expected = error.UnsupportedCfa },
+        // Compression 7 whose strip bytes are not a JPEG stream at all.
+        .{ .tag = tag_compression, .payload = 7, .expected = error.Corrupt },
+    };
+    for (cases) |case| {
+        const blob = try gpa.dupe(u8, pristine);
+        defer gpa.free(blob);
+        test_entry_patch(blob, case.tag, case.payload);
+        try std.testing.expectError(case.expected, decode(gpa, blob));
+    }
+
+    // No strip layout and no tile layout leaves nothing to read.
+    const blob = try gpa.dupe(u8, pristine);
+    defer gpa.free(blob);
+    test_entry_retag(blob, tag_strip_offsets, 999);
+    try std.testing.expectError(error.UnsupportedLayout, decode(gpa, blob));
 }

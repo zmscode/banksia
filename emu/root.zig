@@ -7,6 +7,7 @@
 pub const image = @import("image.zig");
 pub const dng = @import("dng.zig");
 pub const dng_write = @import("dng_write.zig");
+pub const jpeg_lossless = @import("jpeg_lossless.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const recipe = @import("recipe.zig");
 pub const png = @import("png.zig");
@@ -15,6 +16,7 @@ test {
     _ = image;
     _ = dng;
     _ = dng_write;
+    _ = jpeg_lossless;
     _ = pipeline;
     _ = recipe;
     _ = png;

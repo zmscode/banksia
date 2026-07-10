@@ -280,10 +280,11 @@ record deviations there in the same commit as the work.
       the interface later). *(deferred: no libraw in the dev environment;
       the pure-Zig DNG path landed first, so the fallback is now the
       native decoder's job to replace, not precede)*
-- [x] Pure-Zig DNG decoder for uncompressed DNG (TIFF container walk,
-      bounded worklist IFD/SubIFD chain, both byte orders, strips).
-      *(lossless-JPEG DNG still to do; untrusted input returns errors,
-      never asserts — fixtures roundtrip via `emu/dng_write.zig`)*
+- [x] Pure-Zig DNG decoder (TIFF container walk, bounded worklist
+      IFD/SubIFD chain, both byte orders, strips and tiles, uncompressed
+      and lossless-JPEG — real-camera DNGs decode). *(untrusted input
+      returns named errors, never asserts — fixtures roundtrip via
+      `emu/dng_write.zig` in all four container shapes)*
 - [x] Pipeline core (`emu/pipeline.zig`): planar `[]f32` image type; op
       stack as `MultiArrayList(Op)`; ops: black point → white balance →
       bilinear demosaic → exposure → tone curve → sRGB encode. *(engine

@@ -64,6 +64,11 @@ const Variant = struct {
     recipe: emu.pipeline.Recipe,
     /// Longest output edge; 0 renders at full resolution (pipeline contract).
     edge_px_max_out: u32 = 0,
+    compression: emu.dng_write.Compression = .none,
+    tile: ?emu.dng_write.Tile = null,
+    /// Container-only variants must render bit-identically to `neutral`:
+    /// the runner enforces it, beyond the baseline hashes.
+    must_match_neutral: bool = false,
 };
 
 const variants = [_]Variant{
@@ -75,6 +80,15 @@ const variants = [_]Variant{
         .name = "preview",
         .recipe = .{ .ops = &emu.recipe.default_ops },
         .edge_px_max_out = 24,
+    },
+    // The same sensor through the real-camera container: lossless JPEG in
+    // a tile grid that clips at every scene's edges.
+    .{
+        .name = "lj-tiled",
+        .recipe = .{ .ops = &emu.recipe.default_ops },
+        .compression = .lossless_jpeg,
+        .tile = .{ .width = 32, .height = 16 },
+        .must_match_neutral = true,
     },
 };
 
@@ -103,8 +117,23 @@ pub fn main(init: std.process.Init) !void {
     var index: usize = 0;
     defer for (results[0..index]) |result| gpa.free(result.name);
     for (scenes) |scene| {
+        var neutral_hash: ?[64]u8 = null;
         for (variants) |variant| {
             results[index] = try case_run(gpa, scene, variant);
+            if (std.mem.eql(u8, variant.name, "neutral")) {
+                neutral_hash = results[index].hash_hex;
+            }
+            // Same sensor, different container: any divergence is a decode
+            // bug, catchable without touching the baseline.
+            if (variant.must_match_neutral and
+                !std.mem.eql(u8, &results[index].hash_hex, &neutral_hash.?))
+            {
+                std.debug.print("FAIL {s}: container changed the pixels\n", .{
+                    results[index].name,
+                });
+                index += 1;
+                return error.GoldenRegression;
+            }
             index += 1;
         }
     }
@@ -138,6 +167,8 @@ fn case_run(gpa: std.mem.Allocator, scene: Scene, variant: Variant) !Result {
         .white_level = white_level,
         .wb_neutral = scene.wb_neutral,
         .bayer = bayer,
+        .compression = variant.compression,
+        .tile = variant.tile,
     });
     defer gpa.free(blob);
 

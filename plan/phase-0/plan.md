@@ -28,20 +28,32 @@ CLI end-to-end verified (`synth` → `render` → valid 512x384 PNG).
 - [x] `emu/dng.zig`: `decode(blob) → SensorData` — Bayer plane, 2x2 CFA
       pattern, black/white levels, as-shot neutral. Bounded worklist walk
       of IFD0/SubIFD chain (no recursion, `ifd_visit_max = 8`), both byte
-      orders, multi-strip, uncompressed 16-bit CFA only.
-- [x] Untrusted input returns `error.Corrupt` / `error.Unsupported`, never
-      asserts; the decoder's postconditions are the trust boundary and are
-      asserted once, on exit.
+      orders, multi-strip, uncompressed 16-bit CFA only. *(post-Phase-1:
+      strip **and tile** layouts behind one segment grid, AsShotNeutral
+      falls back to its IFD0 spec home, per-site BlackLevel accepted when
+      uniform)*
+- [x] Untrusted input returns `error.Corrupt` / named `Unsupported*`
+      errors (compression, layout, bit depth, CFA, dimensions, structure,
+      JPEG feature) — never asserts; "cannot open" self-diagnoses at the
+      CLI and across the ABI. The decoder's postconditions are the trust
+      boundary and are asserted once, on exit.
 - [x] `emu/dng_write.zig`: synthetic little-endian DNG writer for fixtures.
       Write/decode roundtrip is the format's pair assertion; a truncation
-      test covers the negative space.
+      test covers the negative space. *(post-Phase-1: writes all four
+      container shapes — strip/tiled × uncompressed/lossless-JPEG)*
 - [ ] libraw fallback backend — **deferred**: not installable in the dev
       environment, and the native decoder landed first, which inverts the
       bilby strategy: libraw is now an optional *validation oracle* to add
       when packaging allows, not the day-one path. Revisit in Phase 6.
-- [ ] Lossless-JPEG (LJ92) DNG — **deferred to Phase 6** with the native
-      camera decoders; uncompressed DNG (Adobe converter output) covers
-      Phase 1–5 development.
+- [x] Lossless-JPEG (LJ92) DNG — ~~deferred to Phase 6~~ **pulled forward
+      after Phase 1**: real-camera DNGs (Adobe converter default output)
+      are compression 7 in tiles, so "open a real file" needed it now.
+      `emu/jpeg_lossless.zig`: pure-Zig SOF3 decode (all 7 predictors,
+      point transform, 16-bit modulo arithmetic, byte-stuffing) plus a
+      fixture encoder for the pair assertion; golden gains an `lj-tiled`
+      variant that must render bit-identically to `neutral`, enforced by
+      the runner. First real file: a Canon EOS 350D DNG decodes and
+      renders end to end.
 
 ## 3. Pipeline
 
