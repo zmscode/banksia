@@ -27,5 +27,19 @@ jobs:
       - name: Tests (unit + tidy)
         run: zig build test --summary all
 
+      - name: C ABI dylib + header
+        run: zig build lib
+
+      # The Phase 1 hard gate: the whole bk_ surface exercised from plain C
+      # against the debug dylib, whose per-engine debug allocator asserts a
+      # clean leak report on destroy.
+      - name: C ABI smoke + leak gate
+        run: zig build test-abi
+
+      # Build gate only — there is no GUI to drive headlessly; the runner's
+      # Xcode provides swift build.
+      - name: SwiftUI shell build
+        run: zig build shell
+
       - name: Golden-render conformance
         run: zig build golden

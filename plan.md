@@ -315,21 +315,26 @@ record deviations there in the same commit as the work.
 > re-renders a loaded RAW live (sub-second at preview resolution); the C ABI
 > surface is ≤ 8 functions and documented in `include/banksia.h`.
 
-- [ ] `src/capi.zig` with the `bk_*` surface above; `b.addLibrary(.{
+- [x] `src/capi.zig` with the `bk_*` surface above; `b.addLibrary(.{
       .linkage = .dynamic })` producing `libbanksia.dylib`; install step
-      copies dylib + hand-written header.
-- [ ] Error-handling convention across the boundary: integer codes +
+      copies dylib + hand-written header. *(7 functions; `bk_version`
+      joined the sketch's six)*
+- [x] Error-handling convention across the boundary: integer codes +
       `bk_last_error` string; no Zig errors escape.
-- [ ] Xcode project (or SwiftPM app) with `CBanksia` module map; Makefile
-      dev loop (`zig build && xcodebuild`).
-- [ ] Swift `actor` wrapping the engine handle; renders on a background
+- [x] Xcode project (or SwiftPM app) with `CBanksia` module map; ~~Makefile~~
+      dev loop is `zig build shell` / `zig build run-shell` — SwiftPM
+      driven from the zig build graph, no make (deviation recorded in
+      `plan/phase-1/plan.md`).
+- [x] Swift `actor` wrapping the engine handle; renders on a background
       task; `CGImage` wrapping of the RGBA8 buffer.
-- [ ] SwiftUI: file picker, sliders bound to a recipe model, debounced
+- [x] SwiftUI: file picker, sliders bound to a recipe model, debounced
       re-render, image view.
-- [ ] Preview-resolution renders while dragging (`max_edge`), full-res on
-      release.
-- [ ] CI: build the dylib on a macOS runner; smoke-test the C ABI from a
-      tiny C program (no Xcode needed in CI).
+- [x] Preview-resolution renders while dragging (`max_edge`), full-res on
+      release. *(24MP-class preview at edge 1024: 116 ms warm, ReleaseFast
+      on Apple Silicon)*
+- [x] CI: build the dylib on a macOS runner; smoke-test the C ABI from a
+      tiny C program (no Xcode needed in CI); the debug-allocator leak
+      gate rides the same binary.
 
 ## Phase 2 — wombat: content-addressed vault + columnar catalog
 

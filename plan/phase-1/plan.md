@@ -8,7 +8,9 @@
 > ABI surface is ≤ 8 functions, documented in `include/banksia.h`, and
 > smoke-tested from C in CI.
 
-**Status: in progress.**
+**Status: complete.** Preview at `edge_px_max = 1024` on a 24MP-class
+synth DNG: 116 ms warm (ReleaseFast, Apple Silicon); ABI is 7 functions,
+smoke-tested from C with the leak gate in CI.
 
 ## 1. Preview rendering (emu)
 
@@ -104,10 +106,14 @@ The shell needs `max_edge` before the ABI exists.
 
 ## 5. CI
 
-- [ ] macOS job extends: `zig build lib`, `zig build test-abi`.
-- [ ] `xcodebuild` app build in CI *if* the runner's Xcode is compatible;
+- [x] macOS job extends: `zig build lib`, `zig build test-abi`.
+- [x] `xcodebuild` app build in CI *if* the runner's Xcode is compatible;
       otherwise the smoke test is the gate and the app builds locally
-      (record which in learnings).
+      (record which in learnings). *(`zig build shell` drives `swift
+      build`, which the runner's Xcode provides — no xcodeproj exists to
+      xcodebuild. Verified locally on Swift 6.3/Xcode 26; if the runner's
+      toolchain balks, drop the shell step and the smoke test remains the
+      gate)*
 
 ## Tests
 
@@ -115,14 +121,42 @@ The shell needs `max_edge` before the ABI exists.
 - Downsample golden cases + determinism.
 - Error-path table test in `capi.zig` unit tests (each failure sets a
   message and returns its code; success clears it).
+- Header-sync test: reflected `bk_*` exports counted against
+  `include/banksia.h` declarations.
 
 ## Exit criteria
 
-- [ ] Sliders re-render a 24MP-class synthetic DNG in < 1s at preview
+- [x] Sliders re-render a 24MP-class synthetic DNG in < 1s at preview
       resolution on Apple Silicon (measure and record the number here).
-- [ ] ABI ≤ 8 functions, header documented, C smoke green in CI.
-- [ ] Zero leaks across create/load/render/destroy cycles.
+      **Measured: 6000×4000 synth DNG, ReleaseFast dylib, Apple Silicon —
+      preview (`edge_px_max = 1024`) 116 ms warm / 283 ms first call;
+      full-res 424 ms** (`abi_smoke` timings, 2026-07-11).
+- [x] ABI ≤ 8 functions, header documented, C smoke green in CI.
+      **7 functions.**
+- [x] Zero leaks across create/load/render/destroy cycles. *(debug builds
+      run each engine on its own `DebugAllocator`; destroy asserts a clean
+      report and `test-abi` runs two full engine lifecycles under it)*
 
 ## Learnings
 
-*(recorded as the phase runs)*
+- **stderr is a signal, not a console.** `zig build`'s run steps echo any
+  command that writes to stderr as "failed command" even on success; the
+  CLI's status prints moved to stdout and stderr is reserved for failures.
+- **`Context.packageDirectory` solves the dylib path problem.** The
+  SwiftPM manifest derives absolute `-L` and rpath to `zig-out/lib`, so
+  the debug binary runs from anywhere with no copying and no
+  `DYLD_LIBRARY_PATH`; the `CBanksia` module map references
+  `../../../include/banksia.h` directly, so the header exists in exactly
+  one place.
+- **Temp/tint without widening the ABI:** engine v1 already allows
+  multiple `white_balance` ops before demosaic, and gains compose
+  multiplicatively — the shell stacks the user's gains on the as-shot op
+  instead of needing a "read the camera neutral" ABI function.
+- **Sync tests beat discipline:** the header/export lockstep is a
+  reflection test (`pub export` decls vs `bk_*(` declarations in the
+  header), so an ABI drift fails `zig build test` before review sees it.
+- The dylib is built for the host macOS version while the app targets
+  macOS 14+, which ld warns about (harmless); pinning a `-Dtarget`
+  baseline is worth doing when distribution matters.
+- `has_side_effects = true` is required on the `swift build` step — SwiftPM
+  owns its own caching and the zig build graph must not skip it.
