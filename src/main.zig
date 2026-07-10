@@ -120,7 +120,7 @@ fn render_file(
     };
     defer sensor.deinit(gpa);
 
-    var rendered = emu.pipeline.render(gpa, &sensor, recipe.value) catch |err| {
+    var rendered = emu.pipeline.render(gpa, &sensor, recipe.value, .{}) catch |err| {
         return fail("render failed: {s}", .{@errorName(err)});
     };
     defer rendered.deinit(gpa);

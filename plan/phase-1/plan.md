@@ -8,21 +8,26 @@
 > ABI surface is ≤ 8 functions, documented in `include/banksia.h`, and
 > smoke-tested from C in CI.
 
-**Status: not started.**
+**Status: in progress.**
 
 ## 1. Preview rendering (emu)
 
 The shell needs `max_edge` before the ABI exists.
 
-- [ ] `emu/pipeline.zig`: `render` gains a `edge_px_max_out: u32` option
+- [x] `emu/pipeline.zig`: `render` gains a `edge_px_max_out: u32` option
       (0 = full resolution). v1 implementation: render full-res, then box
       downsample — correct and deterministic first; the subsampled-demosaic
       fast path is a Phase 6 optimization with a golden test against this
-      reference.
-- [ ] Downsample kernel: standalone, `@Vector`, integer box bins (no
+      reference. *(carried as a `RenderOptions` struct so later options
+      don't churn the signature; downsampling happens on the linear planes,
+      before sRGB encode, so averaging is done in light)*
+- [x] Downsample kernel: standalone, `@Vector`, integer box bins (no
       resampling filters yet); golden cases extended with one downsampled
-      variant so the kernel is baselined.
-- [ ] Determinism test covers the downsampled path.
+      variant so the kernel is baselined. *(vertical accumulation is the
+      vector loop; horizontal binning is scalar — bins vary in width. A
+      `preview` variant at edge 24 baselines all 5 scenes: 10 → 15 golden
+      cases, original 10 hashes unchanged)*
+- [x] Determinism test covers the downsampled path.
 
 ## 2. The C ABI (`src/capi.zig` + `include/banksia.h`)
 

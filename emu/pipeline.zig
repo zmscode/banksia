@@ -70,6 +70,14 @@ pub const Recipe = struct {
     ops: []const Op,
 };
 
+pub const RenderOptions = struct {
+    /// Longest edge of the output in pixels; 0 renders at sensor resolution.
+    /// Smaller outputs render at full resolution first and then box
+    /// downsample: correct and deterministic first. The subsampled-demosaic
+    /// fast path is a Phase 6 optimization tested against this reference.
+    edge_px_max_out: u32 = 0,
+};
+
 pub const Rendered = struct {
     width: u32,
     height: u32,
@@ -94,6 +102,7 @@ pub fn render(
     gpa: std.mem.Allocator,
     sensor: *const dng.SensorData,
     recipe: Recipe,
+    options: RenderOptions,
 ) RenderError!Rendered {
     assert(sensor.bayer.len == @as(usize, sensor.width) * sensor.height);
     assert(sensor.white_level > sensor.black_level);
@@ -115,19 +124,77 @@ pub fn render(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const width_out, const height_out =
+        dims_out(sensor.width, sensor.height, options.edge_px_max_out);
+    const count_out = @as(usize, width_out) * height_out;
+    const rgba = try gpa.alloc(u8, count_out * 4);
+    errdefer gpa.free(rgba);
+
     const count = @as(usize, sensor.width) * sensor.height;
     const mosaic = try arena.alloc(f32, count);
     var planes = try image.Planes.init(arena, sensor.width, sensor.height);
-    const rgba = try gpa.alloc(u8, count * 4);
-    errdefer gpa.free(rgba);
 
     for (0..ops.len) |i| {
         try op_apply(ops.get(i), sensor, mosaic, &planes);
     }
-    kernel_srgb_pack(rgba, planes.r, planes.g, planes.b);
 
-    assert(rgba.len == count * 4);
-    return .{ .width = sensor.width, .height = sensor.height, .rgba = rgba };
+    if (width_out == sensor.width and height_out == sensor.height) {
+        kernel_srgb_pack(rgba, planes.r, planes.g, planes.b);
+    } else {
+        const small = try planes_downsample(arena, &planes, width_out, height_out);
+        kernel_srgb_pack(rgba, small.r, small.g, small.b);
+    }
+
+    assert(rgba.len == count_out * 4);
+    return .{ .width = width_out, .height = height_out, .rgba = rgba };
+}
+
+/// Output dimensions for a bounded longest edge. A bound of 0, or one at or
+/// above the sensor's longest edge, keeps full resolution; otherwise the
+/// longest edge maps to the bound exactly and the short edge scales in
+/// proportion, never below one pixel.
+fn dims_out(width: u32, height: u32, edge_px_max_out: u32) struct { u32, u32 } {
+    assert(width > 0);
+    assert(height > 0);
+    const longest = @max(width, height);
+    if (edge_px_max_out == 0 or edge_px_max_out >= longest) return .{ width, height };
+
+    const width_out: u32 = @intCast(@max(1, @as(u64, width) * edge_px_max_out / longest));
+    const height_out: u32 = @intCast(@max(1, @as(u64, height) * edge_px_max_out / longest));
+    assert(@max(width_out, height_out) == edge_px_max_out);
+    assert(width_out < width or height_out < height);
+    return .{ width_out, height_out };
+}
+
+/// Downsample all three planes into a fresh arena allocation; scratch for
+/// the column sums is arena-owned too and dies with the render.
+fn planes_downsample(
+    arena: std.mem.Allocator,
+    planes: *const image.Planes,
+    width_out: u32,
+    height_out: u32,
+) RenderError!image.Planes {
+    assert(width_out <= planes.width);
+    assert(height_out <= planes.height);
+    const small = try image.Planes.init(arena, width_out, height_out);
+    const row_sum = try arena.alloc(f32, planes.width);
+    const pairs = [3][2][]f32{
+        .{ small.r, planes.r },
+        .{ small.g, planes.g },
+        .{ small.b, planes.b },
+    };
+    for (pairs) |pair| {
+        kernel_box_downsample(
+            pair[0],
+            width_out,
+            height_out,
+            pair[1],
+            planes.width,
+            planes.height,
+            row_sum,
+        );
+    }
+    return small;
 }
 
 fn op_apply(
@@ -295,6 +362,69 @@ fn kernel_tone_curve(plane: []f32, contrast: f32) void {
         const x = std.math.clamp(plane[i], 0, 1);
         const s = x * x * (3 - 2 * x);
         plane[i] = x + contrast * (s - x);
+    }
+}
+
+/// Box downsample: each output pixel is the mean of an integer bin of source
+/// pixels. Bin edges come from the lattice map `edge(i) = i * source / target`,
+/// so bins tile the source exactly — every source pixel lands in one bin,
+/// none twice, none dropped. `row_sum` is caller scratch, `width_source` long.
+fn kernel_box_downsample(
+    target: []f32,
+    width_target: u32,
+    height_target: u32,
+    source: []const f32,
+    width_source: u32,
+    height_source: u32,
+    row_sum: []f32,
+) void {
+    assert(target.len == @as(usize, width_target) * height_target);
+    assert(source.len == @as(usize, width_source) * height_source);
+    assert(width_target > 0);
+    assert(height_target > 0);
+    assert(width_target <= width_source);
+    assert(height_target <= height_source);
+    assert(row_sum.len == width_source);
+
+    var y_target: u32 = 0;
+    while (y_target < height_target) : (y_target += 1) {
+        const y0: u32 = @intCast(@as(u64, y_target) * height_source / height_target);
+        const y1: u32 = @intCast((@as(u64, y_target) + 1) * height_source / height_target);
+        assert(y1 > y0);
+        @memset(row_sum, 0);
+        var y = y0;
+        while (y < y1) : (y += 1) {
+            kernel_row_add(row_sum, source[@as(usize, y) * width_source ..][0..width_source]);
+        }
+        const row_target = target[@as(usize, y_target) * width_target ..][0..width_target];
+        kernel_bins_mean(row_target, row_sum, y1 - y0);
+    }
+}
+
+fn kernel_row_add(sum: []f32, row: []const f32) void {
+    assert(sum.len == row.len);
+    var i: usize = 0;
+    while (i + vector_len <= sum.len) : (i += vector_len) {
+        const s: Vf = sum[i..][0..vector_len].*;
+        const r: Vf = row[i..][0..vector_len].*;
+        sum[i..][0..vector_len].* = s + r;
+    }
+    while (i < sum.len) : (i += 1) sum[i] += row[i];
+}
+
+/// Horizontal step of the box downsample: bin a row of column sums into
+/// means. `rows` is how many source rows each column sum accumulates.
+fn kernel_bins_mean(target: []f32, row_sum: []const f32, rows: u32) void {
+    assert(rows > 0);
+    assert(target.len > 0);
+    assert(target.len <= row_sum.len);
+    for (target, 0..) |*out, x_target| {
+        const x0: usize = @intCast(@as(u64, x_target) * row_sum.len / target.len);
+        const x1: usize = @intCast((@as(u64, x_target) + 1) * row_sum.len / target.len);
+        assert(x1 > x0);
+        var sum: f32 = 0;
+        for (row_sum[x0..x1]) |v| sum += v;
+        out.* = sum / @as(f32, @floatFromInt(@as(u64, rows) * (x1 - x0)));
     }
 }
 
@@ -466,11 +596,58 @@ test "render is deterministic: two runs, identical bytes" {
     defer sensor.deinit(gpa);
     const recipe = Recipe{ .ops = &test_ops_default };
 
-    var first = try render(gpa, &sensor, recipe);
+    var first = try render(gpa, &sensor, recipe, .{});
     defer first.deinit(gpa);
-    var second = try render(gpa, &sensor, recipe);
+    var second = try render(gpa, &sensor, recipe, .{});
     defer second.deinit(gpa);
     try std.testing.expectEqualSlices(u8, first.rgba, second.rgba);
+}
+
+test "downsampled render is deterministic and sized by the longest edge" {
+    const gpa = std.testing.allocator;
+    var sensor = try test_sensor(gpa, 37, 23);
+    defer sensor.deinit(gpa);
+    const recipe = Recipe{ .ops = &test_ops_default };
+
+    var first = try render(gpa, &sensor, recipe, .{ .edge_px_max_out = 16 });
+    defer first.deinit(gpa);
+    var second = try render(gpa, &sensor, recipe, .{ .edge_px_max_out = 16 });
+    defer second.deinit(gpa);
+
+    // Longest edge maps to the bound exactly; the short edge scales down
+    // in proportion: 23 * 16 / 37 = 9 (floor).
+    try std.testing.expectEqual(@as(u32, 16), first.width);
+    try std.testing.expectEqual(@as(u32, 9), first.height);
+    try std.testing.expectEqualSlices(u8, first.rgba, second.rgba);
+
+    // A bound at or above the longest edge is a no-op (negative space).
+    var full = try render(gpa, &sensor, recipe, .{ .edge_px_max_out = 37 });
+    defer full.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 37), full.width);
+    try std.testing.expectEqual(@as(u32, 23), full.height);
+}
+
+test "box downsample bins tile the source and average exactly" {
+    // 4 wide -> 2 wide, 2 tall -> 1 tall: each output pixel is the mean of
+    // a 2x2 bin, checked by hand.
+    const source = [_]f32{
+        1, 3, 5,  7,
+        2, 4, 10, 12,
+    };
+    var target: [2]f32 = undefined;
+    var row_sum: [4]f32 = undefined;
+    kernel_box_downsample(&target, 2, 1, &source, 4, 2, &row_sum);
+    try std.testing.expectEqual(@as(f32, 2.5), target[0]);
+    try std.testing.expectEqual(@as(f32, 8.5), target[1]);
+
+    // Non-divisible bins: 5 -> 2 splits as [0,2) and [2,5); a constant
+    // field must stay constant regardless of bin widths.
+    const flat = [_]f32{ 0.25, 0.25, 0.25, 0.25, 0.25 };
+    var uneven: [2]f32 = undefined;
+    var scratch: [5]f32 = undefined;
+    kernel_box_downsample(&uneven, 2, 1, &flat, 5, 1, &scratch);
+    try std.testing.expectEqual(@as(f32, 0.25), uneven[0]);
+    try std.testing.expectEqual(@as(f32, 0.25), uneven[1]);
 }
 
 test "a flat grey field survives the pipeline as flat grey" {
@@ -489,7 +666,7 @@ test "a flat grey field survives the pipeline as flat grey" {
     };
     defer sensor.deinit(gpa);
 
-    var out = try render(gpa, &sensor, .{ .ops = &test_ops_default });
+    var out = try render(gpa, &sensor, .{ .ops = &test_ops_default }, .{});
     defer out.deinit(gpa);
 
     // Every pixel identical, r == g == b, and alpha opaque: demosaic of a
@@ -515,20 +692,20 @@ test "stack validation rejects malformed recipes (negative space)" {
     };
     try std.testing.expectError(
         error.InvalidRecipe,
-        render(gpa, &sensor, .{ .ops = &no_demosaic }),
+        render(gpa, &sensor, .{ .ops = &no_demosaic }, .{}),
     );
 
     const wb_after_demosaic = [_]Op{
-        .{ .black_point = .{} },    .{ .demosaic = .{} },
-        .{ .white_balance = .{} },  .{ .srgb_encode = .{} },
+        .{ .black_point = .{} },   .{ .demosaic = .{} },
+        .{ .white_balance = .{} }, .{ .srgb_encode = .{} },
     };
     try std.testing.expectError(
         error.InvalidRecipe,
-        render(gpa, &sensor, .{ .ops = &wb_after_demosaic }),
+        render(gpa, &sensor, .{ .ops = &wb_after_demosaic }, .{}),
     );
 
     try std.testing.expectError(
         error.UnsupportedEngineVersion,
-        render(gpa, &sensor, .{ .engine_version = 2, .ops = &test_ops_default }),
+        render(gpa, &sensor, .{ .engine_version = 2, .ops = &test_ops_default }, .{}),
     );
 }

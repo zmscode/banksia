@@ -59,11 +59,23 @@ const pushed_ops = [_]emu.pipeline.Op{
     .{ .srgb_encode = .{} },
 };
 
-const Variant = struct { name: []const u8, recipe: emu.pipeline.Recipe };
+const Variant = struct {
+    name: []const u8,
+    recipe: emu.pipeline.Recipe,
+    /// Longest output edge; 0 renders at full resolution (pipeline contract).
+    edge_px_max_out: u32 = 0,
+};
 
 const variants = [_]Variant{
     .{ .name = "neutral", .recipe = .{ .ops = &emu.recipe.default_ops } },
     .{ .name = "pushed", .recipe = .{ .ops = &pushed_ops } },
+    // Baselines the box-downsample kernel through the whole engine; 24 is
+    // small enough that every scene actually downsamples.
+    .{
+        .name = "preview",
+        .recipe = .{ .ops = &emu.recipe.default_ops },
+        .edge_px_max_out = 24,
+    },
 };
 
 const case_count = scenes.len * variants.len;
@@ -131,7 +143,9 @@ fn case_run(gpa: std.mem.Allocator, scene: Scene, variant: Variant) !Result {
 
     var sensor = try emu.dng.decode(gpa, blob);
     defer sensor.deinit(gpa);
-    var rendered = try emu.pipeline.render(gpa, &sensor, variant.recipe);
+    var rendered = try emu.pipeline.render(gpa, &sensor, variant.recipe, .{
+        .edge_px_max_out = variant.edge_px_max_out,
+    });
     defer rendered.deinit(gpa);
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
