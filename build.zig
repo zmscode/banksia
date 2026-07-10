@@ -31,7 +31,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "emu", .module = emu_mod }},
+            .imports = &.{
+                .{ .name = "emu", .module = emu_mod },
+                .{ .name = "wombat", .module = wombat_mod },
+            },
         }),
     });
     b.installArtifact(exe);
@@ -158,7 +161,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("golden/runner.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "emu", .module = emu_mod }},
+            .imports = &.{
+                .{ .name = "emu", .module = emu_mod },
+                .{ .name = "wombat", .module = wombat_mod },
+            },
         }),
     });
     const run_golden = b.addRunArtifact(golden);

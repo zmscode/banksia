@@ -15,6 +15,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const emu = @import("emu");
+const wombat = @import("wombat");
 
 const baseline_path = "golden/baseline.json";
 const file_bytes_max = std.Io.Limit.limited(16 * 1024 * 1024);
@@ -139,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
     }
     assert(index == case_count);
 
-    if (update) return baseline_write(io, &results);
+    if (update) return baseline_write(gpa, io, &results);
     return baseline_compare(gpa, io, &results);
 }
 
@@ -194,19 +195,18 @@ fn case_run(gpa: std.mem.Allocator, scene: Scene, variant: Variant) !Result {
     return result;
 }
 
-fn baseline_write(io: std.Io, results: []const Result) !void {
-    var file = try std.Io.Dir.cwd().createFile(io, baseline_path, .{});
-    defer file.close(io);
-    var buffer: [4096]u8 = undefined;
-    var writer = file.writer(io, &buffer);
-    const w = &writer.interface;
-    try w.writeAll("{\n");
+fn baseline_write(gpa: std.mem.Allocator, io: std.Io, results: []const Result) !void {
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try text.appendSlice(gpa, "{\n");
     for (results, 0..) |result, i| {
         const comma: []const u8 = if (i + 1 < results.len) "," else "";
-        try w.print("    \"{s}\": \"{s}\"{s}\n", .{ result.name, result.hash_hex, comma });
+        try text.print(gpa, "    \"{s}\": \"{s}\"{s}\n", .{
+            result.name, result.hash_hex, comma,
+        });
     }
-    try w.writeAll("}\n");
-    try w.flush();
+    try text.appendSlice(gpa, "}\n");
+    try wombat.vfs.user_file_write(io, std.Io.Dir.cwd(), baseline_path, text.items);
     std.debug.print("golden: baseline updated, {d} cases -> {s}\n", .{
         results.len, baseline_path,
     });

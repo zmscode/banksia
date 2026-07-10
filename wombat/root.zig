@@ -1,11 +1,12 @@
 //! wombat — storage: content-addressed blob vault, content-defined chunking,
 //! the columnar catalog, sessions, persistence. The burrow: everything on
-//! disk. Lands in Phase 2; this stub pins the module layout and test wiring.
+//! disk — nothing outside wombat opens a file for writing (tidy-enforced).
+//!
+//! Every byte goes through the `vfs` seam, so the whole layer runs under
+//! the crash simulator with seed-reproducible fault injection.
 
-const std = @import("std");
+pub const vfs = @import("vfs.zig");
 
-pub const phase = 2;
-
-test "wombat stub" {
-    try std.testing.expectEqual(@as(u32, 2), phase);
+test {
+    _ = vfs;
 }

@@ -4,12 +4,13 @@
 //!   banksia synth <out.dng> [<width> <height>]
 //!       write a synthetic demo DNG (dev fixture; defaults to 512x384)
 //!
-//! The CLI owns all I/O; emu stays a pure function over the bytes it is
-//! handed. Note the file write here is temporary — once wombat lands
-//! (Phase 2), wombat owns every byte on disk.
+//! The CLI reads inputs itself; emu stays a pure function over the bytes
+//! it is handed, and every output byte goes through wombat (which owns
+//! every byte on disk — tidy enforces it).
 
 const std = @import("std");
 const emu = @import("emu");
+const wombat = @import("wombat");
 
 const file_bytes_max = std.Io.Limit.limited(512 * 1024 * 1024);
 
@@ -93,14 +94,9 @@ fn synth_file(
     });
     defer gpa.free(blob);
 
-    var file = std.Io.Dir.cwd().createFile(io, out_path, .{}) catch |err| {
-        return fail("cannot write '{s}': {s}", .{ out_path, @errorName(err) });
+    wombat.vfs.user_file_write(io, std.Io.Dir.cwd(), out_path, blob) catch {
+        return fail("cannot write '{s}'", .{out_path});
     };
-    defer file.close(io);
-    var buffer: [4096]u8 = undefined;
-    var writer = file.writer(io, &buffer);
-    try writer.interface.writeAll(blob);
-    try writer.interface.flush();
     try status(io, "synthesized {d}x{d} -> {s} ({d} bytes)\n", .{
         width, height, out_path, blob.len,
     });
@@ -147,14 +143,9 @@ fn render_file(
     );
     defer gpa.free(png_bytes);
 
-    var file = cwd.createFile(io, out_path, .{}) catch |err| {
-        return fail("cannot write '{s}': {s}", .{ out_path, @errorName(err) });
+    wombat.vfs.user_file_write(io, cwd, out_path, png_bytes) catch {
+        return fail("cannot write '{s}'", .{out_path});
     };
-    defer file.close(io);
-    var buffer: [4096]u8 = undefined;
-    var writer = file.writer(io, &buffer);
-    try writer.interface.writeAll(png_bytes);
-    try writer.interface.flush();
 
     try status(io, "rendered {d}x{d} -> {s} ({d} bytes)\n", .{
         rendered.width, rendered.height, out_path, png_bytes.len,

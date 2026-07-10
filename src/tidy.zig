@@ -44,6 +44,13 @@ const bans = [_]Ban{
         .replacement = "returning errors (emu is silent)",
         .exempt = &.{ "src/main.zig", "golden/runner.zig" },
     },
+    // wombat owns every byte on disk (plan.md invariant 3). Everything
+    // else writes through the vfs seam or wombat.vfs.user_file_write.
+    .{
+        .pattern = "createFile(",
+        .replacement = "wombat.vfs (wombat owns every byte on disk)",
+        .exempt = &.{"wombat/vfs.zig"},
+    },
 };
 
 /// Allowed while iterating, never on main.
