@@ -38,11 +38,12 @@ const bans = [_]Ban{
     // Determinism doctrine: no std PRNG anywhere near the engine or the
     // test substrate; hand-rolled integer generators only (plan.md).
     .{ .pattern = "std.Random", .replacement = "a seeded SplitMix64 (determinism)" },
-    // emu is a library and a pure function; it has no business printing.
+    // Libraries are silent; only entry points (the CLI and the harness
+    // runners) report to a human.
     .{
         .pattern = "std.debug.print(",
-        .replacement = "returning errors (emu is silent)",
-        .exempt = &.{ "src/main.zig", "golden/runner.zig" },
+        .replacement = "returning errors (libraries are silent)",
+        .exempt = &.{ "src/main.zig", "golden/runner.zig", "wombat/sim.zig" },
     },
     // wombat owns every byte on disk (plan.md invariant 3). Everything
     // else writes through the vfs seam or wombat.vfs.user_file_write.

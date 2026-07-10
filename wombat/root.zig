@@ -6,7 +6,9 @@
 //! the crash simulator with seed-reproducible fault injection.
 
 pub const vfs = @import("vfs.zig");
+pub const vault = @import("vault.zig");
 
 test {
     _ = vfs;
+    _ = vault;
 }

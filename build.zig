@@ -152,6 +152,40 @@ pub fn build(b: *std.Build) void {
     abi_step.dependOn(&run_smoke.step);
     test_step.dependOn(&run_smoke.step);
 
+    // ---- `sim`: the wombat crash simulator ---------------------------------------
+    // 10k randomized vault workloads with crash/torn-write injection; the
+    // invariant is zero acknowledged-data loss. The seed defaults to the
+    // commit hash, so every commit explores differently and any CI failure
+    // replays locally from the hash alone.
+    const sim_runs = b.option(u64, "sim-runs", "Crash-simulator runs (default 10000)") orelse
+        10_000;
+    const sim_seed = b.option(u64, "sim-seed", "Crash-simulator seed (default: commit hash)") orelse
+        git_commit_seed(b);
+    // The simulator always builds ReleaseSafe (the TigerBeetle convention):
+    // assertions stay armed, and debug-speed BLAKE3 would turn 10k runs
+    // from under a minute into three quarters of an hour.
+    const sim_mod = b.createModule(.{
+        .root_source_file = b.path("wombat/root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+    const sim_exe = b.addExecutable(.{
+        .name = "sim",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("wombat/sim.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "wombat", .module = sim_mod }},
+        }),
+    });
+    b.installArtifact(sim_exe);
+    const run_sim = b.addRunArtifact(sim_exe);
+    run_sim.addArgs(&.{ "--seed", b.fmt("{d}", .{sim_seed}) });
+    run_sim.addArgs(&.{ "--runs", b.fmt("{d}", .{sim_runs}) });
+    run_sim.has_side_effects = true;
+    const sim_step = b.step("sim", "Run the wombat crash simulator (10k seeded runs)");
+    sim_step.dependOn(&run_sim.step);
+
     // ---- `golden`: the conformance speedometer ---------------------------------
     // Renders the synthetic corpus and compares SHA-256es against the committed
     // baseline. `zig build golden -- --update` rewrites the baseline.
@@ -173,4 +207,13 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_golden.addArgs(args);
     const golden_step = b.step("golden", "Run the golden-render conformance harness");
     golden_step.dependOn(&run_golden.step);
+}
+
+/// The low 64 bits of HEAD's commit hash: every commit explores a
+/// different corner of the state space, and any failure names its seed.
+fn git_commit_seed(b: *std.Build) u64 {
+    const output = b.run(&.{ "git", "rev-parse", "HEAD" });
+    const trimmed = std.mem.trim(u8, output, " \t\r\n");
+    if (trimmed.len < 16) return 0;
+    return std.fmt.parseInt(u64, trimmed[0..16], 16) catch 0;
 }

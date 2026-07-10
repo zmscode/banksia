@@ -10,37 +10,45 @@
 > catalog filters by rating+lens in single-digit milliseconds; the crash
 > simulator never loses an acknowledged blob across 10k randomized runs.
 
-**Status: not started.** Independent of Phase 1; may interleave.
+**Status: in progress.**
 
 ## 1. The filesystem seam (prerequisite for everything)
 
-- [ ] `wombat/vfs.zig`: comptime-interface filesystem — `real` backend
+- [x] `wombat/vfs.zig`: comptime-interface filesystem — `real` backend
       (std.Io) and `sim` backend. Every wombat file operation goes through
-      it; **nothing else in the codebase opens files for writing** (move
-      the CLI's PNG/DNG writes behind wombat when this lands; tidy ban:
-      `createFile(` outside `wombat/`).
-- [ ] Sim backend: in-memory tree; injects crash points (power cut between
+      it; **nothing else in the codebase opens files for writing** (moved
+      the CLI's PNG/DNG writes and the golden baseline write behind
+      `wombat.vfs.user_file_write`; tidy ban: `createFile(` outside
+      `wombat/vfs.zig`).
+- [x] Sim backend: in-memory tree; injects crash points (power cut between
       any two ops), torn writes (prefix of a write survives), and directory
       entry reordering. All injection driven by integer `Ratio{num, den}`
-      probabilities — no floats in the test substrate.
-- [ ] Seed plumbing: `-Dsim-seed=<u64>`, defaulting to the low 64 bits of
+      probabilities — no floats in the test substrate. *(also models name
+      durability: an un-fsynced create or rename may not survive reboot
+      until the parent dir is fsynced — this is what makes the vault's
+      dir-fsync step testable rather than decorative)*
+- [x] Seed plumbing: `-Dsim-seed=<u64>`, defaulting to the low 64 bits of
       the git commit hash (bottlebrush's `gitCommitSeed`), printed on every
       failure so any CI failure replays locally from the hash alone.
 
 ## 2. Blob vault
 
-- [ ] BLAKE3 content addresses (`std.crypto.hash.Blake3`); object layout
+- [x] BLAKE3 content addresses (`std.crypto.hash.Blake3`); object layout
       `vault/objects/aa/bb/<hex>` (two shard levels).
-- [ ] Write path: hash → write to `vault/tmp/<hex>` → fsync file → rename
+- [x] Write path: hash → write to `vault/tmp/<hex>` → fsync file → rename
       into place → fsync directory. Idempotent: existing object = dedup
-      hit, no write.
-- [ ] Read path: optional verify-on-read (rehash and compare — the pair
+      hit, no write (held by a test counting sim operations).
+- [x] Read path: optional verify-on-read (rehash and compare — the pair
       assertion with the write-side hash); always-on in tests and sim.
-- [ ] Crash-sim suite: 10k randomized import runs with injected faults;
+- [x] Crash-sim suite: 10k randomized import runs with injected faults;
       invariant — every blob the API acknowledged is fully readable after
       "reboot"; unacknowledged writes may vanish but never corrupt others.
-- [ ] `wombat gc`: unreferenced-object sweep (behind an explicit verb;
-      nothing deletes implicitly).
+      *(`zig build sim`, in CI; the sim binary always builds ReleaseSafe —
+      asserts armed, 10k runs in ~16s where Debug BLAKE3 took 45 min.
+      First run: 138,407 crashes, 512,243 acknowledged blobs, zero lost)*
+- [x] `wombat gc`: unreferenced-object sweep (behind an explicit verb;
+      nothing deletes implicitly). *(vault.gc with a referenced set; also
+      sweeps tmp leftovers; CLI verb arrives with import in section 5)*
 
 ## 3. Chunking (for the few mutable big files)
 

@@ -43,3 +43,10 @@ jobs:
 
       - name: Golden-render conformance
         run: zig build golden
+
+      # The wombat hard gate: 10k randomized vault workloads under crash
+      # injection, zero acknowledged-data loss. Seeded by the commit hash,
+      # so every commit explores differently and any failure replays
+      # locally from the hash alone.
+      - name: Crash simulator (10k runs)
+        run: zig build sim
