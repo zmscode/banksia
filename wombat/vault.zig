@@ -14,11 +14,15 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const vfs = @import("vfs.zig");
+const chunker = @import("chunker.zig");
 
 pub const Hash = [32]u8;
 pub const Error = vfs.Error || error{CorruptObject};
 
 pub const blob_bytes_max: u64 = 4 * 1024 * 1024 * 1024; // a bound, not a target
+const chunks_max: u32 = 1 << 20;
+const manifest_magic = [4]u8{ 'b', 'k', 'c', 'h' };
+const Chunker = chunker.ChunkerType(chunker.config_default);
 
 pub fn hash_of(bytes: []const u8) Hash {
     var hash: Hash = undefined;
@@ -87,6 +91,55 @@ pub fn VaultType(comptime Fs: type) type {
                 if (!std.mem.eql(u8, &hash_of(bytes), &hash)) return error.CorruptObject;
             }
             return bytes;
+        }
+
+        /// Store a big mutable file (catalog snapshot, export) as
+        /// content-defined chunks plus a manifest object naming them, and
+        /// return the manifest's address. A rewritten file re-puts every
+        /// chunk, but unchanged runs are dedup hits — only changed chunks
+        /// cost bytes. RAW blobs use plain `put`: they never mutate.
+        pub fn put_chunked(vault: *Vault, gpa: std.mem.Allocator, bytes: []const u8) Error!Hash {
+            var manifest: std.ArrayList(u8) = .empty;
+            defer manifest.deinit(gpa);
+            try manifest.appendSlice(gpa, &manifest_magic);
+
+            var chunks = Chunker.init(bytes);
+            var count: u32 = 0;
+            while (chunks.next()) |chunk| {
+                count += 1;
+                assert(count <= chunks_max);
+                const hash = try vault.put(bytes[@intCast(chunk.offset)..][0..chunk.len]);
+                try manifest.appendSlice(gpa, &hash);
+            }
+            return vault.put(manifest.items);
+        }
+
+        /// Reassemble a chunked file from its manifest address. Every
+        /// chunk rides through `get_alloc`, so verify-on-read covers the
+        /// whole reconstruction.
+        pub fn get_chunked_alloc(
+            vault: *Vault,
+            gpa: std.mem.Allocator,
+            manifest_hash: Hash,
+        ) Error![]u8 {
+            const manifest = try vault.get_alloc(gpa, manifest_hash);
+            defer gpa.free(manifest);
+            if (manifest.len < manifest_magic.len) return error.CorruptObject;
+            if (!std.mem.startsWith(u8, manifest, &manifest_magic)) return error.CorruptObject;
+            const body = manifest[manifest_magic.len..];
+            if (body.len % 32 != 0) return error.CorruptObject;
+
+            var bytes: std.ArrayList(u8) = .empty;
+            errdefer bytes.deinit(gpa);
+            var offset: usize = 0;
+            while (offset < body.len) : (offset += 32) {
+                var hash: Hash = undefined;
+                @memcpy(&hash, body[offset..][0..32]);
+                const chunk = try vault.get_alloc(gpa, hash);
+                defer gpa.free(chunk);
+                try bytes.appendSlice(gpa, chunk);
+            }
+            return bytes.toOwnedSlice(gpa);
         }
 
         /// Sweep objects not in `referenced` plus any leftover tmp files.
@@ -301,6 +354,51 @@ test "gc sweeps unreferenced objects and tmp leftovers, keeps the rest" {
     try std.testing.expect(try vault.contains(keep));
     try std.testing.expect(!try vault.contains(drop));
     try std.testing.expect(!try sim.exists("vault/tmp/deadbeef"));
+}
+
+test "chunked put/get roundtrips, and a prefix edit dedups the tail" {
+    const gpa = std.testing.allocator;
+    var sim = vfs.Sim.init(gpa, 15, .{});
+    defer sim.deinit();
+    var vault = try VaultType(vfs.Sim).open(&sim, .{});
+
+    // ~3MiB of deterministic noise: a handful of default-config chunks.
+    const original = try gpa.alloc(u8, 3 * 1024 * 1024);
+    defer gpa.free(original);
+    var state: u64 = 99;
+    for (original, 0..) |*byte, i| {
+        if (i % 8 == 0) state = state *% 0x100000001B3 +% 0x9E3779B9;
+        byte.* = @truncate(state >> @intCast(8 * (i % 8)));
+    }
+
+    const manifest = try vault.put_chunked(gpa, original);
+    const roundtrip = try vault.get_chunked_alloc(gpa, manifest);
+    defer gpa.free(roundtrip);
+    try std.testing.expectEqualSlices(u8, original, roundtrip);
+
+    const objects_before = try test_object_count(gpa, &vault);
+
+    // Insert one byte at the front and store again: content-defined
+    // boundaries re-align, so only the leading chunk(s) and the manifest
+    // are new objects.
+    const edited = try gpa.alloc(u8, original.len + 1);
+    defer gpa.free(edited);
+    edited[0] = 0x42;
+    @memcpy(edited[1..], original);
+    const manifest_edited = try vault.put_chunked(gpa, edited);
+    try std.testing.expect(!std.mem.eql(u8, &manifest, &manifest_edited));
+
+    const objects_after = try test_object_count(gpa, &vault);
+    try std.testing.expect(objects_after > objects_before);
+    try std.testing.expect(objects_after - objects_before <= 3);
+}
+
+fn test_object_count(gpa: std.mem.Allocator, vault: *VaultType(vfs.Sim)) !u32 {
+    var iterator = try VaultType(vfs.Sim).ObjectIterator.init(gpa, vault.fs);
+    defer iterator.deinit();
+    var count: u32 = 0;
+    while (try iterator.next()) |_| count += 1;
+    return count;
 }
 
 test "vault works identically over the real filesystem" {

@@ -52,14 +52,19 @@
 
 ## 3. Chunking (for the few mutable big files)
 
-- [ ] FastCDC: comptime gear table from fixed constants; min/avg/max
+- [x] FastCDC: comptime gear table from fixed constants; min/avg/max
       256KiB / 1MiB / 4MiB; chunk index file mapping chunk hash → offsets.
-- [ ] Applies to catalog snapshots and future exports only — RAW blobs are
+      *(the index is a manifest object in the CAS — magic + chunk hash
+      list — via `vault.put_chunked`/`get_chunked_alloc`; gear spot values
+      and a boundary-sweep digest are test-pinned, so a boundary change is
+      visibly a format change)*
+- [x] Applies to catalog snapshots and future exports only — RAW blobs are
       whole-file addressed (they never mutate, and distinct RAWs share no
       bytes; documented non-goal).
-- [ ] Test: chunk boundaries are content-defined (insert 1 byte at the
-      front of a 10MiB file → only leading chunks change), plus an
-      exhaustive small-input sweep (0..~8KiB) against stored boundaries.
+- [x] Test: chunk boundaries are content-defined (insert 1 byte at the
+      front → tail chunks re-align and dedup through the vault: ≤ 3 new
+      objects on a 3MiB re-put), plus an exhaustive small-input sweep
+      (0..8KiB) against a pinned boundary digest.
 
 ## 4. Columnar catalog
 
