@@ -1,0 +1,30 @@
+name: CI
+
+# Build, test, and run the golden-render harness. The golden hashes are the
+# project's heartbeat: this job fails if any rendered output drifts from
+# golden/baseline.json. The number only goes up.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test-golden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build
+
+      - name: Tests (unit + tidy)
+        run: zig build test --summary all
+
+      - name: Golden-render conformance
+        run: zig build golden

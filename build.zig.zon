@@ -1,0 +1,15 @@
+.{
+    .name = .banksia,
+    .version = "0.0.0",
+    .fingerprint = 0x50f5b04a07706b99,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "emu",
+        "wombat",
+        "lyrebird",
+        "golden",
+    },
+}
