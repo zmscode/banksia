@@ -1,0 +1,12 @@
+{
+    "gradient-neutral": "710eb4242ea3c301828b01e1379d33dcbc04258a07122c406307d6d54504a8e5",
+    "gradient-pushed": "39feaa4394d8b815fb66ac7eed200cbe8cf0c69492e228d86e8911b9408aa180",
+    "patches-neutral": "228af946d89071b2fb5ec50638c91b664e8cc6c724fe9699a84a0afb7470367b",
+    "patches-pushed": "4db1002eb73b4d4e50d0fd851ec2e74a7b21dd337f151a98db05c4a6a0c621b7",
+    "noise-neutral": "60f3ea6f79b2eb7d7a0a45340f90f45081871ad81cb6db691c91410947d0a6ff",
+    "noise-pushed": "27da8d28590ae6272f1f99c564564327a28793175d008815ee2b7221d635cc45",
+    "checker-neutral": "ec52544b54a4177ba34f46a1f85bd3756a93671bb334a66d0015d83f664dcf97",
+    "checker-pushed": "50acfc97ad969049c5c32446d5fea11035eae15d722302d8cd49fe25d833c59f",
+    "highlight-neutral": "1d6db6b61198fc0edf457fd6091063efa4cca096145b262c24ebf851e9b20f73",
+    "highlight-pushed": "3b004dc778081adbc038192e9bff93142e4eab0a40bb1482f350b42dafce6b7e"
+}
