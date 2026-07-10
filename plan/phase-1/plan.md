@@ -31,23 +31,28 @@ The shell needs `max_edge` before the ABI exists.
 
 ## 2. The C ABI (`src/capi.zig` + `include/banksia.h`)
 
-- [ ] `Engine` handle: owns allocator, loaded `SensorData`, parsed recipe,
+- [x] `Engine` handle: owns allocator, loaded `SensorData`, parsed recipe,
       last rendered buffer, and a fixed `last_error` message buffer. One
       handle = one thread; no internal locking (the Swift actor is the
-      serialization point).
-- [ ] Surface (7 functions, `bk_` prefix, snake_case):
+      serialization point). *(debug builds give each engine its own
+      `DebugAllocator` so destroy can audit every byte — that is the leak
+      gate's mechanism)*
+- [x] Surface (7 functions, `bk_` prefix, snake_case):
       `bk_engine_create`, `bk_engine_destroy`, `bk_load_raw(path)`,
       `bk_set_recipe_json(json)`, `bk_render(edge_px_max, *w, *h) → ?[*]u8`,
       `bk_last_error() → [*:0]const u8`, `bk_version() → u32`.
-- [ ] Error convention: functions return `i32` codes (0 ok, negative
+- [x] Error convention: functions return `i32` codes (0 ok, negative
       errno-style set), message via `bk_last_error`; **no Zig error unions,
       no panics cross the boundary** — every `catch` sets last_error.
-- [ ] Buffer contract documented per function in the header: the engine
+- [x] Buffer contract documented per function in the header: the engine
       owns returned pixels; valid until the next `bk_render` or destroy.
-- [ ] `include/banksia.h` hand-written; ABI change and header change land
-      in the same commit (tidy reminder: a `bk_` grep count assertion in
-      the smoke test keeps the two in sync).
-- [ ] `zig build lib`: `b.addLibrary(.{ .linkage = .dynamic })` →
+- [x] `include/banksia.h` hand-written; ABI change and header change land
+      in the same commit. *(deviation: the sync assertion lives in a
+      `capi.zig` unit test, not the C smoke test — Zig reads the header and
+      counts `bk_*(` declarations against the reflected export list, which
+      also catches unreferenced header declarations the C compiler would
+      not)*
+- [x] `zig build lib`: `b.addLibrary(.{ .linkage = .dynamic })` →
       `libbanksia.dylib` + header install step.
 
 ## 3. C smoke test (CI gate)
