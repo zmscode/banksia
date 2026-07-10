@@ -1,8 +1,9 @@
 name: CI
 
-# Build, test, and run the golden-render harness. The golden hashes are the
-# project's heartbeat: this job fails if any rendered output drifts from
-# golden/baseline.json. The number only goes up.
+# Build, test, and run the golden-render harness on macOS — the platform
+# the shell, the C ABI, and eventually Metal target. The golden hashes are
+# the project's heartbeat: this job fails if any rendered output drifts
+# from golden/baseline.json. The number only goes up.
 
 on:
   push:
@@ -11,7 +12,7 @@ on:
 
 jobs:
   build-test-golden:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 

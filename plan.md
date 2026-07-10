@@ -250,6 +250,11 @@ Dev loop: a Makefile that runs `zig build` (dylib + header) then
 Bottlebrush rules apply: every phase ends with a measurable number in CI,
 and the number only goes up.
 
+The sections below are the summaries. The granular per-phase plans —
+task checklists, test plans, exit criteria with recorded numbers, and
+learnings — live in [`plan/phase-N/plan.md`](plan/); work from those, and
+record deviations there in the same commit as the work.
+
 ## Phase 0 — emu bootstrap: decode, minimal pipeline, golden harness
 
 > **Objective:** A CLI that renders a real DNG to a PNG through a linear-f32

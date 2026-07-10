@@ -1,11 +1,15 @@
 # banksia
 
+[![CI](https://github.com/zmscode/banksia/actions/workflows/ci.yml/badge.svg)](https://github.com/zmscode/banksia/actions/workflows/ci.yml)
+
 A RAW photo editor in Zig: a headless, deterministic develop engine with
 non-destructive edits, content-addressed storage, and git-like versioning,
-driven by a golden-render conformance harness from day one.
+driven by a golden-render conformance harness from day one. CI runs on
+macOS — the platform the shell, the C ABI, and eventually Metal target.
 
-See [plan.md](plan.md) for the architecture and the phased implementation
-plan.
+See [plan.md](plan.md) for the architecture and phase summaries, and
+[plan/](plan/) for the granular per-phase plans (tasks, exit criteria,
+tests, learnings).
 
 ## Status: Phase 0 — emu bootstrap (core complete)
 
