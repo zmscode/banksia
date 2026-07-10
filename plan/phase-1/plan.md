@@ -8,9 +8,11 @@
 > ABI surface is ≤ 8 functions, documented in `include/banksia.h`, and
 > smoke-tested from C in CI.
 
-**Status: complete.** Preview at `edge_px_max = 1024` on a 24MP-class
-synth DNG: 116 ms warm (ReleaseFast, Apple Silicon); ABI is 7 functions,
-smoke-tested from C with the leak gate in CI.
+**Status: complete, CI-verified.** Preview at `edge_px_max = 1024` on a
+24MP-class synth DNG: 116 ms warm (ReleaseFast, Apple Silicon); ABI is 7
+functions, smoke-tested from C with the leak gate in CI. All gates green
+on the GitHub macOS runner (run 29124085431, 2m01s): build, unit+tidy,
+lib, ABI smoke + leak gate, SwiftUI shell build, golden.
 
 ## 1. Preview rendering (emu)
 
@@ -109,11 +111,10 @@ The shell needs `max_edge` before the ABI exists.
 - [x] macOS job extends: `zig build lib`, `zig build test-abi`.
 - [x] `xcodebuild` app build in CI *if* the runner's Xcode is compatible;
       otherwise the smoke test is the gate and the app builds locally
-      (record which in learnings). *(`zig build shell` drives `swift
-      build`, which the runner's Xcode provides — no xcodeproj exists to
-      xcodebuild. Verified locally on Swift 6.3/Xcode 26; if the runner's
-      toolchain balks, drop the shell step and the smoke test remains the
-      gate)*
+      (record which in learnings). *(resolved: `zig build shell` drives
+      `swift build`, which the runner's Xcode provides — no xcodeproj
+      exists to xcodebuild. Green on the macos-latest runner, so the shell
+      build is a CI gate, not a local-only step)*
 
 ## Tests
 
@@ -160,3 +161,7 @@ The shell needs `max_edge` before the ABI exists.
   baseline is worth doing when distribution matters.
 - `has_side_effects = true` is required on the `swift build` step — SwiftPM
   owns its own caching and the zig build graph must not skip it.
+- **Pin actions by capability, not habit:** `mlugg/setup-zig@v1`'s mirror
+  list predates Zig 0.16.0 — every mirror 404'd, zig never reached PATH,
+  and the very first CI run died before building anything. v2 fixed it.
+  The workflow file existing is not the gate; the run being green is.
