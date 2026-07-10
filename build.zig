@@ -103,6 +103,22 @@ pub fn build(b: *std.Build) void {
     tidy_step.dependOn(&run_tidy.step);
     test_step.dependOn(&run_tidy.step);
 
+    // ---- `shell` / `run-shell`: the SwiftUI inspection shell ---------------------
+    // The dev loop is zig build, not make: `zig build shell` builds the
+    // dylib, installs the header, then drives SwiftPM; `run-shell` opens
+    // the app. Requires a Swift toolchain (Xcode), so it is not in `test`.
+    const shell_build = b.addSystemCommand(&.{ "swift", "build", "--package-path", "macos" });
+    shell_build.step.dependOn(&lib_install.step);
+    shell_build.has_side_effects = true; // SwiftPM does its own caching
+    const shell_step = b.step("shell", "Build the SwiftUI inspection shell (needs Xcode)");
+    shell_step.dependOn(&shell_build.step);
+
+    const shell_run = b.addSystemCommand(&.{"macos/.build/debug/Banksia"});
+    shell_run.step.dependOn(&shell_build.step);
+    shell_run.has_side_effects = true;
+    const run_shell_step = b.step("run-shell", "Build and launch the inspection shell");
+    run_shell_step.dependOn(&shell_run.step);
+
     // ---- `test-abi`: the C smoke test -------------------------------------------
     // A plain C program compiled against include/banksia.h and linked to the
     // dylib — no Xcode involved. The fixture DNG is synthesized by the CLI.

@@ -75,21 +75,32 @@ The shell needs `max_edge` before the ABI exists.
 
 ## 4. The SwiftUI shell (`macos/`)
 
-- [ ] Xcode project (SwiftPM app target is acceptable if simpler):
+- [x] Xcode project (SwiftPM app target is acceptable if simpler):
       `CBanksia` module map over `banksia.h`, links the dylib via rpath.
-- [ ] `RendererActor`: owns the engine handle; all `bk_*` calls funnel
-      through it; renders on the actor, never the main thread.
-- [ ] `DevelopModel` (@Observable): ev, contrast, wb gains; slider changes
+      *(SwiftPM: `macos/Package.swift` with a systemLibrary target whose
+      module map points at `include/banksia.h`; `Context.packageDirectory`
+      derives absolute -L and rpath to `zig-out/lib`, so the debug binary
+      runs from anywhere with no dylib copying)*
+- [x] `RendererActor`: owns the engine handle; all `bk_*` calls funnel
+      through it; renders on the actor, never the main thread. *(named
+      `Renderer` in `macos/Sources/Banksia/Renderer.swift`)*
+- [x] `DevelopModel` (@Observable): ev, contrast, wb gains; slider changes
       → rebuild recipe JSON (mirror of the canonical form) → debounced
-      render.
-- [ ] Preview-while-dragging: `edge_px_max = 1024` during drag, full-res
+      render. *(temperature/tint ride a second `white_balance` op stacked
+      on the as-shot one — gains compose multiplicatively, so zeroed
+      sliders keep the camera's neutral)*
+- [x] Preview-while-dragging: `edge_px_max = 1024` during drag, full-res
       render on release.
-- [ ] Pixels: copy out of the engine buffer (`Data(bytes:count:)`) →
+- [x] Pixels: copy out of the engine buffer (`Data(bytes:count:)`) →
       `CGImage` → SwiftUI `Image`. Never alias the engine buffer.
-- [ ] File open: `.fileImporter` for a `.dng`; `banksia synth` output is
-      the day-one test file.
-- [ ] `Makefile`: `make` = `zig build lib && xcodebuild -scheme Banksia
-      build`; `make run` opens the app.
+- [x] File open: `.fileImporter` for a `.dng`; `banksia synth` output is
+      the day-one test file. *(plus `Banksia <shot.dng>` opens straight
+      from argv for the dev loop)*
+- [x] `Makefile`: ~~`make` = `zig build lib && xcodebuild`~~ *(deviation:
+      no Makefile — tooling stays in Zig. `zig build shell` builds the
+      dylib, installs the header, and drives `swift build`; `zig build
+      run-shell` launches the app. The ordering is a build-graph edge, not
+      a shell line)*
 
 ## 5. CI
 

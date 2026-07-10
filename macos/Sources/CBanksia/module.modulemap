@@ -1,0 +1,5 @@
+module CBanksia {
+    header "../../../include/banksia.h"
+    link "banksia"
+    export *
+}
