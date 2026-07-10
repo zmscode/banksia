@@ -261,31 +261,45 @@ and the number only goes up.
 > reference outputs with a perceptual-diff threshold and CI fails on
 > regression.
 
-- [ ] Project skeleton: `build.zig` with steps `render` (CLI), `test`
+- [x] Project skeleton: `build.zig` with steps `render` (CLI), `test`
       (unit), `golden` (conformance); `emu/`, `wombat/`, `lyrebird/` as
-      module dirs from day one, even if the latter two are stubs.
-- [ ] Decode interface (`emu/decode.zig`): `decode(path) → SensorData`
-      (Bayer plane, CFA pattern, black/white levels, colour matrix, WB
-      coefficients, orientation). The interface is the contract; backends
-      are swappable.
+      module dirs from day one, even if the latter two are stubs. *(plus
+      `test-tidy`: bans, reminders, 100-column ratchet, from day one)*
+- [x] Decode interface: `decode(blob) → SensorData` (Bayer plane, CFA
+      pattern, black/white levels, WB neutral). The interface is the
+      contract; backends are swappable. *(deviation: takes bytes, not a
+      path — emu stays a pure function and the CLI owns I/O; lives in
+      `emu/dng.zig`; colour matrix/orientation tags arrive with the colour
+      work in Phase 5)*
 - [ ] libraw backend via C interop (the bilby strategy: real engine behind
-      the interface later).
-- [ ] Pure-Zig DNG decoder for uncompressed + lossless-JPEG DNG (TIFF
-      container walk, IFDs, the handful of tags that matter).
-- [ ] Pipeline core (`emu/pipeline.zig`): planar `[]f32` image type; op
+      the interface later). *(deferred: no libraw in the dev environment;
+      the pure-Zig DNG path landed first, so the fallback is now the
+      native decoder's job to replace, not precede)*
+- [x] Pure-Zig DNG decoder for uncompressed DNG (TIFF container walk,
+      bounded worklist IFD/SubIFD chain, both byte orders, strips).
+      *(lossless-JPEG DNG still to do; untrusted input returns errors,
+      never asserts — fixtures roundtrip via `emu/dng_write.zig`)*
+- [x] Pipeline core (`emu/pipeline.zig`): planar `[]f32` image type; op
       stack as `MultiArrayList(Op)`; ops: black point → white balance →
-      bilinear demosaic → exposure → tone curve → sRGB encode.
-- [ ] `@Vector` kernels for the per-pixel ops; comptime-specialized demosaic
-      per CFA pattern.
-- [ ] Determinism from day one: identical output across thread counts and
-      tile sizes (this is what Phase 3's engine versioning leans on). Test
-      it.
-- [ ] Recipe JSON: parse/serialize the op stack; recipes carry an
-      `engine_version` field from the first commit.
-- [ ] PNG writer (or minimal-dependency equivalent) for CLI output.
-- [ ] **Golden harness**: 5–10 vendored DNGs; reference renders from
-      dcraw/libraw; perceptual diff (mean ΔE or SSIM) with a committed
-      threshold; `golden/baseline.json` in CI — regressions fail the build.
+      bilinear demosaic → exposure → tone curve → sRGB encode. *(engine
+      v1 validates stack shape; arena per render; RGBA8 out)*
+- [x] `@Vector` kernels for the per-pixel ops; comptime-specialized demosaic
+      per CFA pattern (RGGB/BGGR/GRBG/GBRG monomorphized).
+- [x] Determinism from day one: two renders are byte-identical, held by a
+      test. *(thread-count/tile-size invariance becomes testable when the
+      thread pool lands in Phase 1–2; the pipeline is single-threaded yet)*
+- [x] Recipe JSON: parse (std.json, strict) / canonical hand-written
+      serialize; recipes carry `engine_version` from the first commit;
+      snapshot + roundtrip tests.
+- [x] PNG writer (zero-dependency: stored-deflate zlib, std.hash CRC32 and
+      Adler32) for CLI output; `banksia synth` writes a demo DNG fixture.
+- [x] **Golden harness**: 10 cases (5 synthetic scenes × 2 recipes) written
+      as real DNG blobs, decoded and rendered through the whole engine,
+      SHA-256ed against `golden/baseline.json` in CI — any drift fails the
+      build. *(deviation: the corpus is synthetic and the oracle is
+      byte-exactness, not perceptual diff; vendored real-camera DNGs with
+      dcraw/darktable-cli reference renders and a ΔE threshold are the
+      upgrade path once a corpus is vendored)*
 
 ## Phase 1 — the C ABI and the SwiftUI inspection shell
 

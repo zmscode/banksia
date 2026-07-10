@@ -7,13 +7,19 @@ driven by a golden-render conformance harness from day one.
 See [plan.md](plan.md) for the architecture and the phased implementation
 plan.
 
-## Status: Phase 0 — emu bootstrap (in progress)
+## Status: Phase 0 — emu bootstrap (core complete)
 
-The develop engine (**emu**) decodes uncompressed DNG, runs a linear
-scene-referred f32 pipeline (black point → white balance → bilinear demosaic
-→ exposure → tone curve → sRGB), and renders to PNG from the CLI. The golden
-harness scores rendered output against committed baselines in CI; the number
-only goes up.
+The develop engine (**emu**) decodes uncompressed DNG (pure Zig: bounded
+TIFF/IFD walk, both byte orders, strips), runs a linear scene-referred f32
+pipeline (black point → white balance → bilinear demosaic, comptime-
+specialized per CFA → exposure → tone curve → sRGB), and renders to PNG from
+the CLI. Renders are deterministic — two runs are byte-identical, held by a
+test. The golden harness renders 10 synthetic-scene cases through the whole
+engine (container write → decode → render) and compares SHA-256es against
+`golden/baseline.json` in CI; any drift fails the build.
+
+Deferred within Phase 0: the libraw fallback backend and lossless-JPEG DNG
+(see plan.md for the deviation notes).
 
 The libraries, per the house naming scheme (Australian flora for projects,
 fauna for the libraries inside):
@@ -36,4 +42,5 @@ zig build              # build the CLI
 zig build test         # unit tests + tidy lint
 zig build render -- <raw.dng> <recipe.json> <out.png>
 zig build golden       # golden-render conformance harness
+zig-out/bin/banksia synth demo.dng   # write a synthetic demo DNG
 ```
