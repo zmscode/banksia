@@ -103,6 +103,36 @@ pub fn build(b: *std.Build) void {
     tidy_step.dependOn(&run_tidy.step);
     test_step.dependOn(&run_tidy.step);
 
+    // ---- `test-abi`: the C smoke test -------------------------------------------
+    // A plain C program compiled against include/banksia.h and linked to the
+    // dylib — no Xcode involved. The fixture DNG is synthesized by the CLI.
+    const smoke_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    smoke_mod.addCSourceFile(.{
+        .file = b.path("tests/abi_smoke.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    smoke_mod.addIncludePath(b.path("include"));
+    smoke_mod.linkLibrary(lib);
+    const smoke = b.addExecutable(.{ .name = "abi_smoke", .root_module = smoke_mod });
+    // Installed too: run it by hand against a 24MP synth for the timing
+    // numbers the phase records.
+    b.installArtifact(smoke);
+
+    const synth_smoke = b.addRunArtifact(exe);
+    synth_smoke.addArg("synth");
+    const smoke_dng = synth_smoke.addOutputFileArg("smoke.dng");
+
+    const run_smoke = b.addRunArtifact(smoke);
+    run_smoke.addFileArg(smoke_dng);
+    run_smoke.addArgs(&.{ "512", "384" });
+    const abi_step = b.step("test-abi", "Smoke-test the C ABI from a C program");
+    abi_step.dependOn(&run_smoke.step);
+    test_step.dependOn(&run_smoke.step);
+
     // ---- `golden`: the conformance speedometer ---------------------------------
     // Renders the synthetic corpus and compares SHA-256es against the committed
     // baseline. `zig build golden -- --update` rewrites the baseline.

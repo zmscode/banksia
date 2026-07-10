@@ -1,7 +1,8 @@
 //! CLI entry point for banksia.
 //!
 //!   banksia render <raw.dng> <recipe.json> <out.png>
-//!   banksia synth <out.dng>     write a synthetic demo DNG (dev fixture)
+//!   banksia synth <out.dng> [<width> <height>]
+//!       write a synthetic demo DNG (dev fixture; defaults to 512x384)
 //!
 //! The CLI owns all I/O; emu stays a pure function over the bytes it is
 //! handed. Note the file write here is temporary — once wombat lands
@@ -29,17 +30,30 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "synth")) {
         const out_path = args.next() orelse return usage();
+        var width: u32 = 512;
+        var height: u32 = 384;
+        if (args.next()) |width_text| {
+            const height_text = args.next() orelse return usage();
+            width = std.fmt.parseInt(u32, width_text, 10) catch return usage();
+            height = std.fmt.parseInt(u32, height_text, 10) catch return usage();
+        }
         if (args.next() != null) return usage();
-        return synth_file(gpa, io, out_path);
+        if (width < 2 or height < 2) return usage();
+        if (width > emu.image.edge_px_max or height > emu.image.edge_px_max) return usage();
+        return synth_file(gpa, io, out_path, width, height);
     }
     return usage();
 }
 
 /// A synthetic scene with structure in every channel: a horizontal
 /// luminance ramp, a vertical colour sweep, and a clipped hot spot.
-fn synth_file(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8) !void {
-    const width: u32 = 512;
-    const height: u32 = 384;
+fn synth_file(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    out_path: []const u8,
+    width: u32,
+    height: u32,
+) !void {
     const black: u16 = 1024;
     const white: u16 = 15360;
     const cfa = [4]emu.dng.CfaColor{ .red, .green, .green, .blue };
@@ -87,7 +101,7 @@ fn synth_file(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8) !void {
     var writer = file.writer(io, &buffer);
     try writer.interface.writeAll(blob);
     try writer.interface.flush();
-    std.debug.print("synthesized {d}x{d} -> {s} ({d} bytes)\n", .{
+    try status(io, "synthesized {d}x{d} -> {s} ({d} bytes)\n", .{
         width, height, out_path, blob.len,
     });
 }
@@ -142,15 +156,24 @@ fn render_file(
     try writer.interface.writeAll(png_bytes);
     try writer.interface.flush();
 
-    std.debug.print("rendered {d}x{d} -> {s} ({d} bytes)\n", .{
+    try status(io, "rendered {d}x{d} -> {s} ({d} bytes)\n", .{
         rendered.width, rendered.height, out_path, png_bytes.len,
     });
+}
+
+/// Progress goes to stdout: stderr is reserved for failures, so build
+/// runners (zig build's own included) don't mistake status for trouble.
+fn status(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &buffer);
+    try writer.interface.print(fmt, args);
+    try writer.interface.flush();
 }
 
 fn usage() error{Usage} {
     std.debug.print(
         \\usage: banksia render <raw.dng> <recipe.json> <out.png>
-        \\       banksia synth <out.dng>
+        \\       banksia synth <out.dng> [<width> <height>]
         \\
     , .{});
     return error.Usage;

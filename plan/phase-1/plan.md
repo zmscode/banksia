@@ -57,15 +57,21 @@ The shell needs `max_edge` before the ABI exists.
 
 ## 3. C smoke test (CI gate)
 
-- [ ] `tests/abi_smoke.c`: create → synth a DNG via the CLI (or embed a
+- [x] `tests/abi_smoke.c`: create → synth a DNG via the CLI (or embed a
       tiny fixture) → load → set recipe → render preview and full →
       assert dims and non-null → error paths (missing file, garbage JSON,
       render before load each return codes and a message) → destroy.
-- [ ] Built and run with `zig build test-abi` (compiles the C file against
-      the dylib with `zig cc` — no Xcode needed); wired into CI on the
-      macOS runner.
-- [ ] Leak gate: the smoke test runs the engine under the debug allocator
-      build and fails on leak report.
+      *(the fixture is `banksia synth` output routed through the build
+      graph — `addOutputFileArg`, no committed blob; the binary also prints
+      render timings, which is how the exit-criteria number is measured)*
+- [x] Built and run with `zig build test-abi` (compiles the C file against
+      the dylib inside the zig build graph — no Xcode needed); wired into
+      CI on the macOS runner. `zig build test` includes it.
+- [x] Leak gate: the smoke test runs the engine under the debug allocator
+      build and fails on leak report. *(mechanism: in debug builds each
+      engine owns a `DebugAllocator` and `bk_engine_destroy` asserts a
+      clean report, so the default-optimize CI run of test-abi aborts on
+      any leak)*
 
 ## 4. The SwiftUI shell (`macos/`)
 
