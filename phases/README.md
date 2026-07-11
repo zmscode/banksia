@@ -1,8 +1,8 @@
 # Banksia phase plans
 
-This directory contains the executable plans for the revised roadmap in
-[`plan-v2.md`](../plan-v2.md). The older `plan/` directory remains a historical
-record of the original phase structure.
+This directory contains the executable plans for the roadmap in
+[`plan.md`](../plan.md). The original linear Phase 0–7 plan it replaced has
+been removed; its history lives in git.
 
 ## Mandatory phases
 

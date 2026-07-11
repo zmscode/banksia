@@ -1,525 +1,201 @@
-# banksia — a RAW photo editor in Zig
+# banksia — product and engineering roadmap
 
-*Architecture and phased implementation plan. Named for the banksia,
-following the house style: Australian flora for projects, Australian fauna
-for the libraries inside (bottlebrush/bilby precedent).*
+> A product-first roadmap for a fast, local-first RAW culling and developing
+> application in Zig, with portable sessions, robust storage, deterministic
+> recipes, and a focused macOS interface.
 
-## One-liner
+**Status:** canonical roadmap  
+**Detailed plans:** [`phases/`](phases/)  
+**Compute strategy:** [`phases/compute-strategy.md`](phases/compute-strategy.md)  
+**Primary target:** macOS on Apple Silicon
 
-A headless, deterministic RAW develop engine in Zig — non-destructive edits,
-content-addressed storage, and git-like versioning built in — with a thin
-macOS SwiftUI shell for visual inspection, and a fast keyboard-driven
-culling/develop tool as the eventual product. Engine priorities follow
-Capture One, not Lightroom: colour fidelity, processing speed, and studio
-workflow over UI breadth.
-
-## Why this and not "Lightroom in Zig"
-
-- **The product wedge**: darktable is powerful but heavy; Lightroom is a
-  subscription; Photo Mechanic ($139) owns "fast culling" and does no
-  developing; Capture One is the engine-quality benchmark but costs more
-  than Lightroom. *Fast, minimal, keyboard-driven culling + C1-grade
-  processing + real version control* is an underserved niche.
-- **The byproducts** are standalone ecosystem gaps in Zig: a develop engine,
-  a content-addressed store with a columnar catalog, a perceptual-hash
-  library. The editor is the forcing function that makes them real.
-- **The engine is headless.** `(RAW file, edit recipe) → image`,
-  deterministic, no UI dependency. Testable with golden renders and oracles,
-  scriptable, embeddable. The GUI — Zig's weakest ecosystem link — is an
-  add-on to iterate on, not a foundation to bet on.
-
-## Architecture
-
-Three fauna libraries under one flora project:
-
-| Component | Name | Scope |
-|---|---|---|
-| The project / app | **banksia** | C ABI, CLI, versioning semantics, export engine, the UIs |
-| Develop engine | **emu** | RAW decode, colour management + camera profiles, the linear-f32 pipeline, render cache, thumbnails. Fast; only runs forward. |
-| Storage | **wombat** | Content-addressed blob vault, content-defined chunking, the columnar catalog, sessions, persistence. The burrow: everything on disk. |
-| Similarity | **lyrebird** | Perceptual hashing, near-duplicate detection, burst grouping, focus/sharpness scoring. The great mimic finds the copies. |
-
-Data flow: **wombat** hands **emu** immutable RAW blobs; **emu** renders
-`(blob, recipe) → image` and memoizes stage outputs back into **wombat**'s
-CAS; **lyrebird** indexes blobs into burst groups and sharpness scores
-stored as catalog columns; **banksia** wires it together behind a C ABI,
-the CLI, and the UIs.
-
-## Capture One influences (processing over UI)
-
-The features worth stealing are engine features. Where each lands:
-
-| Capture One feature | banksia take | Phase |
-|---|---|---|
-| Per-camera colour profiles | Hand-tunable camera profiles in emu (matrix + LUT), not just the bare DNG matrix — C1's colour reputation comes from exactly this | 5 |
-| Process-engine versioning | Recipes/commits record the engine version; old commits render identically forever. Determinism + content addressing make this nearly free, and it hardens the git story | 3 |
-| Sessions vs catalogs | wombat supports both: the global vault/catalog *and* self-contained folder-scoped sessions for shoots (portable, no monolith) | 2 |
-| Process recipes (batch export) | One decode → many simultaneous outputs (formats/sizes/sharpening per output); parallel export queue off the render cache | 6 |
-| Focus mask | Per-tile sharpness scoring (lyrebird) surfaced as a culling overlay and a sortable catalog column — cull the soft frames without zooming | 4 |
-| Advanced colour editor | Targeted hue/sat/lightness by colour range; skin-tone uniformity as a range preset | 5 |
-| Structure/clarity | Local-contrast ops in the pipeline | 5 |
-| Layered local adjustments | Adjustment layers = op groups with masks (parametric + luma/colour range) in the recipe | 5 |
-| Per-ISO noise profiles | Denoise parameterized by (camera, ISO) profile data | 5 |
-| GPU-first processing | Metal compute path; CPU path stays as the reference implementation | 6 |
-| Tethered capture | PTP over USB/IP → instant import → render — the studio workflow C1 owns | 7 |
-
-## Design pillars
-
-### The catalog is a column store — `std.MultiArrayList` is exactly that
-
-A library is 100k+ records of heterogeneous fields, and every interesting
-operation is a filter or sort touching two or three fields out of twenty:
-
-```zig
-const Asset = struct {
-    hash: [32]u8,       // content address of the RAW blob
-    recipe_head: u32,   // current edit version (commit id)
-    capture_time: i64,
-    rating: u3,
-    flags: packed struct { rejected: bool, pick: bool },
-    camera: CameraId,
-    lens: LensId,
-    iso: u32,
-    burst_group: u32,   // populated by lyrebird
-    sharpness: f16,     // populated by lyrebird (focus mask score)
-};
-
-catalog: std.MultiArrayList(Asset),
-
-// "rating >= 4 shot on the 35mm" scans two dense arrays, not
-// 100k scattered structs:
-const ratings = catalog.items(.rating);
-const lenses  = catalog.items(.lens);
-```
-
-Filtering a six-figure library becomes a couple of linear scans over
-contiguous, cache-friendly, SIMD-able columns — smart collections as full
-scans fast enough to skip indexes. Columns also serialize and diff cleanly,
-which feeds the versioning layer.
-
-### Pixels want SoA too — but as planes, not `MultiArrayList`
-
-`MultiArrayList` is for growable heterogeneous records; an image is
-fixed-size homogeneous data. The same struct-of-arrays argument says: store
-planar `[]f32` per channel rather than interleaved RGB. Every kernel becomes
-a clean `@Vector` loop:
-
-```zig
-const V = @Vector(8, f32);
-
-fn applyExposure(plane: []f32, ev: f32) void {
-    const gain: V = @splat(std.math.exp2(ev));
-    var i: usize = 0;
-    while (i + 8 <= plane.len) : (i += 8) {
-        const v: V = plane[i..][0..8].*;
-        plane[i..][0..8].* = v * gain;
-    }
-    while (i < plane.len) : (i += 1) plane[i] *= std.math.exp2(ev);
-}
-```
-
-`MultiArrayList` returns for the record-shaped small stuff: the edit stack
-(`MultiArrayList(Op)` — scan the tag column to plan the pipeline without
-touching params), mask control points, tile descriptors.
-
-### The pipeline (emu)
-
-- **Linear scene-referred f32 end to end** (darktable's modern architecture,
-  and effectively C1's too): do the math in linear light, convert to display
-  space last. The single biggest correct-by-construction decision in a RAW
-  pipeline.
-- **Comptime specialization**: demosaic kernels monomorphized per Bayer
-  pattern (RGGB/BGGR/…); ops specialized over pixel format.
-- **Tiled, threaded execution**: tiles with overlap for convolution ops,
-  `std.Thread.Pool` across tiles, an arena per render so cleanup is one free.
-- **Content-addressed render caching**: each stage's output keyed by
-  `hash(input_hash ++ op_params ++ engine_version)`, stored in wombat.
-  Change the tone curve and everything upstream — including the expensive
-  demosaic — is a cache hit. It's also what makes scrubbing edit *history*
-  (or comparing two branches of an edit) nearly free.
-
-### Versioning (banksia, on top of wombat)
-
-- RAWs are immutable → the heavy data is write-once. All change lives in
-  recipes and catalog state, which are kilobytes.
-- **CAS vault**: import dedups by hash; blobs tier to NAS/S3; check out only
-  what you're working on (the git-annex trick — history tracks references,
-  not content).
-- **Git-like tree over recipes + catalog**: commits, branches, merges.
-  "Virtual copies" become branches of a recipe. Branching a 200GB library
-  costs kilobytes.
-- **Engine-versioned rendering** (the C1 idea): a commit pins the engine
-  version it was made with, so historical commits render bit-identically
-  even after the pipeline improves. Determinism makes this cheap; it also
-  makes golden tests trivially stable.
-- **Content-defined chunking (FastCDC)** for the few big files that do get
-  rewritten (exports, DNG conversions): small change → store only changed
-  chunks.
-
-Honest caveat: dedup won't shrink distinct compressed RAWs — the win is
-"versioning forever costs ~nothing on top of the originals," plus dedup of
-the accidental copies every real library contains.
-
-## The three hard parts, with mitigations
-
-1. **The camera format zoo.** Hundreds of proprietary formats is why
-   everyone uses libraw/rawspeed (C++). Mitigation — the bilby strategy:
-   define emu's decode interface, back it with **libraw via C interop on day
-   one**, write the pure-Zig decoder for **DNG first** (documented spec;
-   Adobe's converter turns anything into DNG), add native CR3/NEF/ARW by
-   popularity later.
-2. **Colour science.** Camera matrices, white-point adaptation, gamut
-   mapping — deep water; *correct* vs *pleasing* is where C1 and darktable
-   spent a decade. Mitigation: the oracle exists. dcraw/libraw reference
-   renders and `darktable-cli` give comparison targets, so the Test262
-   workflow transplants: RAW corpus + reference outputs + perceptual-diff
-   threshold = a conformance speedometer. The number only goes up. C1-grade
-   *pleasing* colour then becomes profile data (Phase 5), not engine
-   rewrites.
-3. **The GUI.** Headless-first buys time; the Phase 1 SwiftUI harness covers
-   inspection. The real UI decision (dvui vs ImGui vs custom) is deferred
-   until the engine earns it.
-
-## macOS visual harness: Zig core + SwiftUI shell
-
-Goal: *see* the pipeline working with sliders. Not the product UI.
-
-- Zig builds `libbanksia.dylib` exposing a tiny **C ABI** (opaque handle +
-  ~6 functions). Swift imports C headers natively — no bridging codegen.
-- SwiftUI app: file picker, 3–4 sliders (EV, temp, tint, contrast), an
-  `Image`. Slider change → rebuild recipe JSON → background render → wrap
-  pixels in `CGImage` → display. ~150 lines of Swift.
-
-### Zig side (`src/capi.zig`)
-
-```zig
-export fn bk_engine_create() ?*Engine;
-export fn bk_engine_destroy(e: *Engine) void;
-export fn bk_load_raw(e: *Engine, path: [*:0]const u8) i32;         // 0 = ok
-export fn bk_set_recipe_json(e: *Engine, json: [*:0]const u8) i32;  // 0 = ok
-// Renders RGBA8; engine owns the buffer, valid until the next render call.
-export fn bk_render(e: *Engine, max_edge: u32, out_w: *u32, out_h: *u32) ?[*]u8;
-export fn bk_last_error(e: *Engine) [*:0]const u8;
-```
-
-Notes:
-- Hand-write `include/banksia.h` (Zig's auto C-header emission was removed;
-  at six functions, keeping it in lockstep manually is fine).
-- Recipe crosses the boundary as a JSON string — trivially debuggable; swap
-  for something binary later if it ever matters.
-- Engine-owns-buffer is the simplest ownership contract for a harness.
-- `max_edge` enables preview-resolution renders while a slider drags,
-  full-res on release — the first "feels responsive" trick.
-
-### Swift side
-
-```
-// CBanksia/module.modulemap
-module CBanksia {
-    header "banksia.h"
-    link "banksia"
-    export *
-}
-```
-
-```swift
-import CBanksia
-
-let engine = bk_engine_create()
-bk_load_raw(engine, path)
-bk_set_recipe_json(engine, recipeJSON)
-var w: UInt32 = 0, h: UInt32 = 0
-if let px = bk_render(engine, 1600, &w, &h) {
-    let data = Data(bytes: px, count: Int(w * h * 4))   // copy = safe to display
-    // wrap in CGImage via CGDataProvider → SwiftUI Image(decorative:)
-}
-```
-
-Threading contract: the engine is not thread-safe; one Swift `actor` owns
-the handle and serializes render calls. Renders run off the main thread;
-SwiftUI receives the finished `CGImage`.
-
-Dev loop: a Makefile that runs `zig build` (dylib + header) then
-`xcodebuild`/opens Xcode. Even before the shell exists, Phase 0's CLI
-(`recipe.json + raw → png` + `open`) gives visual inspection on day one.
+> This roadmap supersedes the original linear Phase 0–7 plan (removed; its
+> history lives in git). Foundation Phases 0 and 1 landed under that
+> structure and are complete; the storage work is re-cut here into 2A/2B/2C.
 
 ---
 
-# Phased implementation
+## Product target
 
-Bottlebrush rules apply: every phase ends with a measurable number in CI,
-and the number only goes up.
+Banksia is not initially trying to reproduce all of Capture One.
 
-The sections below are the summaries. The granular per-phase plans —
-task checklists, test plans, exit criteria with recorded numbers, and
-learnings — live in [`plan/phase-N/plan.md`](plan/); work from those, and
-record deviations there in the same commit as the work.
+The first credible product is:
 
-## Phase 0 — emu bootstrap: decode, minimal pipeline, golden harness
+> A fast, keyboard-driven macOS workflow for importing, culling, globally
+> developing, and exporting a shoot, with portable sessions, immutable
+> originals, reliable recovery, and inspectable recipes.
 
-> **Objective:** A CLI that renders a real DNG to a PNG through a linear-f32
-> pipeline, scored against reference renders in CI. This phase produces the
-> *speedometer* and the engine skeleton every later phase leans on.
->
-> **Definition of done:** `zig build render -- shot.dng recipe.json out.png`
-> works; `zig build golden` compares a small RAW corpus against committed
-> reference outputs with a perceptual-diff threshold and CI fails on
-> regression.
+The mandatory workflow is:
 
-- [x] Project skeleton: `build.zig` with steps `render` (CLI), `test`
-      (unit), `golden` (conformance); `emu/`, `wombat/`, `lyrebird/` as
-      module dirs from day one, even if the latter two are stubs. *(plus
-      `test-tidy`: bans, reminders, 100-column ratchet, from day one)*
-- [x] Decode interface: `decode(blob) → SensorData` (Bayer plane, CFA
-      pattern, black/white levels, WB neutral). The interface is the
-      contract; backends are swappable. *(deviation: takes bytes, not a
-      path — emu stays a pure function and the CLI owns I/O; lives in
-      `emu/dng.zig`; colour matrix/orientation tags arrive with the colour
-      work in Phase 5)*
-- [ ] libraw backend via C interop (the bilby strategy: real engine behind
-      the interface later). *(deferred: no libraw in the dev environment;
-      the pure-Zig DNG path landed first, so the fallback is now the
-      native decoder's job to replace, not precede)*
-- [x] Pure-Zig DNG decoder (TIFF container walk, bounded worklist
-      IFD/SubIFD chain, both byte orders, strips and tiles, uncompressed
-      and lossless-JPEG — real-camera DNGs decode). *(untrusted input
-      returns named errors, never asserts — fixtures roundtrip via
-      `emu/dng_write.zig` in all four container shapes)*
-- [x] Pipeline core (`emu/pipeline.zig`): planar `[]f32` image type; op
-      stack as `MultiArrayList(Op)`; ops: black point → white balance →
-      bilinear demosaic → exposure → tone curve → sRGB encode. *(engine
-      v1 validates stack shape; arena per render; RGBA8 out)*
-- [x] `@Vector` kernels for the per-pixel ops; comptime-specialized demosaic
-      per CFA pattern (RGGB/BGGR/GRBG/GBRG monomorphized).
-- [x] Determinism from day one: two renders are byte-identical, held by a
-      test. *(thread-count/tile-size invariance becomes testable when the
-      thread pool lands in Phase 1–2; the pipeline is single-threaded yet)*
-- [x] Recipe JSON: parse (std.json, strict) / canonical hand-written
-      serialize; recipes carry `engine_version` from the first commit;
-      snapshot + roundtrip tests.
-- [x] PNG writer (zero-dependency: stored-deflate zlib, std.hash CRC32 and
-      Adler32) for CLI output; `banksia synth` writes a demo DNG fixture.
-- [x] **Golden harness**: 10 cases (5 synthetic scenes × 2 recipes) written
-      as real DNG blobs, decoded and rendered through the whole engine,
-      SHA-256ed against `golden/baseline.json` in CI — any drift fails the
-      build. *(deviation: the corpus is synthetic and the oracle is
-      byte-exactness, not perceptual diff; vendored real-camera DNGs with
-      dcraw/darktable-cli reference renders and a ΔE threshold are the
-      upgrade path once a corpus is vendored)*
+```text
+Create or open a portable session
+→ import a supported shoot without modifying the source
+→ see thumbnails immediately
+→ rate, reject, compare, and filter
+→ make global adjustments
+→ crop and straighten
+→ export full-resolution and web JPEGs
+→ close, reopen, verify, and repeat the export
+```
 
-## Phase 1 — the C ABI and the SwiftUI inspection shell
+The first useful release does not require broad Capture One parity, native
+proprietary decoders, local brushes, automatic subject masks, broad tethering,
+cloud sync, GPU-only rendering, printing, or complete Git semantics.
 
-> **Objective:** Move visual inspection from "render a PNG and `open` it" to
-> live sliders. Prove the Zig↔Swift boundary before any storage work.
->
-> **Definition of done:** A macOS app with EV/temp/tint/contrast sliders
-> re-renders a loaded RAW live (sub-second at preview resolution); the C ABI
-> surface is ≤ 8 functions and documented in `include/banksia.h`.
+## Product success gate
 
-- [x] `src/capi.zig` with the `bk_*` surface above; `b.addLibrary(.{
-      .linkage = .dynamic })` producing `libbanksia.dylib`; install step
-      copies dylib + hand-written header. *(7 functions; `bk_version`
-      joined the sketch's six)*
-- [x] Error-handling convention across the boundary: integer codes +
-      `bk_last_error` string; no Zig errors escape.
-- [x] Xcode project (or SwiftPM app) with `CBanksia` module map; ~~Makefile~~
-      dev loop is `zig build shell` / `zig build run-shell` — SwiftPM
-      driven from the zig build graph, no make (deviation recorded in
-      `plan/phase-1/plan.md`).
-- [x] Swift `actor` wrapping the engine handle; renders on a background
-      task; `CGImage` wrapping of the RGBA8 buffer.
-- [x] SwiftUI: file picker, sliders bound to a recipe model, debounced
-      re-render, image view.
-- [x] Preview-resolution renders while dragging (`max_edge`), full-res on
-      release. *(24MP-class preview at edge 1024: 116 ms warm, ReleaseFast
-      on Apple Silicon)*
-- [x] CI: build the dylib on a macOS runner; smoke-test the C ABI from a
-      tiny C program (no Xcode needed in CI); the debug-allocator leak
-      gate rides the same binary.
+Banksia reaches its first useful release when:
 
-## Phase 2 — wombat: content-addressed vault + columnar catalog
+- a real supported shoot of at least 100 images is completed without another
+  RAW editor;
+- source files remain byte-identical;
+- acknowledged imports and edits survive tested crash points;
+- supported images have correct geometry, white balance, and baseline colour;
+- cached culling is responsive on a 10,000-image session;
+- full-resolution and web JPEG batches are delivered safely;
+- a signed application runs without a development toolchain;
+- session verification detects missing or corrupt data;
+- camera and format limits are documented honestly.
 
-> **Objective:** The storage layer: import photos into a CAS vault with
-> dedup, and a columnar catalog fast enough to filter a six-figure library
-> by full scan. Simulation-tested from day one. Both C1 workflow shapes:
-> the global catalog and self-contained sessions.
->
-> **Definition of done:** `banksia import <dir>` ingests a card, dedups
-> byte-identical files, and populates the catalog; a 100k-asset synthetic
-> catalog filters by rating+lens in single-digit milliseconds; the crash
-> simulator (inject torn writes / kill mid-import) never loses an
-> acknowledged blob across 10k randomized runs in CI.
+---
 
-- [ ] Blob store: BLAKE3-addressed files in a sharded object dir; write =
-      hash → temp file → fsync → rename; verify-on-read mode.
-- [ ] **Deterministic simulation harness** (the TigerBeetle discipline): a
-      filesystem shim that injects crashes, torn writes, and reordering;
-      seed-reproducible; runs in CI.
-- [ ] FastCDC chunking for mutable big files (exports, catalogs); chunk
-      index. Distinct RAWs won't chunk-dedup — that's fine and documented.
-- [ ] Catalog: `MultiArrayList(Asset)` + string/keyword interning tables;
-      snapshot-to-disk persistence with a small WAL for incremental updates.
-- [ ] **Sessions** (C1): a session = a self-contained directory (vault +
-      catalog + recipes scoped to one shoot), portable across machines;
-      `banksia session new <dir>`; import-into-catalog from a session later.
-- [ ] Import pipeline: hash → dedup check → blob write → EXIF extract
-      (capture time, camera, lens, ISO) → catalog append.
-- [ ] Thumbnail cache: emu renders small previews, memoized into the CAS
-      (first use of the render-cache pattern).
-- [ ] Filter engine: predicate → columnar scans; benchmark target in CI
-      (the speedometer for this phase is a latency number).
+## Current state
 
-## Phase 3 — versioning: recipes as commits, engines as versions
+### Foundation Phase 0 — engine bootstrap
 
-> **Objective:** The git layer. Every edit is a commit; virtual copies are
-> branches; history is scrubbable; commits render identically forever. This
-> is the feature no competitor has (C1's process-engine versioning is the
-> closest, and it has no history/branches).
->
-> **Definition of done:** `banksia log <photo>` shows edit history;
-> `banksia branch <photo> alt-crop` forks a recipe; checking out any
-> historical version re-renders via cache in under 100ms at preview size;
-> a commit made under engine v1 renders bit-identically after the pipeline
-> gains new ops; the version store for a 10k-photo library stays under 50MB.
+**Complete.** Native DNG/TIFF decode, strips and tiles, uncompressed CFA,
+lossless JPEG, deterministic planar-f32 processing, canonical recipes, PNG/CLI
+output, and a synthetic golden harness are implemented.
 
-- [ ] Commit model: recipe blobs (canonical-form JSON, content-addressed in
-      wombat) + a commit object (parent hash, recipe hash, engine version,
-      timestamp, message) — a Merkle chain per asset, plus library-level
-      snapshots of catalog state.
-- [ ] **Engine versioning** (C1): the pipeline registry is versioned; a
-      commit's `engine_version` selects op implementations, so improving a
-      curve or demosaic never silently changes old renders. New edits get
-      the newest engine; `banksia upgrade <photo>` migrates explicitly.
-- [ ] `recipe_head` column in the catalog points at the current commit;
-      branches are named refs per asset.
-- [ ] Render-cache keying by `(blob hash, recipe hash, engine version,
-      stage index)` so history scrubbing and branch comparison are cache
-      hits.
-- [ ] CLI verbs: `log`, `branch`, `checkout`, `diff` (recipe diff — it's
-      JSON, diff the op stacks structurally), `upgrade`.
-- [ ] Merge = op-stack merge with conflicts surfaced (last-writer-wins per
-      op as the v1 policy; real merge UI later).
-- [ ] Harness-shell support: a history scrubber slider in the SwiftUI app —
-      drag through an edit's history live (this is the demo).
+Current golden result: **20 pass, 0 fail**. These cases prove regression
+stability, not real-camera colour correctness.
 
-## Phase 4 — lyrebird + the culling workflow
+### Foundation Phase 1 — C ABI and inspection shell
 
-> **Objective:** Perceptual similarity, sharpness scoring, and the first
-> *product* surface: a keyboard-driven culling grid with burst stacks and a
-> C1-style focus mask.
->
-> **Definition of done:** Import a 1000-shot shoot; bursts are auto-grouped;
-> the grid navigates/rates/rejects entirely from the keyboard at 60fps; the
-> focus overlay separates sharp from soft frames without zooming; lyrebird's
-> precision/recall on a labelled burst corpus is scored in CI.
+**Complete.** The seven-function C ABI, C smoke test, debug leak gate, Swift
+actor wrapper, SwiftUI sliders, and preview/full-resolution rendering are
+implemented.
 
-- [ ] lyrebird: dHash/pHash over emu preview renders; Hamming-distance
-      BK-tree or SIMD linear scan (100k × 64-bit hashes is small — measure
-      first).
-- [ ] Time-windowed burst grouping (perceptual distance + capture-time
-      proximity); writes the `burst_group` column.
-- [ ] **Focus mask** (C1): per-tile Laplacian-variance sharpness from the
-      preview render → `sharpness` column (sortable: "show me the soft
-      ones") + an edge-overlay heatmap in the UI for the selected frame.
-- [ ] Labelled corpus + precision/recall scoring in CI (lyrebird's
-      speedometer); sharpness scored against a hand-labelled sharp/soft set.
-- [ ] Culling UI (grow the SwiftUI shell): virtualized thumbnail grid off
-      the columnar catalog, burst stacks collapse to the pick, J/K/arrows +
-      number-key ratings, X to reject, F toggles the focus overlay; every
-      action is a catalog commit (undo = version history, for free).
-- [ ] `banksia dedupe` CLI: near-duplicate report across the whole library.
+Recorded 24MP-class Apple Silicon results:
 
-## Phase 5 — develop maturity: C1-grade processing
+- warm edge-1024 preview: 116 ms;
+- first edge-1024 preview: 283 ms;
+- full-resolution render: 424 ms.
 
-> **Objective:** From "proves the pipeline" to "produces keepers": better
-> demosaic, real colour management with camera profiles, the colour editor,
-> local adjustments as layers, and the develop UI.
->
-> **Definition of done:** The golden-corpus perceptual score against
-> darktable-cli reference renders crosses an agreed threshold; at least two
-> cameras have tuned profiles that beat the bare-matrix render in a blind
-> A/B; a real shoot can be culled *and* finished in banksia end to end.
+The current preview still renders at full resolution before downsampling.
 
-- [ ] RCD (or AMaZE) demosaic behind the same comptime-specialized
-      interface; golden corpus scores the improvement.
-- [ ] Proper colour management: camera matrix → working space →
-      display-referred output transform (filmic-style tone mapping).
-- [ ] **Camera profiles** (C1's crown jewel): per-camera profile = matrix +
-      1D/3D LUT, loadable as data; a profile-tuning workflow (render a
-      ColorChecker shot, solve for the LUT); ship hand-tuned profiles for
-      the developer's own cameras first.
-- [ ] **Colour editor** (C1): targeted hue/sat/lightness adjustments by
-      colour range (hue wedge + smooth falloff); skin-tone range preset with
-      uniformity control.
-- [ ] **Structure/clarity**: local-contrast ops (guided-filter or bilateral
-      base/detail split).
-- [ ] **Per-ISO denoise profiles** (C1): profiled non-local-means or wavelet
-      denoise parameterized by (camera, ISO); profile data measured from
-      dark/flat frames.
-- [ ] **Adjustment layers** (C1): recipe ops grouped into layers, each with
-      a mask — parametric shapes (elliptical/gradient), luma range, colour
-      range; mask control points in `MultiArrayList`; layers compose in
-      order.
-- [ ] Crop/rotate with the geometry op recorded in the recipe like any
-      other.
-- [ ] Develop UI: single-image view, op-stack/layers panel, before/after,
-      side-by-side branch comparison (the Phase 3 payoff made visual).
+### Foundation Phase 2 — storage primitives
 
-## Phase 6 — performance + the export engine
+**In progress (Phase 2A).** The filesystem seam (`wombat/vfs.zig`, real + sim
+backends), the BLAKE3 vault with the fsync/rename durability protocol, the
+seeded crash simulator (`zig build sim`, 10k runs, zero acknowledged blob
+loss), explicit GC, FastCDC chunking with manifest objects, and the columnar
+catalog (`std.MultiArrayList`, snapshot + generation-tagged WAL, `zig build
+bench` at 0.19 ms/100k-asset filter) are implemented and `zig build test` is
+green (48 tests).
 
-> **Objective:** Speed where it's felt: GPU processing, native decoders for
-> the big three, and C1-style process recipes for batch export.
->
-> **Definition of done:** Slider-drag re-render at preview res under 16ms on
-> Apple Silicon for the common op subset; a 500-photo shoot exports to two
-> simultaneous output recipes (full-res JPEG + 2048px web) saturating all
-> cores; top-3 native decoders pass the golden corpus without libraw.
+Remaining before the storage contract is trustworthy, tracked in
+[`phases/2a-storage-closure/plan.md`](phases/2a-storage-closure/plan.md):
+catalog mutations are not yet exercised by the crash simulator, mutation
+acknowledgement is not failure-atomic (the WAL record is durable before the
+in-memory apply, so an allocation failure can surface as success after
+reopen), vault directory creation is modelled as always-durable in the sim,
+and sessions/import/thumbnail scheduling do not exist.
 
-- [ ] Metal compute path for the hot ops (keep the CPU path as the
-      reference implementation the GPU path is tested against — determinism
-      contract: GPU output must match CPU within the golden threshold).
-- [ ] **Process recipes** (C1): named output configurations (format, size,
-      colour space, output sharpening); one develop render fans out to N
-      outputs; `banksia export --recipe web --recipe print <selection>`.
-- [ ] Parallel export queue: per-photo renders across the thread pool,
-      reusing the render cache for shared prefixes of the op stack.
-- [ ] Native decoders: CR3, NEF, ARW — validated against libraw output on
-      the corpus, then libraw becomes optional.
-- [ ] Tile-level parallel render-cache warming (background full-res render
-      after the preview lands).
-- [ ] Profile-guided pass over the catalog scans and import path at 500k
-      assets.
+---
 
-## Phase 7 — studio: tethered capture
+## Roadmap
 
-> **Objective:** The workflow Capture One owns and nothing open-source does
-> well: camera → cable → instant render. Sessions (Phase 2) were built for
-> this.
->
-> **Definition of done:** A supported camera shoots tethered into a live
-> session: frame lands, imports, renders with the session's default recipe,
-> and appears in the grid in under 2 seconds, hands-free.
+| Phase | Outcome | Detailed plan | Indicative solo duration |
+|---|---|---|---:|
+| 2A | Stable storage and catalog contract | [`phases/2a-storage-closure/plan.md`](phases/2a-storage-closure/plan.md) | 1–3 weeks |
+| 2B | Correct real-camera DNG baseline | [`phases/2b-real-camera-correctness/plan.md`](phases/2b-real-camera-correctness/plan.md) | 4–8 weeks |
+| 2C | Safe portable sessions and import | [`phases/2c-sessions-import/plan.md`](phases/2c-sessions-import/plan.md) | 4–7 weeks |
+| 3 | Keyboard-driven culling MVP | [`phases/3-culling-mvp/plan.md`](phases/3-culling-mvp/plan.md) | 5–8 weeks |
+| 4 | Baseline global develop | [`phases/4-global-develop/plan.md`](phases/4-global-develop/plan.md) | 6–10 weeks |
+| 5 | Practical export; first completed shoot | [`phases/5-practical-export/plan.md`](phases/5-practical-export/plan.md) | 4–8 weeks |
+| 6 | Product hardening and private alpha | [`phases/6-private-alpha/plan.md`](phases/6-private-alpha/plan.md) | 6–10 weeks |
+| 7 | Interoperability, LibRaw, public beta | [`phases/7-interoperability-public-beta/plan.md`](phases/7-interoperability-public-beta/plan.md) | 6–12 weeks |
+| 8 | Immutable history, variants, reproducibility | [`phases/8-history-variants/plan.md`](phases/8-history-variants/plan.md) | 5–9 weeks |
 
-- [ ] PTP over USB (and PTP/IP for the cameras that support it); start with
-      one camera family the developer owns.
-- [ ] Live session ingest: capture event → wombat import → emu preview
-      render → catalog append → UI update, as one streaming path.
-- [ ] Session default recipe: new frames inherit the shoot's develop
-      settings (white balance dialed on frame 1 applies to frame 400).
-- [ ] Overlay/compare: live frame against a pinned reference frame (the
-      studio use case: matching a layout comp).
-- [ ] Graceful degradation: tether drops are recoverable; the simulation
-      harness gets a flaky-transport mode.
+```mermaid
+graph TD
+    F0[Foundation 0: engine] --> P2A[2A: storage closure]
+    F1[Foundation 1: ABI and shell] --> P2A
+    P2A --> P2B[2B: real-camera correctness]
+    P2B --> P2C[2C: sessions and import]
+    P2C --> P3[3: culling MVP]
+    P3 --> P4[4: global develop]
+    P4 --> P5[5: practical export]
+    P5 --> P6[6: private alpha]
+    P6 --> P7[7: interoperability and public beta]
+    P7 --> P8[8: history and variants]
+```
 
-## Sequencing notes
+## Evidence-gated branches
 
-- Phases 0→1 are strictly ordered (the shell needs the ABI needs the
-  engine). Phase 2 (wombat) is independent of Phase 1 and can interleave.
-- lyrebird (Phase 4) needs emu previews (Phase 0) and the catalog (Phase 2)
-  but not versioning (Phase 3).
-- Phase 5's camera profiles and colour editor are independent of Phase 4
-  and can pull forward if develop quality matters sooner than culling.
-- Phase 7 (tether) depends on sessions (Phase 2) and the import path, not
-  on Phases 5–6 — it can pull forward for a studio-first strategy.
-- Every phase keeps the golden/bench/simulation numbers from earlier phases
-  running in CI — the banksia scoreboard accretes, never resets.
+These are not mandatory sequential phases. Each branch moves through
+**Discover → Prove → Invest → Ship**, or is deliberately parked.
+
+| Branch | Hypothesis | Plan |
+|---|---|---|
+| A | Smart grouping and focus assistance materially reduce culling time | [`phases/branch-a-smart-culling/plan.md`](phases/branch-a-smart-culling/plan.md) |
+| B | Advanced processing lets a narrow camera set finish harder shoots | [`phases/branch-b-advanced-processing/plan.md`](phases/branch-b-advanced-processing/plan.md) |
+| C | CPU optimization or Metal improves measured user-visible bottlenecks | [`phases/branch-c-performance-metal/plan.md`](phases/branch-c-performance-metal/plan.md) |
+| D | One-camera tethering creates enough studio value to justify support | [`phases/branch-d-tethering/plan.md`](phases/branch-d-tethering/plan.md) |
+
+---
+
+## Compute position
+
+Banksia should use parallelism, but in layers and only under one
+memory-aware scheduler.
+
+1. **Keep SIMD in hot kernels now.** It is local, deterministic, and already
+   useful for per-pixel work.
+2. **Use bounded asset-level parallelism first.** Thumbnail generation, metadata
+   extraction, hashing, verification, and export naturally operate on independent
+   photos.
+3. **Keep catalog and WAL mutation single-writer.** Parallel preparation may
+   feed one ordered commit path.
+4. **Add intra-image tile threading after the real-camera reference path is
+   stable.** Prove output invariance across thread counts and tile sizes.
+5. **Avoid nested pools.** The global scheduler chooses between parallel photos
+   and parallel tiles according to priority and memory budget.
+6. **Keep a strict CPU renderer as the canonical backend.** It defines historical
+   reproducibility and validates accelerated implementations.
+7. **Use Metal only after CPU planning, cache reuse, and preview-resolution work
+   still miss a measured interaction target.** Approximate GPU output receives a
+   separate renderer/cache identity.
+
+The detailed scheduler, queue, memory-token, cancellation, and GPU recommendations
+are in [`phases/compute-strategy.md`](phases/compute-strategy.md).
+
+---
+
+## Planning rules
+
+- Correctness before format or feature breadth.
+- User workflows before infrastructure expansion.
+- Stable contracts with replaceable implementations.
+- Every phase has tests, workloads, measurable gates, risks, and non-goals.
+- No silent recipe, renderer, session, or profile compatibility changes.
+- Synthetic goldens prove determinism; real corpora prove photographic behavior.
+- Performance claims use named hardware, corpus, build mode, and p50/p95/p99.
+- Optional branches must pass evidence gates rather than become automatic scope.
+
+Shared identity, durability, cache, validation, scoreboard, and close-out rules
+live in [`phases/README.md`](phases/README.md).
+
+## Immediate sequence
+
+1. Finish and test the current catalog.
+2. Correct validation and mutation acknowledgement semantics.
+3. Extend crash simulation to catalog mutations and compaction.
+4. Reconcile vault directory durability with the simulator model.
+5. Restore `zig build test` to green.
+6. Build the licensed real-camera DNG corpus.
+7. Implement orientation, crop metadata, and baseline DNG colour.
+8. Complete the LibRaw feasibility spike.
+9. Implement portable sessions and bounded streaming import.
+10. Build manual culling before smart-culling work.

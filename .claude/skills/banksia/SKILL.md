@@ -6,11 +6,24 @@ description: Use when implementing or designing any part of banksia, the RAW pho
 # Building banksia
 
 banksia is a headless, deterministic RAW develop engine in Zig with a thin
-native UI on top. The full plan, phase list, and definitions of done live in
-`plan.md` — read the current phase's section before starting work, do the
-next unchecked task, and never regress a CI number. Every phase ends with a
-measurable number (golden score, latency, simulation runs, precision/recall),
-and the number only goes up.
+native UI on top. The roadmap lives in `plan.md`; the executable per-phase
+plans — task checklists, tests, exit criteria with recorded numbers, risks,
+and non-goals — live in [`phases/`](../../../phases/), one directory per
+phase. Read the current phase's plan before starting work, do the next
+unchecked task, check it off in the same commit, and never regress a CI
+number. Every phase ends with a measurable number (golden score, latency,
+simulation runs, ΔE, precision/recall) and the number only goes up.
+
+## Current status
+
+Foundation Phases 0 (engine bootstrap) and 1 (C ABI + SwiftUI shell) are
+**complete**. Storage is re-cut into 2A/2B/2C; the project is in **Phase 2A**
+(storage-closure) — vault, crash simulator, chunker, and columnar catalog are
+in and `zig build test` is green, with catalog crash-coverage, failure-atomic
+acknowledgement, and vault directory durability still open. The compute /
+threading / Metal doctrine is [`phases/compute-strategy.md`](../../../phases/compute-strategy.md);
+shared durability, cache-identity, and scoreboard contracts are
+[`phases/README.md`](../../../phases/README.md).
 
 ## Layout
 
@@ -110,11 +123,15 @@ and the number only goes up.
   interfaces. Zero-cost dispatch for anything known at compile time.
 - **`@Vector` SIMD** with a scalar tail in every per-pixel kernel; measure
   before hand-tuning further.
-- **Threading**: tiles across a `std.Thread.Pool`; in the shell, IO and
-  rendering are separate threads feeding the UI (Ghostty's surface model).
-  The GPU path (Phase 6) is an *optimization of* the CPU path — the CPU
-  implementation is the reference the GPU is tested against, within the
-  golden threshold.
+- **Threading in layers, under one scheduler** (see
+  [`compute-strategy.md`](../../../phases/compute-strategy.md)): SIMD in
+  kernels now; bounded asset-level parallelism (thumbnails, hashing, export)
+  next; the catalog/WAL stays single-writer; intra-image tiling comes only
+  after the real-camera CPU reference is stable and proves output invariance
+  across thread counts and tile sizes. No nested pools; admission is
+  memory-token aware, not core-count aware. The GPU/Metal path is Branch C —
+  evidence-gated, an *optimization of* the canonical CPU path and tested
+  against it, never a separate architecture goal.
 
 ## Testing — the interlock
 
@@ -164,15 +181,22 @@ assertions make corruption loud, fuzzing makes the two of them find bugs.
   dragging, full-res on release) → `CGImage` → view.
 - Copy pixels out of the engine buffer before displaying (`Data(bytes:count:)`)
   — never let a `CGImage` alias memory the next render will overwrite.
-- SwiftLint on the Swift side; the Makefile dev loop is
-  `zig build && xcodebuild`.
+- The dev loop is `zig build`, not make: `zig build shell` builds the dylib,
+  installs the header, and drives `swift build`; `zig build run-shell`
+  launches the app. Tooling stays in Zig (no Makefiles).
 
 ## Workflow
 
-- Find the current phase in `plan.md`; do the next unchecked task; check
-  it off in the same commit as the implementation.
+- Find the current phase's plan under `phases/`; do the next unchecked task;
+  check it off in the same commit as the implementation and record deviations
+  in the plan.
 - A task isn't done until its tests exist and the phase's CI numbers hold.
-  New capability without a new number is not done.
+  New capability without a new number is not done. Each phase closes with the
+  template in [`phases/README.md`](../../../phases/README.md) — actual numbers,
+  deviations, and learnings recorded.
+- Evidence-gated branches (A–D) are hypotheses, not scheduled scope: they pass
+  Discover→Prove→Invest→Ship or are deliberately parked. Don't pull branch
+  work into a mandatory phase without the gate.
 - Commit messages: what changed and why, present tense, no fluff. Zero
   technical debt policy — do it right the first time; in a photo tool the
   interest on debt is paid in someone's corrupted library.
