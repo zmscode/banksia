@@ -186,6 +186,29 @@ pub fn build(b: *std.Build) void {
     const sim_step = b.step("sim", "Run the wombat crash simulator (10k seeded runs)");
     sim_step.dependOn(&run_sim.step);
 
+    // ---- `bench`: the catalog filter speedometer ---------------------------------
+    // Always ReleaseFast — the exit criterion is a ReleaseFast number.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("wombat/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("wombat/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "wombat", .module = bench_mod }},
+        }),
+    });
+    b.installArtifact(bench_exe);
+    const run_bench = b.addRunArtifact(bench_exe);
+    run_bench.has_side_effects = true;
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Time the 100k-asset catalog filter (ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
+
     // ---- `golden`: the conformance speedometer ---------------------------------
     // Renders the synthetic corpus and compares SHA-256es against the committed
     // baseline. `zig build golden -- --update` rewrites the baseline.

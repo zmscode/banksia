@@ -68,21 +68,26 @@
 
 ## 4. Columnar catalog
 
-- [ ] `wombat/catalog.zig`: `std.MultiArrayList(Asset)` — hash handle
+- [x] `wombat/catalog.zig`: `std.MultiArrayList(Asset)` — hash handle
       (u32 into a blob-hash side table), recipe_head (u32), capture_time
       (i64), rating (u3), packed flags, camera/lens ids (u16 interned),
       iso (u32), burst_group (u32, Phase 4), sharpness (f16, Phase 4).
-- [ ] Interning tables: string → u16 id, id → string; serialized with the
+- [x] Interning tables: string → u16 id, id → string; serialized with the
       snapshot.
-- [ ] Persistence: snapshot file (header + per-column sections + BLAKE3
-      trailer) + WAL of append-only records (add_asset, set_rating,
-      set_flags, …). Open = load snapshot, replay WAL; `compact` folds the
-      WAL into a fresh snapshot. All through the vfs seam → crash-sim
-      covers torn WAL tails (a torn record is truncated, never applied
-      half-way).
-- [ ] Filter engine: predicate → columnar scans touching only named
+- [x] Persistence: snapshot file (magic + version + generation + column
+      sections + BLAKE3 trailer) + WAL of CRC32-framed append-only records
+      (add_asset, set_rating, set_flags). Open = load snapshot, replay WAL;
+      `compact` folds the WAL into a fresh snapshot. All through the vfs
+      seam → crash-sim covers torn WAL tails (a torn record is truncated,
+      never applied half-way). *(records carry the snapshot generation, so
+      a crash between "snapshot renamed" and "WAL cleared" can't
+      double-apply history — the property test exercises interleaved
+      compactions)*
+- [x] Filter engine: predicate → columnar scans touching only named
       columns; `zig build bench` builds a 100k synthetic catalog and
-      times rating+lens filters in ReleaseFast.
+      times rating+lens filters in ReleaseFast. *(matches a naive
+      row-oracle in a unit test; the fused two-column scan is already fast
+      enough that a per-column bitmap pass is deferred until it isn't)*
 
 ## 5. Sessions and import
 

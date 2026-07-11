@@ -8,9 +8,11 @@
 pub const vfs = @import("vfs.zig");
 pub const vault = @import("vault.zig");
 pub const chunker = @import("chunker.zig");
+pub const catalog = @import("catalog.zig");
 
 test {
     _ = vfs;
     _ = vault;
     _ = chunker;
+    _ = catalog;
 }

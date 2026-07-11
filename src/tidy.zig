@@ -43,7 +43,12 @@ const bans = [_]Ban{
     .{
         .pattern = "std.debug.print(",
         .replacement = "returning errors (libraries are silent)",
-        .exempt = &.{ "src/main.zig", "golden/runner.zig", "wombat/sim.zig" },
+        .exempt = &.{
+            "src/main.zig",
+            "golden/runner.zig",
+            "wombat/sim.zig",
+            "wombat/bench.zig",
+        },
     },
     // wombat owns every byte on disk (plan.md invariant 3). Everything
     // else writes through the vfs seam or wombat.vfs.user_file_write.

@@ -50,3 +50,8 @@ jobs:
       # locally from the hash alone.
       - name: Crash simulator (10k runs)
         run: zig build sim
+
+      # The catalog speedometer: a two-column filter over 100k assets, in
+      # single-digit milliseconds. Fails on >2x the 10 ms budget.
+      - name: Catalog filter benchmark
+        run: zig build bench
