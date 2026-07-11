@@ -322,30 +322,53 @@ pub fn CatalogType(comptime Fs: type) type {
             defer catalog.gpa.free(bytes);
 
             var offset: usize = 0;
-            while (offset < bytes.len) {
-                const valid = wal_record_validate(bytes[offset..]) orelse break;
-                try catalog.record_apply(valid);
-                offset += 8 + valid.len;
-            }
-            if (offset < bytes.len) {
-                // Torn tail: truncate to the valid prefix so future appends
-                // land after intact records, never after garbage.
-                try catalog.fs.write_file(wal_path, bytes[0..offset]);
+            const torn_at: ?usize = scan: while (offset < bytes.len) {
+                switch (wal_record_scan(bytes[offset..])) {
+                    .record => |payload| {
+                        try catalog.record_apply(payload);
+                        offset += 8 + payload.len;
+                    },
+                    // An incomplete final frame is the expected power-cut
+                    // signature: truncate it and keep the intact prefix.
+                    .torn => break :scan offset,
+                    // A complete frame that fails its checksum (or a garbage
+                    // header) is interior corruption: later bytes may be
+                    // intact records, so never truncate them away. Report
+                    // and preserve the file for inspection.
+                    .corrupt => return error.CorruptCatalog,
+                }
+            } else null;
+
+            if (torn_at) |valid_len| {
+                assert(valid_len < bytes.len);
+                try catalog.fs.write_file(wal_path, bytes[0..valid_len]);
                 try catalog.fs.fsync_file(wal_path);
             }
         }
 
-        /// The payload of the record at the head of `bytes`, or null for a
-        /// torn/corrupt head (length insane, frame truncated, crc wrong).
-        fn wal_record_validate(bytes: []const u8) ?[]const u8 {
-            if (bytes.len < 8) return null;
+        const RecordScan = union(enum) {
+            /// A complete, length-framed, checksum-valid record payload.
+            record: []const u8,
+            /// The final frame is incomplete (header or payload cut at EOF).
+            torn,
+            /// A complete-looking frame that fails its checksum, or a header
+            /// whose length is impossible for a real record.
+            corrupt,
+        };
+
+        /// Classify the record at the head of `bytes`. The distinction that
+        /// matters: a torn tail may be truncated, interior corruption may
+        /// not — the two look different because a torn write leaves a short
+        /// final frame while a bit flip preserves length but breaks the CRC.
+        fn wal_record_scan(bytes: []const u8) RecordScan {
+            if (bytes.len < 8) return .torn; // partial header at EOF
             const len = std.mem.readInt(u32, bytes[0..4], .little);
-            if (len > wal_record_bytes_max - 8) return null;
-            if (bytes.len < 8 + len) return null;
+            if (len > wal_record_bytes_max - 8) return .corrupt; // impossible length
+            if (bytes.len < 8 + len) return .torn; // payload cut at EOF
             const payload = bytes[8..][0..len];
             const crc = std.mem.readInt(u32, bytes[4..8], .little);
-            if (std.hash.crc.Crc32.hash(payload) != crc) return null;
-            return payload;
+            if (std.hash.crc.Crc32.hash(payload) != crc) return .corrupt;
+            return .{ .record = payload };
         }
 
         const RecordTag = enum(u8) { add_asset = 1, set_rating = 2, set_flags = 3 };
@@ -778,6 +801,38 @@ test "a torn WAL tail is truncated, never half-applied (negative space)" {
     var reopened = try TestCatalog.open(gpa, &sim);
     defer reopened.deinit();
     try std.testing.expectEqual(@as(u32, 2), reopened.count());
+}
+
+test "interior WAL corruption is reported, not silently truncated away" {
+    const gpa = std.testing.allocator;
+    var sim = vfs.Sim.init(gpa, 28, .{});
+    defer sim.deinit();
+
+    {
+        var catalog = try TestCatalog.open(gpa, &sim);
+        defer catalog.deinit();
+        _ = try catalog.asset_add(.{ .hash = test_hash(1), .camera = "A", .lens = "L" });
+        _ = try catalog.asset_add(.{ .hash = test_hash(2), .camera = "A", .lens = "L" });
+        _ = try catalog.asset_add(.{ .hash = test_hash(3), .camera = "A", .lens = "L" });
+    }
+
+    // Flip a bit inside the FIRST record's payload: a complete frame that no
+    // longer checksums, with two intact records after it. This is not a
+    // torn tail, and truncating from here would destroy good data.
+    const wal = try sim.read_alloc(gpa, wal_path, 1 << 20);
+    defer gpa.free(wal);
+    const before = try gpa.dupe(u8, wal);
+    defer gpa.free(before);
+    wal[20] ^= 0x40; // inside record 0's payload (past its 8-byte frame header)
+    try sim.write_file(wal_path, wal);
+
+    // Reopen refuses rather than replaying a damaged log...
+    try std.testing.expectEqual(error.CorruptCatalog, TestCatalog.open(gpa, &sim));
+
+    // ...and left the file untouched: no automatic destructive repair.
+    const after = try sim.read_alloc(gpa, wal_path, 1 << 20);
+    defer gpa.free(after);
+    try std.testing.expectEqual(before.len, after.len);
 }
 
 test "public boundaries reject bad input by name, never by assertion" {
