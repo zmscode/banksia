@@ -9,3 +9,6 @@ macos/.build/
 assets/**/*.CR2
 assets/**/*.CR3
 assets/**/*.DNG
+
+# Generated from the locally installed proprietary Capture One application.
+reverse-engineering/capture-one-extracted/
