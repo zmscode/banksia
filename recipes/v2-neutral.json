@@ -1,0 +1,11 @@
+{
+	"engine_version": 2,
+	"ops": [
+		{ "black_point": {} },
+		{ "white_balance": { "as_shot": true, "gain_r": 1, "gain_g": 1, "gain_b": 1 } },
+		{ "demosaic": {} },
+		{ "exposure": { "ev": 0 } },
+		{ "tone_curve": { "contrast": 0 } },
+		{ "srgb_encode": {} }
+	]
+}

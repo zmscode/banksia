@@ -1,4 +1,10 @@
 .zig-cache/
+.zig-global-cache/
 zig-out/
 macos/.build/
 /*.dng
+.DS_Store
+
+# Local licensed/proprietary RAW corpus. Commit manifests and hashes, not blobs.
+assets/**/*.CR2
+assets/**/*.CR3

@@ -46,7 +46,7 @@ const DebugAllocator = std.heap.DebugAllocator(.{});
 const Engine = struct {
     debug_allocator: if (verify) DebugAllocator else void,
     gpa: std.mem.Allocator,
-    sensor: ?emu.dng.SensorData = null,
+    raw: ?emu.dng.DecodedRaw = null,
     recipe: ?std.json.Parsed(emu.pipeline.Recipe) = null,
     rendered: ?emu.pipeline.Rendered = null,
     /// Always NUL-terminated; index error_message_bytes_max is the fence.
@@ -66,7 +66,7 @@ pub export fn bk_engine_create() ?*Engine {
 
 pub export fn bk_engine_destroy(engine_maybe: ?*Engine) void {
     const engine = engine_maybe orelse return;
-    if (engine.sensor) |*sensor| sensor.deinit(engine.gpa);
+    if (engine.raw) |*raw| raw.deinit(engine.gpa);
     if (engine.recipe) |*recipe| recipe.deinit();
     if (engine.rendered) |*rendered| rendered.deinit(engine.gpa);
     if (verify) {
@@ -98,14 +98,14 @@ fn load_raw(engine: *Engine, path: []const u8) i32 {
         };
     defer engine.gpa.free(blob);
 
-    const sensor = emu.dng.decode(engine.gpa, blob) catch |err| switch (err) {
+    const raw = emu.raw.decode_raw(engine.gpa, blob) catch |err| switch (err) {
         error.OutOfMemory => return fail(engine, err_out_of_memory, "out of memory", .{}),
         else => return fail(engine, err_decode, "cannot decode '{s}': {s}", .{
             path, @errorName(err),
         }),
     };
-    if (engine.sensor) |*old| old.deinit(engine.gpa);
-    engine.sensor = sensor;
+    if (engine.raw) |*old| old.deinit(engine.gpa);
+    engine.raw = raw;
     return succeed(engine);
 }
 
@@ -138,7 +138,7 @@ pub export fn bk_render(
         _ = fail(engine, err_invalid_argument, "height_out is null", .{});
         return null;
     };
-    if (engine.sensor == null) {
+    if (engine.raw == null) {
         _ = fail(engine, err_no_raw, "no raw loaded: bk_load_raw must succeed first", .{});
         return null;
     }
@@ -146,7 +146,7 @@ pub export fn bk_render(
     // A handle with no recipe set renders the engine's default recipe: the
     // shell can show an image before its first slider moves.
     const recipe = if (engine.recipe) |parsed| parsed.value else emu.recipe.default_recipe();
-    const rendered = emu.pipeline.render(engine.gpa, &engine.sensor.?, recipe, .{
+    const rendered = emu.pipeline.render_decoded(engine.gpa, &engine.raw.?, recipe, .{
         .edge_px_max_out = edge_px_max,
     }) catch |err| {
         const code = switch (err) {

@@ -60,6 +60,12 @@ const pushed_ops = [_]emu.pipeline.Op{
     .{ .srgb_encode = .{} },
 };
 
+const v2_color_matrix: emu.dng.Matrix3x3 = .{
+    0.72, 0.18, 0.10,
+    0.12, 0.78, 0.10,
+    0.03, 0.17, 0.80,
+};
+
 const Variant = struct {
     name: []const u8,
     recipe: emu.pipeline.Recipe,
@@ -70,6 +76,8 @@ const Variant = struct {
     /// Container-only variants must render bit-identically to `neutral`:
     /// the runner enforces it, beyond the baseline hashes.
     must_match_neutral: bool = false,
+    /// Exercise engine-v2 colour, crop, and orientation as one versioned case.
+    engine_v2: bool = false,
 };
 
 const variants = [_]Variant{
@@ -90,6 +98,11 @@ const variants = [_]Variant{
         .compression = .lossless_jpeg,
         .tile = .{ .width = 32, .height = 16 },
         .must_match_neutral = true,
+    },
+    .{
+        .name = "v2-baseline",
+        .recipe = .{ .engine_version = 2, .ops = &emu.recipe.default_ops },
+        .engine_v2 = true,
     },
 };
 
@@ -160,6 +173,18 @@ fn case_run(gpa: std.mem.Allocator, scene: Scene, variant: Variant) !Result {
 
     // Through the *whole* engine: container write, container decode,
     // render. The decoder is exercised by every golden case.
+    const active_area: ?emu.dng.Rect = if (variant.engine_v2) .{
+        .x = 1,
+        .y = 1,
+        .width = scene.width - 2,
+        .height = scene.height - 2,
+    } else null;
+    const default_crop: ?emu.dng.Rect = if (variant.engine_v2) .{
+        .x = 2,
+        .y = 2,
+        .width = scene.width - 4,
+        .height = scene.height - 4,
+    } else null;
     const blob = try emu.dng_write.write(gpa, .{
         .width = scene.width,
         .height = scene.height,
@@ -167,15 +192,23 @@ fn case_run(gpa: std.mem.Allocator, scene: Scene, variant: Variant) !Result {
         .black_level = black_level,
         .white_level = white_level,
         .wb_neutral = scene.wb_neutral,
+        .color_matrix_1 = if (variant.engine_v2)
+            v2_color_matrix
+        else
+            emu.color.Mat3.identity.values,
+        .analog_balance = if (variant.engine_v2) .{ 1.02, 1.0, 0.98 } else .{ 1, 1, 1 },
+        .orientation = if (variant.engine_v2) .rotate_90_clockwise else .normal,
+        .active_area = active_area,
+        .default_crop = default_crop,
         .bayer = bayer,
         .compression = variant.compression,
         .tile = variant.tile,
     });
     defer gpa.free(blob);
 
-    var sensor = try emu.dng.decode(gpa, blob);
-    defer sensor.deinit(gpa);
-    var rendered = try emu.pipeline.render(gpa, &sensor, variant.recipe, .{
+    var raw = try emu.raw.decode_raw(gpa, blob);
+    defer raw.deinit(gpa);
+    var rendered = try emu.pipeline.render_decoded(gpa, &raw, variant.recipe, .{
         .edge_px_max_out = variant.edge_px_max_out,
     });
     defer rendered.deinit(gpa);

@@ -19,6 +19,82 @@ const jpeg_lossless = @import("jpeg_lossless.zig");
 
 pub const CfaColor = enum(u8) { red = 0, green = 1, blue = 2 };
 
+pub const Orientation = enum(u8) {
+    normal = 1,
+    mirror_horizontal = 2,
+    rotate_180 = 3,
+    mirror_vertical = 4,
+    transpose = 5,
+    rotate_90_clockwise = 6,
+    transverse = 7,
+    rotate_270_clockwise = 8,
+};
+
+pub const Rect = struct {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+};
+
+pub const Compression = enum { none, lossless_jpeg, proprietary };
+
+pub const Matrix3x3 = [9]f32;
+
+pub const Text = struct {
+    bytes: [128]u8 = @splat(0),
+    len: u8 = 0,
+
+    pub fn init(value: []const u8) Text {
+        var text = Text{};
+        const len = @min(value.len, text.bytes.len);
+        @memcpy(text.bytes[0..len], value[0..len]);
+        text.len = @intCast(len);
+        return text;
+    }
+
+    pub fn slice(text: *const Text) []const u8 {
+        return text.bytes[0..text.len];
+    }
+};
+
+/// Metadata shared by metadata-only import and full pixel decode. Crop origin
+/// is relative to the active area's top-left, as defined by DNG.
+pub const Metadata = struct {
+    width: u32,
+    height: u32,
+    compression: Compression,
+    cfa: [4]CfaColor,
+    black_level: f32,
+    white_level: f32,
+    black_level_site: ?[4]f32 = null,
+    white_level_site: ?[4]f32 = null,
+    wb_neutral: [3]f32,
+    orientation: Orientation,
+    active_area: Rect,
+    default_crop: Rect,
+    make: Text = .{},
+    model: Text = .{},
+    unique_model: Text = .{},
+    lens: Text = .{},
+    iso: ?f32 = null,
+    capture_time: ?i64 = null,
+    capture_datetime: Text = .{},
+    capture_subsecond: Text = .{},
+    color_matrix_1: ?Matrix3x3 = null,
+    color_matrix_2: ?Matrix3x3 = null,
+    calibration_illuminant_1: ?u16 = null,
+    calibration_illuminant_2: ?u16 = null,
+    camera_calibration_1: ?Matrix3x3 = null,
+    camera_calibration_2: ?Matrix3x3 = null,
+    camera_calibration_signature: Text = .{},
+    profile_calibration_signature: Text = .{},
+    analog_balance: [3]f32 = .{ 1, 1, 1 },
+    /// Backend-normalized camera-to-XYZ fallback for proprietary RAWs whose
+    /// original DNG calibration tags are unavailable.
+    camera_to_xyz: ?Matrix3x3 = null,
+};
+
 pub const SensorData = struct {
     width: u32,
     height: u32,
@@ -26,6 +102,9 @@ pub const SensorData = struct {
     cfa: [4]CfaColor,
     black_level: f32,
     white_level: f32,
+    /// Optional row-major 2×2 level maps for cameras with unequal sites.
+    black_level_site: ?[4]f32 = null,
+    white_level_site: ?[4]f32 = null,
     /// Camera as-shot neutral (linear RGB of a neutral patch), for white balance.
     wb_neutral: [3]f32,
     /// Dense row-major mosaic, exactly `width * height` samples.
@@ -38,12 +117,26 @@ pub const SensorData = struct {
     }
 };
 
+pub const DecodedRaw = struct {
+    sensor: SensorData,
+    metadata: Metadata,
+
+    pub fn deinit(self: *DecodedRaw, gpa: std.mem.Allocator) void {
+        self.sensor.deinit(gpa);
+        self.* = undefined;
+    }
+};
+
 /// Malformed input is `Corrupt`; valid DNG using a feature this decoder
 /// lacks gets an error naming the feature, so "cannot open" self-diagnoses
 /// at the CLI and across the C ABI (both print the error name).
 pub const Error = error{
     Corrupt,
     OutOfMemory,
+    /// Canon CR2 is a valid proprietary RAW container, not malformed DNG.
+    UnsupportedCr2,
+    /// Canon CR3/CRX is a valid ISO-BMFF RAW container, not malformed DNG.
+    UnsupportedCr3,
     /// Compression other than uncompressed (1) or lossless JPEG (7).
     UnsupportedCompression,
     /// Neither a strip layout nor a tile layout (or, corruptly, both).
@@ -52,7 +145,10 @@ pub const Error = error{
     UnsupportedBitDepth,
     /// CFA patterns beyond the 2x2 Bayer family.
     UnsupportedCfa,
-    /// Per-site black levels that differ within the repeat pattern.
+    /// Valid geometry that requires fractional crop coordinates or another
+    /// transform outside the current integer crop profile.
+    UnsupportedGeometry,
+    /// Black-level repeat maps beyond the supported 2×2 CFA-site layout.
     UnsupportedBlackLevel,
     /// Image larger than `image.edge_px_max` on a side.
     UnsupportedDimensions,
@@ -78,10 +174,14 @@ const tag_image_height: u16 = 257;
 const tag_bits_per_sample: u16 = 258;
 const tag_compression: u16 = 259;
 const tag_photometric: u16 = 262;
+const tag_make: u16 = 271;
+const tag_model: u16 = 272;
 const tag_strip_offsets: u16 = 273;
+const tag_orientation: u16 = 274;
 const tag_samples_per_pixel: u16 = 277;
 const tag_rows_per_strip: u16 = 278;
 const tag_strip_byte_counts: u16 = 279;
+const tag_datetime: u16 = 306;
 const tag_sub_ifds: u16 = 330;
 const tag_tile_width: u16 = 322;
 const tag_tile_height: u16 = 323;
@@ -89,9 +189,28 @@ const tag_tile_offsets: u16 = 324;
 const tag_tile_byte_counts: u16 = 325;
 const tag_cfa_repeat_dim: u16 = 33421;
 const tag_cfa_pattern: u16 = 33422;
+const tag_exif_ifd: u16 = 34665;
+const tag_iso_speed_ratings: u16 = 34855;
+const tag_datetime_original: u16 = 36867;
+const tag_subsec_time_original: u16 = 37521;
+const tag_lens_model: u16 = 42036;
+const tag_unique_camera_model: u16 = 50708;
+const tag_black_level_repeat_dim: u16 = 50713;
 const tag_black_level: u16 = 50714;
 const tag_white_level: u16 = 50717;
+const tag_default_crop_origin: u16 = 50719;
+const tag_default_crop_size: u16 = 50720;
+const tag_color_matrix_1: u16 = 50721;
+const tag_color_matrix_2: u16 = 50722;
+const tag_camera_calibration_1: u16 = 50723;
+const tag_camera_calibration_2: u16 = 50724;
+const tag_analog_balance: u16 = 50727;
 const tag_as_shot_neutral: u16 = 50728;
+const tag_calibration_illuminant_1: u16 = 50778;
+const tag_calibration_illuminant_2: u16 = 50779;
+const tag_active_area: u16 = 50829;
+const tag_camera_calibration_signature: u16 = 50931;
+const tag_profile_calibration_signature: u16 = 50932;
 
 const photometric_cfa: u32 = 32803;
 
@@ -220,6 +339,15 @@ fn ifd_parse(r: *const Reader, off: u32) Error!struct { ifd: Ifd, next: u32 } {
 }
 
 fn reader_init(bytes: []const u8) Error!Reader {
+    if (bytes.len >= 12 and std.mem.eql(u8, bytes[8..12], "CR\x02\x00")) {
+        return error.UnsupportedCr2;
+    }
+    if (bytes.len >= 12 and
+        std.mem.eql(u8, bytes[4..8], "ftyp") and
+        std.mem.eql(u8, bytes[8..12], "crx "))
+    {
+        return error.UnsupportedCr3;
+    }
     if (bytes.len < 8) return error.Corrupt;
     const endian: std.builtin.Endian = switch (std.mem.readInt(u16, bytes[0..2], .little)) {
         0x4949 => .little, // "II"
@@ -231,11 +359,39 @@ fn reader_init(bytes: []const u8) Error!Reader {
     return r;
 }
 
-/// Decode a DNG blob into dense sensor data. The blob is untrusted; the
-/// result is trusted (its invariants are asserted before returning).
-pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!SensorData {
-    const r = try reader_init(bytes);
+const IfdSelection = struct { raw: Ifd, first: Ifd, exif: ?Ifd };
 
+/// Metadata-only import path: parses the same bounded IFD selection and the
+/// same metadata function as full decode, without allocating or touching the
+/// compressed pixel segments.
+pub fn decode_metadata(bytes: []const u8) Error!Metadata {
+    const r = try reader_init(bytes);
+    const selected = try ifds_select(&r);
+    return metadata_from_ifd(&r, &selected.raw, &selected.first, selected.exif);
+}
+
+/// Rich full decode. Engine v1 continues to consume `decode()` below, while
+/// geometry and engine v2 can use the metadata without widening SensorData.
+pub fn decode_raw(gpa: std.mem.Allocator, bytes: []const u8) Error!DecodedRaw {
+    const r = try reader_init(bytes);
+    const selected = try ifds_select(&r);
+    const metadata = try metadata_from_ifd(
+        &r,
+        &selected.raw,
+        &selected.first,
+        selected.exif,
+    );
+    const sensor = try sensor_from_ifd(gpa, &r, &selected.raw, metadata);
+    return .{ .sensor = sensor, .metadata = metadata };
+}
+
+/// Backward-compatible engine-v1 decode surface.
+pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!SensorData {
+    const raw = try decode_raw(gpa, bytes);
+    return raw.sensor;
+}
+
+fn ifds_select(r: *const Reader) Error!IfdSelection {
     // Walk IFD0, its chain, and any SubIFDs, bounded by `ifd_visit_max` —
     // an explicit worklist, not recursion. The raw image is the first IFD
     // whose PhotometricInterpretation is CFA.
@@ -244,8 +400,6 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!SensorData {
     pending[0] = try r.read_u32(4);
     var visited: u32 = 0;
     var raw: ?Ifd = null;
-    // IFD0 is retained: DNG keeps camera-wide tags (AsShotNeutral) there
-    // even when the raw mosaic lives in a SubIFD.
     var first: ?Ifd = null;
 
     while (pending_len > 0 and raw == null) {
@@ -255,11 +409,11 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!SensorData {
         const off = pending[pending_len];
         if (off == 0) continue;
 
-        const parsed = try ifd_parse(&r, off);
+        const parsed = try ifd_parse(r, off);
         const ifd = parsed.ifd;
         if (first == null) first = ifd;
         if (ifd.find(tag_photometric)) |p| {
-            if (try value_scalar(&r, p, 0) == photometric_cfa) {
+            if (try value_scalar(r, p, 0) == photometric_cfa) {
                 raw = ifd;
                 break;
             }
@@ -271,63 +425,165 @@ pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!SensorData {
         if (ifd.find(tag_sub_ifds)) |subs| {
             var i: u32 = 0;
             while (i < subs.count and pending_len < ifd_visit_max) : (i += 1) {
-                pending[pending_len] = try value_scalar(&r, subs, i);
+                pending[pending_len] = try value_scalar(r, subs, i);
                 pending_len += 1;
             }
         }
     }
 
-    const ifd = raw orelse return error.UnsupportedStructure;
-    assert(first != null); // the loop parsed at least the IFD that broke it
-    return sensor_from_ifd(gpa, &r, &ifd, &first.?);
+    const first_ifd = first orelse return error.UnsupportedStructure;
+    var exif: ?Ifd = null;
+    if (first_ifd.find(tag_exif_ifd)) |entry| {
+        if (entry.count != 1) return error.Corrupt;
+        const parsed = try ifd_parse(r, try value_scalar(r, entry, 0));
+        exif = parsed.ifd;
+    }
+    return .{
+        .raw = raw orelse return error.UnsupportedStructure,
+        .first = first_ifd,
+        .exif = exif,
+    };
 }
 
 const compression_none: u32 = 1;
 const compression_lossless_jpeg: u32 = 7;
 
-fn sensor_from_ifd(
-    gpa: std.mem.Allocator,
+fn metadata_from_ifd(
     r: *const Reader,
     ifd: *const Ifd,
     ifd0: *const Ifd,
-) Error!SensorData {
+    exif: ?Ifd,
+) Error!Metadata {
+    const exif_ptr: ?*const Ifd = if (exif) |*value| value else null;
     const width = try require_scalar(r, ifd, tag_image_width);
     const height = try require_scalar(r, ifd, tag_image_height);
     if (width == 0 or height == 0) return error.Corrupt;
-    if (width > image.edge_px_max) return error.UnsupportedDimensions;
-    if (height > image.edge_px_max) return error.UnsupportedDimensions;
-
+    if (width > image.edge_px_max or height > image.edge_px_max) {
+        return error.UnsupportedDimensions;
+    }
     if (try require_scalar(r, ifd, tag_bits_per_sample) != 16) {
         return error.UnsupportedBitDepth;
     }
     if (try scalar_or(r, ifd, tag_samples_per_pixel, 1) != 1) {
         return error.UnsupportedBitDepth;
     }
-    const compression = try require_scalar(r, ifd, tag_compression);
-    if (compression != compression_none and compression != compression_lossless_jpeg) {
-        return error.UnsupportedCompression;
-    }
-
+    const compression_raw = try require_scalar(r, ifd, tag_compression);
+    const compression: Compression = switch (compression_raw) {
+        compression_none => .none,
+        compression_lossless_jpeg => .lossless_jpeg,
+        else => return error.UnsupportedCompression,
+    };
     const cfa = try cfa_pattern(r, ifd);
-    const black_level = try black_level_read(r, ifd);
-    const white_level: f32 = @floatFromInt(try scalar_or(r, ifd, tag_white_level, 65535));
-    if (white_level <= black_level) return error.Corrupt;
-    const wb_neutral = try as_shot_neutral(r, ifd, ifd0);
+    const black = try black_level_read(r, ifd);
+    const white = try white_level_read(r, ifd);
+    for (black.sites orelse @as([4]f32, @splat(black.scalar)), 0..) |level, index| {
+        const white_level = if (white.sites) |sites| sites[index] else white.scalar;
+        if (!(white_level > level)) return error.Corrupt;
+    }
+    const active_area = try active_area_read(r, ifd, width, height);
+    const default_crop = try default_crop_read(r, ifd, active_area);
 
-    const bayer = try bayer_read(gpa, r, ifd, width, height, compression);
-    errdefer comptime unreachable; // no failure paths after this point
-
-    // Postconditions: this is the trust boundary. Everything downstream may
-    // assert instead of re-validating.
-    assert(bayer.len == @as(usize, width) * height);
-    assert(white_level > black_level);
     return .{
         .width = width,
         .height = height,
+        .compression = compression,
         .cfa = cfa,
-        .black_level = black_level,
-        .white_level = white_level,
-        .wb_neutral = wb_neutral,
+        .black_level = black.scalar,
+        .white_level = white.scalar,
+        .black_level_site = black.sites,
+        .white_level_site = white.sites,
+        .wb_neutral = try as_shot_neutral(r, ifd, ifd0),
+        .orientation = try orientation_read(r, ifd, ifd0),
+        .active_area = active_area,
+        .default_crop = default_crop,
+        .make = try text_from_ifds(r, tag_make, ifd0, ifd, null),
+        .model = try text_from_ifds(r, tag_model, ifd0, ifd, null),
+        .unique_model = try text_from_ifds(
+            r,
+            tag_unique_camera_model,
+            ifd0,
+            ifd,
+            null,
+        ),
+        .lens = try text_from_ifds(r, tag_lens_model, exif_ptr, ifd0, ifd),
+        .iso = try fraction_from_ifds(r, tag_iso_speed_ratings, exif_ptr, ifd0, ifd),
+        .capture_datetime = try capture_datetime_read(r, exif_ptr, ifd0),
+        .capture_subsecond = try text_from_ifds(
+            r,
+            tag_subsec_time_original,
+            exif_ptr,
+            ifd0,
+            null,
+        ),
+        .color_matrix_1 = try matrix_from_ifds(r, tag_color_matrix_1, ifd, ifd0),
+        .color_matrix_2 = try matrix_from_ifds(r, tag_color_matrix_2, ifd, ifd0),
+        .calibration_illuminant_1 = try integer_from_ifds(
+            r,
+            tag_calibration_illuminant_1,
+            ifd,
+            ifd0,
+        ),
+        .calibration_illuminant_2 = try integer_from_ifds(
+            r,
+            tag_calibration_illuminant_2,
+            ifd,
+            ifd0,
+        ),
+        .camera_calibration_1 = try matrix_from_ifds(
+            r,
+            tag_camera_calibration_1,
+            ifd,
+            ifd0,
+        ),
+        .camera_calibration_2 = try matrix_from_ifds(
+            r,
+            tag_camera_calibration_2,
+            ifd,
+            ifd0,
+        ),
+        .camera_calibration_signature = try signature_from_ifds(
+            r,
+            tag_camera_calibration_signature,
+            ifd0,
+            ifd,
+            null,
+        ),
+        .profile_calibration_signature = try signature_from_ifds(
+            r,
+            tag_profile_calibration_signature,
+            ifd0,
+            ifd,
+            null,
+        ),
+        .analog_balance = try analog_balance_read(r, ifd, ifd0),
+    };
+}
+
+fn sensor_from_ifd(
+    gpa: std.mem.Allocator,
+    r: *const Reader,
+    ifd: *const Ifd,
+    metadata: Metadata,
+) Error!SensorData {
+    const compression: u32 = switch (metadata.compression) {
+        .none => compression_none,
+        .lossless_jpeg => compression_lossless_jpeg,
+        .proprietary => unreachable,
+    };
+    const bayer = try bayer_read(gpa, r, ifd, metadata.width, metadata.height, compression);
+    errdefer comptime unreachable; // no failure paths after this point
+
+    assert(bayer.len == @as(usize, metadata.width) * metadata.height);
+    assert(metadata.white_level > metadata.black_level);
+    return .{
+        .width = metadata.width,
+        .height = metadata.height,
+        .cfa = metadata.cfa,
+        .black_level = metadata.black_level,
+        .white_level = metadata.white_level,
+        .black_level_site = metadata.black_level_site,
+        .white_level_site = metadata.white_level_site,
+        .wb_neutral = metadata.wb_neutral,
         .bayer = bayer,
     };
 }
@@ -342,17 +598,239 @@ fn scalar_or(r: *const Reader, ifd: *const Ifd, tag: u16, default: u32) Error!u3
     return value_scalar(r, e, 0);
 }
 
-/// BlackLevel may repeat per CFA site; the pipeline models one scalar, so
-/// per-site values are accepted only when they agree.
-fn black_level_read(r: *const Reader, ifd: *const Ifd) Error!f32 {
-    const e = ifd.find(tag_black_level) orelse return 0;
-    if (e.count == 0 or e.count > 16) return error.Corrupt;
-    const first = try value_fraction(r, e, 0);
-    var i: u32 = 1;
-    while (i < e.count) : (i += 1) {
-        if (try value_fraction(r, e, i) != first) return error.UnsupportedBlackLevel;
+fn entry_from_ifds(
+    tag: u16,
+    first: ?*const Ifd,
+    second: ?*const Ifd,
+    third: ?*const Ifd,
+) ?Entry {
+    if (first) |ifd| if (ifd.find(tag)) |entry| return entry;
+    if (second) |ifd| if (ifd.find(tag)) |entry| return entry;
+    if (third) |ifd| if (ifd.find(tag)) |entry| return entry;
+    return null;
+}
+
+fn text_from_ifds(
+    r: *const Reader,
+    tag: u16,
+    first: ?*const Ifd,
+    second: ?*const Ifd,
+    third: ?*const Ifd,
+) Error!Text {
+    const entry = entry_from_ifds(tag, first, second, third) orelse return .{};
+    if (entry.typ != type_ascii or entry.count == 0 or entry.count > 128) {
+        return error.Corrupt;
     }
-    return first;
+    const off = try value_off(r, entry, 0);
+    const bytes = try r.slice(off, entry.count);
+    const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
+    for (bytes[0..end]) |byte| {
+        if (byte < 0x20 or byte > 0x7e) return error.Corrupt;
+    }
+    return Text.init(bytes[0..end]);
+}
+
+fn fraction_from_ifds(
+    r: *const Reader,
+    tag: u16,
+    first: ?*const Ifd,
+    second: ?*const Ifd,
+    third: ?*const Ifd,
+) Error!?f32 {
+    const entry = entry_from_ifds(tag, first, second, third) orelse return null;
+    if (entry.count == 0) return error.Corrupt;
+    const value = try value_fraction(r, entry, 0);
+    if (!(value > 0) or !std.math.isFinite(value)) return error.Corrupt;
+    return value;
+}
+
+fn signature_from_ifds(
+    r: *const Reader,
+    tag: u16,
+    first: ?*const Ifd,
+    second: ?*const Ifd,
+    third: ?*const Ifd,
+) Error!Text {
+    const entry = entry_from_ifds(tag, first, second, third) orelse return .{};
+    if ((entry.typ != type_ascii and entry.typ != type_byte) or
+        entry.count == 0 or entry.count > 128)
+    {
+        return error.Corrupt;
+    }
+    const off = try value_off(r, entry, 0);
+    const bytes = try r.slice(off, entry.count);
+    const end = std.mem.indexOfScalar(u8, bytes, 0) orelse bytes.len;
+    if (!std.unicode.utf8ValidateSlice(bytes[0..end])) return error.Corrupt;
+    return Text.init(bytes[0..end]);
+}
+
+fn capture_datetime_read(
+    r: *const Reader,
+    exif: ?*const Ifd,
+    ifd0: *const Ifd,
+) Error!Text {
+    const original = try text_from_ifds(r, tag_datetime_original, exif, null, null);
+    if (original.len != 0) return original;
+    return text_from_ifds(r, tag_datetime, ifd0, null, null);
+}
+
+fn matrix_from_ifds(
+    r: *const Reader,
+    tag: u16,
+    first: *const Ifd,
+    second: *const Ifd,
+) Error!?Matrix3x3 {
+    const entry = first.find(tag) orelse second.find(tag) orelse return null;
+    if (entry.typ != type_srational or entry.count != 9) return error.Corrupt;
+    var matrix: Matrix3x3 = undefined;
+    for (&matrix, 0..) |*value, index| {
+        value.* = try value_fraction(r, entry, @intCast(index));
+        if (!std.math.isFinite(value.*)) return error.Corrupt;
+    }
+    return matrix;
+}
+
+fn integer_from_ifds(
+    r: *const Reader,
+    tag: u16,
+    first: *const Ifd,
+    second: *const Ifd,
+) Error!?u16 {
+    const entry = first.find(tag) orelse second.find(tag) orelse return null;
+    if (entry.typ != type_short or entry.count != 1) return error.Corrupt;
+    const value = try value_scalar(r, entry, 0);
+    if (value > std.math.maxInt(u16)) return error.Corrupt;
+    return @intCast(value);
+}
+
+fn analog_balance_read(
+    r: *const Reader,
+    ifd: *const Ifd,
+    ifd0: *const Ifd,
+) Error![3]f32 {
+    const entry = ifd.find(tag_analog_balance) orelse
+        ifd0.find(tag_analog_balance) orelse return .{ 1, 1, 1 };
+    if (entry.typ != type_rational or entry.count != 3) return error.Corrupt;
+    var balance: [3]f32 = undefined;
+    for (&balance, 0..) |*value, index| {
+        value.* = try value_fraction(r, entry, @intCast(index));
+        if (!(value.* > 0) or !std.math.isFinite(value.*)) return error.Corrupt;
+    }
+    return balance;
+}
+
+fn geometry_value(r: *const Reader, entry: Entry, index: u32) Error!u32 {
+    const value = try value_fraction(r, entry, index);
+    if (!std.math.isFinite(value) or value < 0) return error.Corrupt;
+    if (@floor(value) != value) return error.UnsupportedGeometry;
+    if (value > image.edge_px_max) return error.Corrupt;
+    return @intFromFloat(value);
+}
+
+fn orientation_read(r: *const Reader, ifd: *const Ifd, ifd0: *const Ifd) Error!Orientation {
+    const entry = ifd0.find(tag_orientation) orelse ifd.find(tag_orientation) orelse {
+        return .normal;
+    };
+    if (entry.count != 1) return error.Corrupt;
+    return switch (try value_scalar(r, entry, 0)) {
+        1 => .normal,
+        2 => .mirror_horizontal,
+        3 => .rotate_180,
+        4 => .mirror_vertical,
+        5 => .transpose,
+        6 => .rotate_90_clockwise,
+        7 => .transverse,
+        8 => .rotate_270_clockwise,
+        else => error.Corrupt,
+    };
+}
+
+fn active_area_read(
+    r: *const Reader,
+    ifd: *const Ifd,
+    width: u32,
+    height: u32,
+) Error!Rect {
+    const entry = ifd.find(tag_active_area) orelse {
+        return .{ .x = 0, .y = 0, .width = width, .height = height };
+    };
+    if (entry.count != 4) return error.Corrupt;
+    const top = try geometry_value(r, entry, 0);
+    const left = try geometry_value(r, entry, 1);
+    const bottom = try geometry_value(r, entry, 2);
+    const right = try geometry_value(r, entry, 3);
+    if (bottom <= top or right <= left) return error.Corrupt;
+    if (bottom > height or right > width) return error.Corrupt;
+    return .{ .x = left, .y = top, .width = right - left, .height = bottom - top };
+}
+
+fn default_crop_read(r: *const Reader, ifd: *const Ifd, active: Rect) Error!Rect {
+    var x: u32 = 0;
+    var y: u32 = 0;
+    if (ifd.find(tag_default_crop_origin)) |entry| {
+        if (entry.count != 2) return error.Corrupt;
+        x = try geometry_value(r, entry, 0);
+        y = try geometry_value(r, entry, 1);
+    }
+    var width = active.width;
+    var height = active.height;
+    if (ifd.find(tag_default_crop_size)) |entry| {
+        if (entry.count != 2) return error.Corrupt;
+        width = try geometry_value(r, entry, 0);
+        height = try geometry_value(r, entry, 1);
+    }
+    if (width == 0 or height == 0) return error.Corrupt;
+    if (@as(u64, x) + width > active.width) return error.Corrupt;
+    if (@as(u64, y) + height > active.height) return error.Corrupt;
+    return .{ .x = x, .y = y, .width = width, .height = height };
+}
+
+const Levels = struct { scalar: f32, sites: ?[4]f32 };
+
+fn black_level_read(r: *const Reader, ifd: *const Ifd) Error!Levels {
+    const entry = ifd.find(tag_black_level) orelse {
+        return .{ .scalar = 0, .sites = null };
+    };
+    if (entry.count == 1) {
+        return .{ .scalar = try value_fraction(r, entry, 0), .sites = null };
+    }
+    const repeat = ifd.find(tag_black_level_repeat_dim) orelse {
+        return error.UnsupportedBlackLevel;
+    };
+    if (repeat.count != 2 or
+        try value_scalar(r, repeat, 0) != 2 or
+        try value_scalar(r, repeat, 1) != 2 or
+        entry.count != 4)
+    {
+        return error.UnsupportedBlackLevel;
+    }
+    var sites: [4]f32 = undefined;
+    var scalar = std.math.inf(f32);
+    for (&sites, 0..) |*site, index| {
+        site.* = try value_fraction(r, entry, @intCast(index));
+        if (!std.math.isFinite(site.*) or site.* < 0) return error.Corrupt;
+        scalar = @min(scalar, site.*);
+    }
+    return .{ .scalar = scalar, .sites = sites };
+}
+
+fn white_level_read(r: *const Reader, ifd: *const Ifd) Error!Levels {
+    const entry = ifd.find(tag_white_level) orelse {
+        return .{ .scalar = 65535, .sites = null };
+    };
+    if (entry.count != 1 and entry.count != 4) return error.Corrupt;
+    var sites: [4]f32 = undefined;
+    var scalar = std.math.inf(f32);
+    for (0..entry.count) |index| {
+        const value = try value_fraction(r, entry, @intCast(index));
+        if (!std.math.isFinite(value) or value <= 0) return error.Corrupt;
+        sites[index] = value;
+        scalar = @min(scalar, value);
+    }
+    return .{
+        .scalar = scalar,
+        .sites = if (entry.count == 4) sites else null,
+    };
 }
 
 fn cfa_pattern(r: *const Reader, ifd: *const Ifd) Error![4]CfaColor {
@@ -580,6 +1058,18 @@ fn segment_copy_decoded(bayer: []u16, width: u32, seg: Segment, samples: []const
     }
 }
 
+test "proprietary Canon containers fail by actionable name" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnsupportedCr2,
+        decode(gpa, "II*\x00\x10\x00\x00\x00CR\x02\x00"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedCr3,
+        decode(gpa, "\x00\x00\x00\x18ftypcrx "),
+    );
+}
+
 test "truncated and garbage input is Corrupt, never a crash" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.Corrupt, decode(gpa, ""));
@@ -606,6 +1096,59 @@ fn test_entry_patch(blob: []u8, tag: u16, payload: u32) void {
         }
     }
     unreachable; // the fixture writer always emits the tag under test
+}
+
+fn test_entry_payload(blob: []const u8, tag: u16) u32 {
+    const count = std.mem.readInt(u16, blob[8..10], .little);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const off = 10 + i * 12;
+        if (std.mem.readInt(u16, blob[off..][0..2], .little) == tag) {
+            return std.mem.readInt(u32, blob[off + 8 ..][0..4], .little);
+        }
+    }
+    unreachable;
+}
+
+fn test_entry_type_patch(blob: []u8, tag: u16, typ: u16) void {
+    const count = std.mem.readInt(u16, blob[8..10], .little);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const off = 10 + i * 12;
+        if (std.mem.readInt(u16, blob[off..][0..2], .little) == tag) {
+            std.mem.writeInt(u16, blob[off + 2 ..][0..2], typ, .little);
+            return;
+        }
+    }
+    unreachable;
+}
+
+fn test_entry_value_patch(blob: []u8, tag: u16, index: u32, value: u32) void {
+    const count = std.mem.readInt(u16, blob[8..10], .little);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const off = 10 + i * 12;
+        if (std.mem.readInt(u16, blob[off..][0..2], .little) != tag) continue;
+        const typ = std.mem.readInt(u16, blob[off + 2 ..][0..2], .little);
+        const value_count = std.mem.readInt(u32, blob[off + 4 ..][0..4], .little);
+        assert(index < value_count);
+        const size: u32 = switch (typ) {
+            type_short => 2,
+            type_long => 4,
+            else => unreachable,
+        };
+        const base = if (size * value_count <= 4)
+            off + 8
+        else
+            std.mem.readInt(u32, blob[off + 8 ..][0..4], .little);
+        if (size == 2) {
+            std.mem.writeInt(u16, blob[base + index * size ..][0..2], @intCast(value), .little);
+        } else {
+            std.mem.writeInt(u32, blob[base + index * size ..][0..4], value, .little);
+        }
+        return;
+    }
+    unreachable;
 }
 
 fn test_entry_retag(blob: []u8, tag: u16, tag_new: u16) void {
@@ -652,4 +1195,132 @@ test "unsupported features fail by name, one field away from valid" {
     defer gpa.free(blob);
     test_entry_retag(blob, tag_strip_offsets, 999);
     try std.testing.expectError(error.UnsupportedLayout, decode(gpa, blob));
+}
+
+test "geometry tags distinguish malformed bounds from unsupported fractions" {
+    const gpa = std.testing.allocator;
+    const dng_write = @import("dng_write.zig");
+    const bayer = [_]u16{0} ** (6 * 4);
+    const pristine = try dng_write.write(gpa, .{
+        .width = 6,
+        .height = 4,
+        .wb_neutral = .{ 0.5, 1, 0.75 },
+        .bayer = &bayer,
+    });
+    defer gpa.free(pristine);
+
+    {
+        const blob = try gpa.dupe(u8, pristine);
+        defer gpa.free(blob);
+        test_entry_patch(blob, tag_orientation, 9);
+        try std.testing.expectError(error.Corrupt, decode_metadata(blob));
+    }
+    {
+        const blob = try gpa.dupe(u8, pristine);
+        defer gpa.free(blob);
+        test_entry_value_patch(blob, tag_active_area, 2, 5);
+        try std.testing.expectError(error.Corrupt, decode_metadata(blob));
+    }
+    {
+        const blob = try gpa.dupe(u8, pristine);
+        defer gpa.free(blob);
+        test_entry_value_patch(blob, tag_default_crop_size, 0, 7);
+        try std.testing.expectError(error.Corrupt, decode_metadata(blob));
+    }
+    {
+        const blob = try gpa.dupe(u8, pristine);
+        defer gpa.free(blob);
+        const neutral_off = test_entry_payload(blob, tag_as_shot_neutral);
+        test_entry_type_patch(blob, tag_default_crop_origin, type_rational);
+        test_entry_patch(blob, tag_default_crop_origin, neutral_off);
+        try std.testing.expectError(error.UnsupportedGeometry, decode_metadata(blob));
+    }
+}
+
+fn test_ifd_entry(
+    bytes: []u8,
+    ifd: *Ifd,
+    tag: u16,
+    typ: u16,
+    values_off: u32,
+    count: u32,
+) void {
+    const payload_off = @as(u32, 4) * ifd.len;
+    std.mem.writeInt(u32, bytes[payload_off..][0..4], values_off, .little);
+    ifd.entries[ifd.len] = .{
+        .tag = tag,
+        .typ = typ,
+        .count = count,
+        .payload_off = payload_off,
+    };
+    ifd.len += 1;
+}
+
+fn test_srational_put(bytes: []u8, off: u32, numerator: i32, denominator: i32) void {
+    std.mem.writeInt(u32, bytes[off..][0..4], @bitCast(numerator), .little);
+    std.mem.writeInt(u32, bytes[off + 4 ..][0..4], @bitCast(denominator), .little);
+}
+
+test "identity, exposure, and calibration metadata values are bounded and typed" {
+    var bytes: [1024]u8 = @splat(0);
+    var ifd = Ifd{ .entries = undefined, .len = 0 };
+    const make = "Banksia Camera\x00";
+    @memcpy(bytes[128..][0..make.len], make);
+    test_ifd_entry(&bytes, &ifd, tag_make, type_ascii, 128, make.len);
+
+    const matrix = [9]i32{ 1, -2, 3, -4, 5, -6, 7, -8, 9 };
+    for (matrix, 0..) |value, index| {
+        test_srational_put(&bytes, 256 + @as(u32, @intCast(index)) * 8, value, 10);
+    }
+    test_ifd_entry(&bytes, &ifd, tag_color_matrix_1, type_srational, 256, 9);
+
+    for ([3]u32{ 2, 1, 3 }, 0..) |value, index| {
+        const off = 384 + @as(u32, @intCast(index)) * 8;
+        std.mem.writeInt(u32, bytes[off..][0..4], value, .little);
+        std.mem.writeInt(u32, bytes[off + 4 ..][0..4], 1, .little);
+    }
+    test_ifd_entry(&bytes, &ifd, tag_analog_balance, type_rational, 384, 3);
+
+    const reader = Reader{ .bytes = &bytes, .endian = .little };
+    const parsed_make = try text_from_ifds(&reader, tag_make, &ifd, null, null);
+    try std.testing.expectEqualStrings("Banksia Camera", parsed_make.slice());
+    const parsed_matrix = (try matrix_from_ifds(
+        &reader,
+        tag_color_matrix_1,
+        &ifd,
+        &ifd,
+    )).?;
+    for (parsed_matrix, matrix) |actual, numerator| {
+        try std.testing.expectApproxEqAbs(
+            @as(f32, @floatFromInt(numerator)) / 10,
+            actual,
+            1e-6,
+        );
+    }
+    try std.testing.expectEqual(
+        [3]f32{ 2, 1, 3 },
+        try analog_balance_read(&reader, &ifd, &ifd),
+    );
+}
+
+test "2x2 black and white maps retain every CFA site" {
+    var bytes: [256]u8 = @splat(0);
+    var ifd = Ifd{ .entries = undefined, .len = 0 };
+    std.mem.writeInt(u32, bytes[128..132], 2, .little);
+    std.mem.writeInt(u32, bytes[132..136], 2, .little);
+    test_ifd_entry(&bytes, &ifd, tag_black_level_repeat_dim, type_long, 128, 2);
+    for ([4]u32{ 100, 101, 102, 103 }, 0..) |value, index| {
+        std.mem.writeInt(u32, bytes[144 + index * 4 ..][0..4], value, .little);
+    }
+    test_ifd_entry(&bytes, &ifd, tag_black_level, type_long, 144, 4);
+    for ([4]u32{ 1000, 1001, 1002, 1003 }, 0..) |value, index| {
+        std.mem.writeInt(u32, bytes[176 + index * 4 ..][0..4], value, .little);
+    }
+    test_ifd_entry(&bytes, &ifd, tag_white_level, type_long, 176, 4);
+
+    const reader = Reader{ .bytes = &bytes, .endian = .little };
+    const black = try black_level_read(&reader, &ifd);
+    const white = try white_level_read(&reader, &ifd);
+    try std.testing.expectEqual([4]f32{ 100, 101, 102, 103 }, black.sites.?);
+    try std.testing.expectEqual([4]f32{ 1000, 1001, 1002, 1003 }, white.sites.?);
 }

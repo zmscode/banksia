@@ -3,6 +3,8 @@
 //!   banksia render <raw.dng> <recipe.json> <out.png>
 //!   banksia synth <out.dng> [<width> <height>]
 //!       write a synthetic demo DNG (dev fixture; defaults to 512x384)
+//!   banksia inspect <raw> [--decode]
+//!       parse RAW metadata; optionally unpack and validate the sensor mosaic
 //!
 //! The CLI reads inputs itself; emu stays a pure function over the bytes
 //! it is handed, and every output byte goes through wombat (which owns
@@ -29,6 +31,16 @@ pub fn main(init: std.process.Init) !void {
         if (args.next() != null) return usage();
         return render_file(gpa, io, raw_path, recipe_path, out_path);
     }
+    if (std.mem.eql(u8, command, "inspect")) {
+        const raw_path = args.next() orelse return usage();
+        var decode_pixels = false;
+        if (args.next()) |option| {
+            if (!std.mem.eql(u8, option, "--decode")) return usage();
+            decode_pixels = true;
+        }
+        if (args.next() != null) return usage();
+        return inspect_file(gpa, io, raw_path, decode_pixels);
+    }
     if (std.mem.eql(u8, command, "synth")) {
         const out_path = args.next() orelse return usage();
         var width: u32 = 512;
@@ -44,6 +56,98 @@ pub fn main(init: std.process.Init) !void {
         return synth_file(gpa, io, out_path, width, height);
     }
     return usage();
+}
+
+fn inspect_file(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    raw_path: []const u8,
+    decode_pixels: bool,
+) !void {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, raw_path, gpa, file_bytes_max) catch |err| {
+        return fail("cannot read raw '{s}': {s}", .{ raw_path, @errorName(err) });
+    };
+    defer gpa.free(bytes);
+    var decoded: ?emu.dng.DecodedRaw = null;
+    defer if (decoded) |*raw| raw.deinit(gpa);
+    const metadata = if (decode_pixels) decoded: {
+        decoded = emu.raw.decode_raw(gpa, bytes) catch |err| {
+            return fail("cannot unpack '{s}': {s}", .{ raw_path, @errorName(err) });
+        };
+        break :decoded decoded.?.metadata;
+    } else emu.raw.decode_metadata(bytes) catch |err| {
+        return fail("cannot inspect '{s}': {s}", .{ raw_path, @errorName(err) });
+    };
+    try status(io, "{s}: {d}x{d}, {s}, orientation={s}\n", .{
+        raw_path,
+        metadata.width,
+        metadata.height,
+        @tagName(metadata.compression),
+        @tagName(metadata.orientation),
+    });
+    try status(io, "  active: x={d} y={d} width={d} height={d}\n", .{
+        metadata.active_area.x,
+        metadata.active_area.y,
+        metadata.active_area.width,
+        metadata.active_area.height,
+    });
+    try status(io, "  default crop (active-relative): x={d} y={d} width={d} height={d}\n", .{
+        metadata.default_crop.x,
+        metadata.default_crop.y,
+        metadata.default_crop.width,
+        metadata.default_crop.height,
+    });
+    try status(io, "  CFA: {s} {s} / {s} {s}; black={d:.3} white={d:.3}\n", .{
+        @tagName(metadata.cfa[0]),
+        @tagName(metadata.cfa[1]),
+        @tagName(metadata.cfa[2]),
+        @tagName(metadata.cfa[3]),
+        metadata.black_level,
+        metadata.white_level,
+    });
+    if (metadata.black_level_site) |levels| {
+        try status(io, "  black sites: {d:.0} {d:.0} / {d:.0} {d:.0}\n", .{
+            levels[0], levels[1], levels[2], levels[3],
+        });
+    }
+    try status(io, "  as-shot neutral: {d:.6} {d:.6} {d:.6}\n", .{
+        metadata.wb_neutral[0],
+        metadata.wb_neutral[1],
+        metadata.wb_neutral[2],
+    });
+    try status(io, "  camera: {s} {s}; lens={s}\n", .{
+        metadata.make.slice(),
+        metadata.model.slice(),
+        metadata.lens.slice(),
+    });
+    if (metadata.unique_model.len != 0) {
+        try status(io, "  unique model: {s}\n", .{metadata.unique_model.slice()});
+    }
+    if (metadata.iso) |iso| try status(io, "  ISO: {d:.0}\n", .{iso});
+    if (metadata.capture_datetime.len != 0) {
+        try status(io, "  captured: {s}.{s}\n", .{
+            metadata.capture_datetime.slice(),
+            metadata.capture_subsecond.slice(),
+        });
+    }
+    try status(io, "  colour calibration: matrix1={s} matrix2={s}\n", .{
+        if (metadata.color_matrix_1 != null) "yes" else "no",
+        if (metadata.color_matrix_2 != null) "yes" else "no",
+    });
+    if (metadata.camera_to_xyz) |matrix| {
+        try status(io, "  backend camera-to-XYZ:\n", .{});
+        for (0..3) |row| {
+            try status(io, "    {d:.6} {d:.6} {d:.6}\n", .{
+                matrix[row * 3], matrix[row * 3 + 1], matrix[row * 3 + 2],
+            });
+        }
+    }
+    if (decoded) |*raw| {
+        try status(io, "  decoded sensor: {d} samples ({d} bytes)\n", .{
+            raw.sensor.bayer.len,
+            raw.sensor.bayer.len * @sizeOf(u16),
+        });
+    }
 }
 
 /// A synthetic scene with structure in every channel: a horizontal
@@ -125,12 +229,12 @@ fn render_file(
     };
     defer recipe.deinit();
 
-    var sensor = emu.dng.decode(gpa, raw_bytes) catch |err| {
+    var raw = emu.raw.decode_raw(gpa, raw_bytes) catch |err| {
         return fail("cannot decode '{s}': {s}", .{ raw_path, @errorName(err) });
     };
-    defer sensor.deinit(gpa);
+    defer raw.deinit(gpa);
 
-    var rendered = emu.pipeline.render(gpa, &sensor, recipe.value, .{}) catch |err| {
+    var rendered = emu.pipeline.render_decoded(gpa, &raw, recipe.value, .{}) catch |err| {
         return fail("render failed: {s}", .{@errorName(err)});
     };
     defer rendered.deinit(gpa);
@@ -165,6 +269,7 @@ fn usage() error{Usage} {
     std.debug.print(
         \\usage: banksia render <raw.dng> <recipe.json> <out.png>
         \\       banksia synth <out.dng> [<width> <height>]
+        \\       banksia inspect <raw> [--decode]
         \\
     , .{});
     return error.Usage;

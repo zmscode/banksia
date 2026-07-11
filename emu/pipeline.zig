@@ -18,7 +18,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const builtin = @import("builtin");
+const color = @import("color.zig");
 const dng = @import("dng.zig");
+const geometry = @import("geometry.zig");
 const image = @import("image.zig");
 
 /// Per-element asserts inside pixel loops run only when this is set: slow
@@ -26,6 +28,7 @@ const image = @import("image.zig");
 const verify = builtin.mode == .Debug;
 
 pub const engine_version_current: u32 = 1;
+pub const engine_version_latest: u32 = 2;
 
 /// An edit stack longer than this is not a recipe, it is a bug.
 pub const ops_max: u32 = 64;
@@ -95,6 +98,7 @@ pub const RenderError = error{
     InvalidRecipe,
     UnsupportedEngineVersion,
     UnsupportedSensor,
+    InvalidColorMetadata,
     OutOfMemory,
 };
 
@@ -104,11 +108,47 @@ pub fn render(
     recipe: Recipe,
     options: RenderOptions,
 ) RenderError!Rendered {
+    if (recipe.engine_version != 1) return error.UnsupportedEngineVersion;
+    return render_internal(gpa, sensor, recipe, options, null, null);
+}
+
+/// Rich dispatch surface. Version 1 deliberately ignores metadata and stays
+/// byte-frozen; version 2 applies the declared crop and orientation.
+pub fn render_decoded(
+    gpa: std.mem.Allocator,
+    raw: *const dng.DecodedRaw,
+    recipe: Recipe,
+    options: RenderOptions,
+) RenderError!Rendered {
+    return switch (recipe.engine_version) {
+        1 => render(gpa, &raw.sensor, recipe, options),
+        2 => {
+            const color_transform = color.Transform.init(raw.metadata) catch {
+                return error.InvalidColorMetadata;
+            };
+            return render_internal(
+                gpa,
+                &raw.sensor,
+                recipe,
+                options,
+                geometry.Transform.init(raw.metadata),
+                color_transform,
+            );
+        },
+        else => error.UnsupportedEngineVersion,
+    };
+}
+
+fn render_internal(
+    gpa: std.mem.Allocator,
+    sensor: *const dng.SensorData,
+    recipe: Recipe,
+    options: RenderOptions,
+    transform: ?geometry.Transform,
+    color_transform: ?color.Transform,
+) RenderError!Rendered {
     assert(sensor.bayer.len == @as(usize, sensor.width) * sensor.height);
     assert(sensor.white_level > sensor.black_level);
-    if (recipe.engine_version != engine_version_current) {
-        return error.UnsupportedEngineVersion;
-    }
 
     // The op stack is struct-of-arrays: validation walks the tag column
     // without touching a single payload.
@@ -124,29 +164,62 @@ pub fn render(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const width_out, const height_out =
-        dims_out(sensor.width, sensor.height, options.edge_px_max_out);
-    const count_out = @as(usize, width_out) * height_out;
-    const rgba = try gpa.alloc(u8, count_out * 4);
-    errdefer gpa.free(rgba);
-
     const count = @as(usize, sensor.width) * sensor.height;
     const mosaic = try arena.alloc(f32, count);
     var planes = try image.Planes.init(arena, sensor.width, sensor.height);
 
     for (0..ops.len) |i| {
-        try op_apply(ops.get(i), sensor, mosaic, &planes);
+        try op_apply(ops.get(i), sensor, mosaic, &planes, color_transform);
     }
+    if (color_transform != null) color.working_to_linear_srgb(&planes);
 
-    if (width_out == sensor.width and height_out == sensor.height) {
-        kernel_srgb_pack(rgba, planes.r, planes.g, planes.b);
+    const output_planes = if (transform) |value|
+        try planes_transform(arena, &planes, value)
+    else
+        planes;
+    const width_out, const height_out = dims_out(
+        output_planes.width,
+        output_planes.height,
+        options.edge_px_max_out,
+    );
+    const count_out = @as(usize, width_out) * height_out;
+    const rgba = try gpa.alloc(u8, count_out * 4);
+    errdefer gpa.free(rgba);
+
+    if (width_out == output_planes.width and height_out == output_planes.height) {
+        kernel_srgb_pack(rgba, output_planes.r, output_planes.g, output_planes.b);
     } else {
-        const small = try planes_downsample(arena, &planes, width_out, height_out);
+        const small = try planes_downsample(arena, &output_planes, width_out, height_out);
         kernel_srgb_pack(rgba, small.r, small.g, small.b);
     }
 
     assert(rgba.len == count_out * 4);
     return .{ .width = width_out, .height = height_out, .rgba = rgba };
+}
+
+fn planes_transform(
+    arena: std.mem.Allocator,
+    source: *const image.Planes,
+    transform: geometry.Transform,
+) RenderError!image.Planes {
+    const dimensions = transform.output_dimensions();
+    const target = try image.Planes.init(arena, dimensions.width, dimensions.height);
+    const pairs = [3][2][]f32{
+        .{ target.r, source.r },
+        .{ target.g, source.g },
+        .{ target.b, source.b },
+    };
+    for (pairs) |pair| {
+        for (pair[0], 0..) |*value, index| {
+            const output = geometry.Point{
+                .x = @intCast(index % dimensions.width),
+                .y = @intCast(index / dimensions.width),
+            };
+            const sensor = transform.output_to_sensor(output);
+            value.* = pair[1][@as(usize, sensor.y) * source.width + sensor.x];
+        }
+    }
+    return target;
 }
 
 /// Output dimensions for a bounded longest edge. A bound of 0, or one at or
@@ -202,18 +275,37 @@ fn op_apply(
     sensor: *const dng.SensorData,
     mosaic: []f32,
     planes: *image.Planes,
+    color_transform: ?color.Transform,
 ) RenderError!void {
     switch (op) {
         .black_point => {
-            const scale = 1.0 / (sensor.white_level - sensor.black_level);
-            kernel_black_scale(mosaic, sensor.bayer, sensor.black_level, scale);
+            if (sensor.black_level_site) |black| {
+                const white = sensor.white_level_site orelse
+                    @as([4]f32, @splat(sensor.white_level));
+                kernel_black_scale_sites(
+                    mosaic,
+                    sensor.bayer,
+                    sensor.width,
+                    sensor.height,
+                    black,
+                    white,
+                );
+            } else {
+                const scale = 1.0 / (sensor.white_level - sensor.black_level);
+                kernel_black_scale(mosaic, sensor.bayer, sensor.black_level, scale);
+            }
         },
         .white_balance => {
             const wb = op.white_balance;
-            const gains = wb_gains(wb, sensor.wb_neutral);
-            kernel_wb(mosaic, sensor.width, sensor.height, sensor.cfa, gains);
+            if (color_transform == null or !wb.as_shot) {
+                const gains = wb_gains(wb, sensor.wb_neutral);
+                kernel_wb(mosaic, sensor.width, sensor.height, sensor.cfa, gains);
+            }
         },
-        .demosaic => try demosaic_dispatch(sensor.cfa, mosaic, planes),
+        .demosaic => {
+            try demosaic_dispatch(sensor.cfa, mosaic, planes);
+            if (color_transform) |value| value.camera_to_working(planes);
+        },
         .exposure => {
             const gain = std.math.exp2(op.exposure.ev);
             for ([_][]f32{ planes.r, planes.g, planes.b }) |plane| {
@@ -291,6 +383,34 @@ fn kernel_black_scale(dst: []f32, src: []const u16, black: f32, scale: f32) void
     while (i < dst.len) : (i += 1) {
         const v: f32 = @floatFromInt(src[i]);
         dst[i] = @max(0, (v - black) * scale);
+    }
+}
+
+fn kernel_black_scale_sites(
+    dst: []f32,
+    src: []const u16,
+    width: u32,
+    height: u32,
+    black: [4]f32,
+    white: [4]f32,
+) void {
+    assert(dst.len == src.len);
+    assert(dst.len == @as(usize, width) * height);
+    var scale: [4]f32 = undefined;
+    for (&scale, black, white) |*value, black_site, white_site| {
+        assert(white_site > black_site);
+        value.* = 1 / (white_site - black_site);
+    }
+
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < width) : (x += 1) {
+            const index = @as(usize, y) * width + x;
+            const site = (y & 1) * 2 + (x & 1);
+            const raw: f32 = @floatFromInt(src[index]);
+            dst[index] = @max(0, (raw - black[site]) * scale[site]);
+        }
     }
 }
 
@@ -590,6 +710,15 @@ fn test_sensor(gpa: std.mem.Allocator, width: u32, height: u32) !dng.SensorData 
     };
 }
 
+test "per-site black and white levels normalize each CFA site independently" {
+    const source = [4]u16{ 60, 120, 180, 240 };
+    const black = [4]f32{ 10, 20, 30, 40 };
+    const white = [4]f32{ 110, 220, 330, 440 };
+    var target: [4]f32 = undefined;
+    kernel_black_scale_sites(&target, &source, 2, 2, black, white);
+    for (target) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.5), value, 1e-6);
+}
+
 test "render is deterministic: two runs, identical bytes" {
     const gpa = std.testing.allocator;
     var sensor = try test_sensor(gpa, 23, 17);
@@ -625,6 +754,43 @@ test "downsampled render is deterministic and sized by the longest edge" {
     defer full.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 37), full.width);
     try std.testing.expectEqual(@as(u32, 23), full.height);
+}
+
+test "engine v2 applies default crop and orientation before preview sizing" {
+    const gpa = std.testing.allocator;
+    const sensor = try test_sensor(gpa, 10, 8);
+    var raw = dng.DecodedRaw{
+        .sensor = sensor,
+        .metadata = .{
+            .width = 10,
+            .height = 8,
+            .compression = .none,
+            .cfa = sensor.cfa,
+            .black_level = sensor.black_level,
+            .white_level = sensor.white_level,
+            .wb_neutral = sensor.wb_neutral,
+            .orientation = .rotate_90_clockwise,
+            .active_area = .{ .x = 1, .y = 1, .width = 8, .height = 6 },
+            .default_crop = .{ .x = 1, .y = 1, .width = 6, .height = 4 },
+            .color_matrix_1 = color.Mat3.identity.values,
+            .calibration_illuminant_1 = 23,
+        },
+    };
+    defer raw.deinit(gpa);
+    const recipe = Recipe{ .engine_version = 2, .ops = &test_ops_default };
+
+    var full = try render_decoded(gpa, &raw, recipe, .{});
+    defer full.deinit(gpa);
+    var repeated = try render_decoded(gpa, &raw, recipe, .{});
+    defer repeated.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 4), full.width);
+    try std.testing.expectEqual(@as(u32, 6), full.height);
+    try std.testing.expectEqualSlices(u8, full.rgba, repeated.rgba);
+
+    var preview = try render_decoded(gpa, &raw, recipe, .{ .edge_px_max_out = 3 });
+    defer preview.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 2), preview.width);
+    try std.testing.expectEqual(@as(u32, 3), preview.height);
 }
 
 test "box downsample bins tile the source and average exactly" {
@@ -707,5 +873,19 @@ test "stack validation rejects malformed recipes (negative space)" {
     try std.testing.expectError(
         error.UnsupportedEngineVersion,
         render(gpa, &sensor, .{ .engine_version = 2, .ops = &test_ops_default }, .{}),
+    );
+
+    const raw = dng.DecodedRaw{
+        .sensor = sensor,
+        .metadata = undefined,
+    };
+    try std.testing.expectError(
+        error.UnsupportedEngineVersion,
+        render_decoded(
+            gpa,
+            &raw,
+            .{ .engine_version = 3, .ops = &test_ops_default },
+            .{},
+        ),
     );
 }

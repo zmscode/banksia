@@ -17,6 +17,12 @@ pub const Compression = enum { none, lossless_jpeg };
 
 pub const Tile = struct { width: u32, height: u32 };
 
+const identity_matrix: dng.Matrix3x3 = .{
+    1, 0, 0,
+    0, 1, 0,
+    0, 0, 1,
+};
+
 pub const Description = struct {
     width: u32,
     height: u32,
@@ -24,6 +30,15 @@ pub const Description = struct {
     black_level: u16 = 0,
     white_level: u16 = 65535,
     wb_neutral: [3]f32 = .{ 1, 1, 1 },
+    color_matrix_1: dng.Matrix3x3 = identity_matrix,
+    camera_calibration_1: dng.Matrix3x3 = identity_matrix,
+    analog_balance: [3]f32 = .{ 1, 1, 1 },
+    calibration_illuminant_1: u16 = 23,
+    orientation: dng.Orientation = .normal,
+    /// Sensor-relative active pixels; null selects the full sensor.
+    active_area: ?dng.Rect = null,
+    /// Sensor-relative output crop; null selects the active area.
+    default_crop: ?dng.Rect = null,
     /// Row-major mosaic, exactly `width * height` samples.
     bayer: []const u16,
     compression: Compression = .none,
@@ -38,6 +53,11 @@ const tiles_max: u32 = 4096;
 /// Fixed denominator for encoding f32 as RATIONAL. One part per million is
 /// far below anything the pipeline can distinguish.
 const fraction_denominator: u32 = 1_000_000;
+
+const Geometry = struct {
+    active_area: dng.Rect,
+    default_crop: dng.Rect,
+};
 
 const Grid = struct {
     segment_width: u32,
@@ -59,6 +79,9 @@ pub fn write(gpa: std.mem.Allocator, desc: Description) ![]u8 {
     assert(desc.bayer.len == @as(usize, desc.width) * desc.height);
     assert(desc.white_level > desc.black_level);
     for (desc.wb_neutral) |n| assert(n > 0);
+    const orientation = @intFromEnum(desc.orientation);
+    assert(orientation >= 1 and orientation <= 8);
+    const geometry = geometry_of(desc);
 
     const grid = grid_of(desc);
     assert(grid.count() >= 1);
@@ -74,7 +97,29 @@ pub fn write(gpa: std.mem.Allocator, desc: Description) ![]u8 {
         payload.* = try segment_payload(arena, desc, grid, @intCast(index));
     }
 
-    return assemble(gpa, desc, grid, payloads);
+    return assemble(gpa, desc, geometry, grid, payloads);
+}
+
+fn geometry_of(desc: Description) Geometry {
+    const sensor = dng.Rect{ .x = 0, .y = 0, .width = desc.width, .height = desc.height };
+    const active = desc.active_area orelse sensor;
+    assert(active.width > 0);
+    assert(active.height > 0);
+    assert(active.width <= sensor.width);
+    assert(active.height <= sensor.height);
+    assert(active.x <= sensor.width - active.width);
+    assert(active.y <= sensor.height - active.height);
+
+    const crop = desc.default_crop orelse active;
+    assert(crop.width > 0);
+    assert(crop.height > 0);
+    assert(crop.x >= active.x);
+    assert(crop.y >= active.y);
+    assert(crop.width <= active.width);
+    assert(crop.height <= active.height);
+    assert(crop.x - active.x <= active.width - crop.width);
+    assert(crop.y - active.y <= active.height - crop.height);
+    return .{ .active_area = active, .default_crop = crop };
 }
 
 fn grid_of(desc: Description) Grid {
@@ -151,41 +196,63 @@ const Assembly = struct {
     entry_count: u32,
     black_off: u32,
     neutral_off: u32,
+    default_crop_origin_off: u32,
+    default_crop_size_off: u32,
+    color_matrix_1_off: u32,
+    camera_calibration_1_off: u32,
+    analog_balance_off: u32,
+    active_area_off: u32,
     /// 0 when the single segment's values are stored inline.
     offsets_array_off: u32,
     byte_counts_array_off: u32,
     data_off: u32,
-    total: u64,
+    total: u32,
 };
 
 fn assembly_plan(grid: Grid, payloads: []const []const u8, tiled: bool) Assembly {
-    const entry_count: u32 = if (tiled) 17 else 16;
-    const values_off = ifd_off + 2 + entry_count * 12 + 4;
+    const entry_count: u32 = if (tiled) 25 else 24;
     const arrays = grid.count() > 1;
-    const array_bytes: u32 = if (arrays) 4 * grid.count() else 0;
+    const array_bytes: u64 = if (arrays) 4 * @as(u64, grid.count()) else 0;
+    const values_off = @as(u64, ifd_off) + 2 + @as(u64, entry_count) * 12 + 4;
     const black_off = values_off;
     const neutral_off = black_off + 8;
-    const offsets_array_off = neutral_off + 24;
+    const default_crop_origin_off = neutral_off + 24;
+    const default_crop_size_off = default_crop_origin_off + 8;
+    const color_matrix_1_off = default_crop_size_off + 8;
+    const camera_calibration_1_off = color_matrix_1_off + 72;
+    const analog_balance_off = camera_calibration_1_off + 72;
+    const active_area_off = analog_balance_off + 24;
+    const offsets_array_off = active_area_off + 16;
     const byte_counts_array_off = offsets_array_off + array_bytes;
     const data_off = byte_counts_array_off + array_bytes;
     assert(data_off % 2 == 0);
 
-    var total: u64 = data_off;
-    for (payloads) |payload| total += payload.len + payload.len % 2;
+    var total = data_off;
+    for (payloads) |payload| {
+        total += @as(u64, payload.len) + payload.len % 2;
+    }
+    assert(total <= std.math.maxInt(u32));
     return .{
         .entry_count = entry_count,
-        .black_off = black_off,
-        .neutral_off = neutral_off,
-        .offsets_array_off = if (arrays) offsets_array_off else 0,
-        .byte_counts_array_off = if (arrays) byte_counts_array_off else 0,
-        .data_off = data_off,
-        .total = total,
+        .black_off = @intCast(black_off),
+        .neutral_off = @intCast(neutral_off),
+        .default_crop_origin_off = @intCast(default_crop_origin_off),
+        .default_crop_size_off = @intCast(default_crop_size_off),
+        .color_matrix_1_off = @intCast(color_matrix_1_off),
+        .camera_calibration_1_off = @intCast(camera_calibration_1_off),
+        .analog_balance_off = @intCast(analog_balance_off),
+        .active_area_off = @intCast(active_area_off),
+        .offsets_array_off = if (arrays) @intCast(offsets_array_off) else 0,
+        .byte_counts_array_off = if (arrays) @intCast(byte_counts_array_off) else 0,
+        .data_off = @intCast(data_off),
+        .total = @intCast(total),
     };
 }
 
 fn assemble(
     gpa: std.mem.Allocator,
     desc: Description,
+    geometry: Geometry,
     grid: Grid,
     payloads: []const []const u8,
 ) ![]u8 {
@@ -204,19 +271,52 @@ fn assemble(
     for (desc.wb_neutral, 0..) |n, i| {
         fraction_put(out, plan.neutral_off + 8 * @as(u32, @intCast(i)), n);
     }
+    const active = geometry.active_area;
+    const crop = geometry.default_crop;
+    put_u32(out, plan.default_crop_origin_off, crop.x - active.x);
+    put_u32(out, plan.default_crop_origin_off + 4, crop.y - active.y);
+    put_u32(out, plan.default_crop_size_off, crop.width);
+    put_u32(out, plan.default_crop_size_off + 4, crop.height);
+    for (desc.color_matrix_1, 0..) |value, index| {
+        signed_fraction_put(
+            out,
+            plan.color_matrix_1_off + 8 * @as(u32, @intCast(index)),
+            value,
+        );
+    }
+    for (desc.camera_calibration_1, 0..) |value, index| {
+        signed_fraction_put(
+            out,
+            plan.camera_calibration_1_off + 8 * @as(u32, @intCast(index)),
+            value,
+        );
+    }
+    for (desc.analog_balance, 0..) |value, index| {
+        fraction_put(
+            out,
+            plan.analog_balance_off + 8 * @as(u32, @intCast(index)),
+            value,
+        );
+    }
+    put_u32(out, plan.active_area_off, active.y);
+    put_u32(out, plan.active_area_off + 4, active.x);
+    put_u32(out, plan.active_area_off + 8, active.y + active.height);
+    put_u32(out, plan.active_area_off + 12, active.x + active.width);
 
     // Segment data, with the offset/byte-count arrays when out-of-line.
-    var data_off: u32 = plan.data_off;
+    var data_cursor: u64 = plan.data_off;
     for (payloads, 0..) |payload, index| {
         const i: u32 = @intCast(index);
+        const data_off: u32 = @intCast(data_cursor);
+        const payload_len: u32 = @intCast(payload.len);
         if (grid.count() > 1) {
             put_u32(out, plan.offsets_array_off + 4 * i, data_off);
-            put_u32(out, plan.byte_counts_array_off + 4 * i, @intCast(payload.len));
+            put_u32(out, plan.byte_counts_array_off + 4 * i, payload_len);
         }
         @memcpy(out[data_off..][0..payload.len], payload);
-        data_off += @intCast(payload.len + payload.len % 2);
+        data_cursor += @as(u64, payload_len) + payload_len % 2;
     }
-    assert(data_off == plan.total);
+    assert(data_cursor == plan.total);
     return out;
 }
 
@@ -252,6 +352,7 @@ fn entries_put(
     if (desc.tile == null) {
         sink.put(273, type_long, grid.count(), offsets_payload); // StripOffsets
     }
+    sink.put(274, type_short, 1, @intCast(@intFromEnum(desc.orientation))); // Orientation
     sink.put(277, type_short, 1, 1); // SamplesPerPixel
     if (desc.tile == null) {
         sink.put(278, type_long, 1, desc.height); // RowsPerStrip
@@ -267,7 +368,14 @@ fn entries_put(
     sink.put(50706, type_byte, 4, 1 | (4 << 8)); // DNGVersion 1.4.0.0
     sink.put(50714, type_rational, 1, plan.black_off); // BlackLevel
     sink.put(50717, type_long, 1, desc.white_level); // WhiteLevel
+    sink.put(50719, type_long, 2, plan.default_crop_origin_off); // DefaultCropOrigin
+    sink.put(50720, type_long, 2, plan.default_crop_size_off); // DefaultCropSize
+    sink.put(50721, type_srational, 9, plan.color_matrix_1_off); // ColorMatrix1
+    sink.put(50723, type_srational, 9, plan.camera_calibration_1_off); // CameraCalibration1
+    sink.put(50727, type_rational, 3, plan.analog_balance_off); // AnalogBalance
     sink.put(50728, type_rational, 3, plan.neutral_off); // AsShotNeutral
+    sink.put(50778, type_short, 1, desc.calibration_illuminant_1); // CalibrationIlluminant1
+    sink.put(50829, type_long, 4, plan.active_area_off); // ActiveArea
     assert(sink.index == plan.entry_count);
     put_u32(out, ifd_off + 2 + plan.entry_count * 12, 0); // no next IFD
 }
@@ -276,6 +384,7 @@ const type_byte: u16 = 1;
 const type_short: u16 = 3;
 const type_long: u16 = 4;
 const type_rational: u16 = 5;
+const type_srational: u16 = 10;
 
 const EntrySink = struct {
     out: []u8,
@@ -316,6 +425,58 @@ fn fraction_put(out: []u8, off: u32, v: f32) void {
     put_u32(out, off + 4, fraction_denominator);
 }
 
+fn signed_fraction_put(out: []u8, off: u32, v: f32) void {
+    assert(v > -2000);
+    assert(v < 2000);
+    const numerator: i32 = @intFromFloat(@round(v * fraction_denominator));
+    put_u32(out, off, @bitCast(numerator));
+    put_u32(out, off + 4, fraction_denominator);
+}
+
+fn expect_tag_values(
+    blob: []const u8,
+    tag: u16,
+    typ: u16,
+    expected: []const u32,
+) !void {
+    const ifd = std.mem.readInt(u32, blob[4..8], .little);
+    const count = std.mem.readInt(u16, blob[ifd..][0..2], .little);
+    var entry_off: ?u32 = null;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const off = ifd + 2 + i * 12;
+        if (std.mem.readInt(u16, blob[off..][0..2], .little) == tag) {
+            entry_off = off;
+            break;
+        }
+    }
+    const off = entry_off orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(typ, std.mem.readInt(u16, blob[off + 2 ..][0..2], .little));
+    try std.testing.expectEqual(
+        @as(u32, @intCast(expected.len)),
+        std.mem.readInt(u32, blob[off + 4 ..][0..4], .little),
+    );
+    const value_size: u32 = switch (typ) {
+        type_short => 2,
+        type_long => 4,
+        else => unreachable,
+    };
+    const value_bytes = @as(u64, value_size) * @as(u64, @intCast(expected.len));
+    const value_off = if (value_bytes <= 4)
+        off + 8
+    else
+        std.mem.readInt(u32, blob[off + 8 ..][0..4], .little);
+    for (expected, 0..) |value, index| {
+        const item_off = value_off + value_size * @as(u32, @intCast(index));
+        const actual: u32 = switch (typ) {
+            type_short => std.mem.readInt(u16, blob[item_off..][0..2], .little),
+            type_long => std.mem.readInt(u32, blob[item_off..][0..4], .little),
+            else => unreachable,
+        };
+        try std.testing.expectEqual(value, actual);
+    }
+}
+
 test "write/decode roundtrip preserves every field and every sample" {
     const gpa = std.testing.allocator;
     var bayer: [6 * 4]u16 = undefined;
@@ -328,12 +489,36 @@ test "write/decode roundtrip preserves every field and every sample" {
         .black_level = 128,
         .white_level = 16000,
         .wb_neutral = .{ 0.5, 1.0, 0.75 },
+        .active_area = .{ .x = 1, .y = 1, .width = 4, .height = 2 },
+        .default_crop = .{ .x = 2, .y = 1, .width = 2, .height = 2 },
         .bayer = &bayer,
     });
     defer gpa.free(blob);
 
-    var sensor = try dng.decode(gpa, blob);
-    defer sensor.deinit(gpa);
+    try expect_tag_values(blob, 274, type_short, &.{1});
+    try expect_tag_values(blob, 50719, type_long, &.{ 1, 0 });
+    try expect_tag_values(blob, 50720, type_long, &.{ 2, 2 });
+    try expect_tag_values(blob, 50778, type_short, &.{23});
+    try expect_tag_values(blob, 50829, type_long, &.{ 1, 1, 3, 5 });
+
+    var raw = try dng.decode_raw(gpa, blob);
+    defer raw.deinit(gpa);
+    const sensor = &raw.sensor;
+    const metadata = try dng.decode_metadata(blob);
+    try std.testing.expectEqual(raw.metadata, metadata);
+    try std.testing.expectEqual(dng.Orientation.normal, metadata.orientation);
+    try std.testing.expectEqual(
+        dng.Rect{ .x = 1, .y = 1, .width = 4, .height = 2 },
+        metadata.active_area,
+    );
+    try std.testing.expectEqual(
+        dng.Rect{ .x = 1, .y = 0, .width = 2, .height = 2 },
+        metadata.default_crop,
+    );
+    try std.testing.expectEqual(identity_matrix, metadata.color_matrix_1.?);
+    try std.testing.expectEqual(identity_matrix, metadata.camera_calibration_1.?);
+    try std.testing.expectEqual([3]f32{ 1, 1, 1 }, metadata.analog_balance);
+    try std.testing.expectEqual(@as(?u16, 23), metadata.calibration_illuminant_1);
 
     try std.testing.expectEqual(@as(u32, 6), sensor.width);
     try std.testing.expectEqual(@as(u32, 4), sensor.height);
@@ -345,6 +530,32 @@ test "write/decode roundtrip preserves every field and every sample" {
         try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
     }
     try std.testing.expectEqualSlices(u16, &bayer, sensor.bayer);
+}
+
+test "all eight TIFF orientations roundtrip through metadata-only decode" {
+    const gpa = std.testing.allocator;
+    const bayer = [_]u16{ 100, 200, 300, 400 };
+    const orientations = [_]dng.Orientation{
+        .normal,
+        .mirror_horizontal,
+        .rotate_180,
+        .mirror_vertical,
+        .transpose,
+        .rotate_90_clockwise,
+        .transverse,
+        .rotate_270_clockwise,
+    };
+    for (orientations) |orientation| {
+        const blob = try write(gpa, .{
+            .width = 2,
+            .height = 2,
+            .orientation = orientation,
+            .bayer = &bayer,
+        });
+        defer gpa.free(blob);
+        const metadata = try dng.decode_metadata(blob);
+        try std.testing.expectEqual(orientation, metadata.orientation);
+    }
 }
 
 test "roundtrip across every container shape the decoder supports" {
@@ -382,8 +593,9 @@ test "the decoder rejects a corrupted fixture (negative space)" {
     defer gpa.free(blob);
 
     // Truncating the strip must be Corrupt, not a short read.
-    try std.testing.expectError(
-        error.Corrupt,
-        dng.decode(gpa, blob[0 .. blob.len - 2]),
-    );
+    const truncated = blob[0 .. blob.len - 2];
+    // Import can still inspect intact metadata without touching pixel bytes.
+    const metadata = try dng.decode_metadata(truncated);
+    try std.testing.expectEqual(@as(u32, 2), metadata.width);
+    try std.testing.expectError(error.Corrupt, dng.decode(gpa, truncated));
 }

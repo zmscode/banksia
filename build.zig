@@ -3,13 +3,27 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const libraw_prefix = b.option(
+        []const u8,
+        "libraw-prefix",
+        "LibRaw installation prefix",
+    ) orelse "/opt/homebrew/opt/libraw";
 
     // ---- emu: the develop engine module --------------------------------------
     const emu_mod = b.createModule(.{
         .root_source_file = b.path("emu/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    emu_mod.addIncludePath(.{
+        .cwd_relative = b.fmt("{s}/include", .{libraw_prefix}),
+    });
+    emu_mod.addLibraryPath(.{
+        .cwd_relative = b.fmt("{s}/lib", .{libraw_prefix}),
+    });
+    emu_mod.linkSystemLibrary("raw_r", .{ .use_pkg_config = .no });
+    emu_mod.linkSystemLibrary("c++", .{});
 
     // wombat provides the durable vault and catalog baseline; lyrebird
     // (similarity, Phase 4) remains a layout/test stub.
@@ -151,6 +165,15 @@ pub fn build(b: *std.Build) void {
     const abi_step = b.step("test-abi", "Smoke-test the C ABI from a C program");
     abi_step.dependOn(&run_smoke.step);
     test_step.dependOn(&run_smoke.step);
+
+    // ---- `corpus`: optional local proprietary-RAW compatibility gate --------------
+    // The 483 MB source files are intentionally untracked. This verifies their
+    // hashes, LibRaw mosaics, and macOS ImageIO 1024px previews.
+    const corpus_check = b.addSystemCommand(&.{ "sh", "tools/verify-raw-corpus.sh" });
+    corpus_check.step.dependOn(b.getInstallStep());
+    corpus_check.has_side_effects = true;
+    const corpus_step = b.step("corpus", "Verify and ImageIO-decode the local RAW corpus");
+    corpus_step.dependOn(&corpus_check.step);
 
     // ---- `sim`: the wombat crash simulator ---------------------------------------
     // 10k vault plus 10k catalog workloads with crash/torn-write injection.
