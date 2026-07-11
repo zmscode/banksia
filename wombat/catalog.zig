@@ -22,11 +22,23 @@ const assert = std.debug.assert;
 const vfs = @import("vfs.zig");
 const vault = @import("vault.zig");
 
-pub const Error = vfs.Error || error{CorruptCatalog};
+/// User-reachable inputs (hashes, ratings, camera/lens strings, asset ids)
+/// are validated at the public boundary and fail by name — never by
+/// assertion. `CorruptCatalog` is reserved for on-disk state that fails its
+/// own checksums or invariants.
+pub const Error = vfs.Error || error{
+    CorruptCatalog,
+    DuplicateAsset,
+    UnknownAsset,
+    InvalidRating,
+    StringTooLong,
+    LimitExceeded,
+};
 
+pub const rating_max: u8 = 5;
 pub const assets_max: u32 = 1 << 24;
 const strings_max: u32 = 1 << 16;
-const string_bytes_max: u32 = 256;
+const string_bytes_max: u32 = 255; // one length byte in the WAL record
 const wal_record_bytes_max: u32 = 1024;
 const snapshot_path = "catalog";
 const snapshot_tmp_path = "catalog.tmp";
@@ -59,14 +71,15 @@ pub const Asset = struct {
     sharpness: f16,
 };
 
-/// What an importer knows about one photo.
+/// What an importer knows about one photo. `rating` is 0..=`rating_max`;
+/// out-of-range values are rejected at the boundary, not truncated.
 pub const AssetDescription = struct {
     hash: vault.Hash,
     capture_time: i64 = 0,
     camera: []const u8 = "",
     lens: []const u8 = "",
     iso: u32 = 0,
-    rating: u3 = 0,
+    rating: u8 = 0,
     flags: Flags = .{},
 };
 
@@ -106,6 +119,18 @@ const StringTable = struct {
     fn get(table: *const StringTable, id: u16) []const u8 {
         assert(id < table.strings.items.len);
         return table.strings.items[id];
+    }
+
+    /// Roll the table back to `len` entries, unmapping and freeing the rest.
+    /// Ids are dense and assigned in order, so the tail pops cleanly — this
+    /// undoes interning done for a mutation whose WAL append then failed.
+    fn truncate(table: *StringTable, gpa: std.mem.Allocator, len: usize) void {
+        assert(len <= table.strings.items.len);
+        while (table.strings.items.len > len) {
+            const string = table.strings.pop().?;
+            assert(table.ids.remove(string));
+            gpa.free(string);
+        }
     }
 };
 
@@ -155,14 +180,42 @@ pub fn CatalogType(comptime Fs: type) type {
             return catalog.asset_by_hash_id.get(hash_id);
         }
 
-        /// Append an asset. Durable when this returns.
+        /// Append an asset. Durable when this returns, and failure-atomic:
+        /// every allocation the mutation needs is reserved *before* the WAL
+        /// record is made durable, so the in-memory apply after the append
+        /// cannot fail. A failed call therefore never surfaces as a
+        /// successful mutation after reopen.
         pub fn asset_add(catalog: *Catalog, description: AssetDescription) Error!u32 {
-            assert(catalog.assets.len < assets_max);
-            assert(catalog.asset_by_hash(description.hash) == null);
+            const gpa = catalog.gpa;
+            if (catalog.assets.len >= assets_max) return error.LimitExceeded;
+            if (description.rating > rating_max) return error.InvalidRating;
+            if (description.camera.len > string_bytes_max) return error.StringTooLong;
+            if (description.lens.len > string_bytes_max) return error.StringTooLong;
+            if (catalog.asset_by_hash(description.hash) != null) return error.DuplicateAsset;
+
+            // Interning is the only pre-WAL step that mutates state; capture
+            // the table lengths so a later failure rolls it back cleanly.
+            const cameras_len = catalog.cameras.strings.items.len;
+            const lenses_len = catalog.lenses.strings.items.len;
+            errdefer catalog.cameras.truncate(gpa, cameras_len);
+            errdefer catalog.lenses.truncate(gpa, lenses_len);
+
+            const camera_id = try catalog.cameras.intern(gpa, description.camera);
+            const lens_id = try catalog.lenses.intern(gpa, description.lens);
+            const hash_id_existing = catalog.hash_ids.get(description.hash);
+            try catalog.assets.ensureUnusedCapacity(gpa, 1);
+            try catalog.asset_by_hash_id.ensureUnusedCapacity(gpa, 1);
+            if (hash_id_existing == null) {
+                try catalog.hashes.ensureUnusedCapacity(gpa, 1);
+                try catalog.hash_ids.ensureUnusedCapacity(gpa, 1);
+            }
+
             var record: [wal_record_bytes_max]u8 = undefined;
             const payload = record_encode_add(&record, catalog.generation, description);
             try catalog.wal_append(payload);
-            return catalog.asset_add_apply(description);
+
+            // Infallible from here: acknowledgement is atomic with durability.
+            return catalog.asset_apply_reserved(description, camera_id, lens_id, hash_id_existing);
         }
 
         /// In-memory append with no WAL record: the benchmark builds a
@@ -172,17 +225,20 @@ pub fn CatalogType(comptime Fs: type) type {
             return catalog.asset_add_apply(description);
         }
 
-        pub fn rating_set(catalog: *Catalog, asset: u32, rating: u3) Error!void {
-            assert(asset < catalog.assets.len);
+        pub fn rating_set(catalog: *Catalog, asset: u32, rating: u8) Error!void {
+            if (asset >= catalog.assets.len) return error.UnknownAsset;
+            if (rating > rating_max) return error.InvalidRating;
             var record: [wal_record_bytes_max]u8 = undefined;
             const payload =
                 record_encode_set(&record, catalog.generation, .set_rating, asset, rating);
+            // The WAL append is the only fallible step; the slot write after
+            // it cannot fail, so the mutation is failure-atomic by shape.
             try catalog.wal_append(payload);
-            catalog.assets.items(.rating)[asset] = rating;
+            catalog.assets.items(.rating)[asset] = @intCast(rating);
         }
 
         pub fn flags_set(catalog: *Catalog, asset: u32, flags: Flags) Error!void {
-            assert(asset < catalog.assets.len);
+            if (asset >= catalog.assets.len) return error.UnknownAsset;
             var record: [wal_record_bytes_max]u8 = undefined;
             const payload =
                 record_encode_set(&record, catalog.generation, .set_flags, asset, @bitCast(flags));
@@ -319,7 +375,7 @@ pub fn CatalogType(comptime Fs: type) type {
                     const asset = std.mem.readInt(u32, body[0..4], .little);
                     if (asset >= catalog.assets.len) return error.CorruptCatalog;
                     if (tag == .set_rating) {
-                        if (body[4] > 5) return error.CorruptCatalog;
+                        if (body[4] > rating_max) return error.CorruptCatalog;
                         catalog.assets.items(.rating)[asset] = @intCast(body[4]);
                     } else {
                         catalog.assets.items(.flags)[asset] = @bitCast(body[4]);
@@ -354,8 +410,8 @@ pub fn CatalogType(comptime Fs: type) type {
             @memcpy(&description.hash, body[0..32]);
             description.capture_time = std.mem.readInt(i64, body[32..40], .little);
             description.iso = std.mem.readInt(u32, body[40..44], .little);
-            if (body[44] > 5) return null;
-            description.rating = @intCast(body[44]);
+            if (body[44] > rating_max) return null;
+            description.rating = body[44];
             description.flags = @bitCast(body[45]);
             var offset: usize = 46;
             const camera_len = body[offset];
@@ -387,29 +443,55 @@ pub fn CatalogType(comptime Fs: type) type {
             return writer.buffered();
         }
 
-        /// Mutate in-memory state only; the WAL record is the caller's job.
+        /// Fallible in-memory apply, allocating as it goes: used by WAL
+        /// replay and the benchmark, where a failure is just OOM and no
+        /// acknowledgement is outstanding. The public `asset_add` uses the
+        /// reserved path instead so it can promise failure-atomicity.
         fn asset_add_apply(catalog: *Catalog, description: AssetDescription) Error!u32 {
             const gpa = catalog.gpa;
-            const hash_id: u32 = if (catalog.hash_ids.get(description.hash)) |id| id else blk: {
+            const camera_id = try catalog.cameras.intern(gpa, description.camera);
+            const lens_id = try catalog.lenses.intern(gpa, description.lens);
+            const hash_id_existing = catalog.hash_ids.get(description.hash);
+            try catalog.assets.ensureUnusedCapacity(gpa, 1);
+            try catalog.asset_by_hash_id.ensureUnusedCapacity(gpa, 1);
+            if (hash_id_existing == null) {
+                try catalog.hashes.ensureUnusedCapacity(gpa, 1);
+                try catalog.hash_ids.ensureUnusedCapacity(gpa, 1);
+            }
+            return catalog.asset_apply_reserved(description, camera_id, lens_id, hash_id_existing);
+        }
+
+        /// Infallible apply against already-reserved capacity and interned
+        /// ids. Every insert here is an `AssumeCapacity`, so nothing can
+        /// fail after the caller has made its WAL record durable.
+        fn asset_apply_reserved(
+            catalog: *Catalog,
+            description: AssetDescription,
+            camera_id: u16,
+            lens_id: u16,
+            hash_id_existing: ?u32,
+        ) u32 {
+            const hash_id: u32 = hash_id_existing orelse blk: {
                 const id: u32 = @intCast(catalog.hashes.items.len);
-                try catalog.hashes.append(gpa, description.hash);
-                try catalog.hash_ids.put(gpa, description.hash, id);
+                catalog.hashes.appendAssumeCapacity(description.hash);
+                catalog.hash_ids.putAssumeCapacity(description.hash, id);
                 break :blk id;
             };
+            assert(description.rating <= rating_max);
             const index: u32 = @intCast(catalog.assets.len);
-            try catalog.assets.append(gpa, .{
+            catalog.assets.appendAssumeCapacity(.{
                 .hash_id = hash_id,
                 .recipe_head = 0,
                 .capture_time = description.capture_time,
-                .rating = description.rating,
+                .rating = @intCast(description.rating),
                 .flags = description.flags,
-                .camera = try catalog.cameras.intern(gpa, description.camera),
-                .lens = try catalog.lenses.intern(gpa, description.lens),
+                .camera = camera_id,
+                .lens = lens_id,
                 .iso = description.iso,
                 .burst_group = 0,
                 .sharpness = 0,
             });
-            try catalog.asset_by_hash_id.put(gpa, hash_id, index);
+            catalog.asset_by_hash_id.putAssumeCapacity(hash_id, index);
             return index;
         }
 
@@ -693,6 +775,79 @@ test "a torn WAL tail is truncated, never half-applied (negative space)" {
 
     // And appending after recovery lands cleanly on the truncated log.
     _ = try catalog.asset_add(.{ .hash = test_hash(3), .camera = "A", .lens = "L" });
+    var reopened = try TestCatalog.open(gpa, &sim);
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u32, 2), reopened.count());
+}
+
+test "public boundaries reject bad input by name, never by assertion" {
+    const gpa = std.testing.allocator;
+    var sim = vfs.Sim.init(gpa, 26, .{});
+    defer sim.deinit();
+    var catalog = try TestCatalog.open(gpa, &sim);
+    defer catalog.deinit();
+
+    const ok = try catalog.asset_add(.{ .hash = test_hash(1), .camera = "A", .lens = "L" });
+    // Duplicate hash, over-range rating, over-long string, unknown asset id.
+    try std.testing.expectEqual(
+        error.DuplicateAsset,
+        catalog.asset_add(.{ .hash = test_hash(1), .camera = "A", .lens = "L" }),
+    );
+    try std.testing.expectEqual(
+        error.InvalidRating,
+        catalog.asset_add(.{ .hash = test_hash(2), .rating = 6 }),
+    );
+    const long = "x" ** 300;
+    try std.testing.expectEqual(
+        error.StringTooLong,
+        catalog.asset_add(.{ .hash = test_hash(3), .camera = long }),
+    );
+    try std.testing.expectEqual(error.InvalidRating, catalog.rating_set(ok, 9));
+    try std.testing.expectEqual(error.UnknownAsset, catalog.rating_set(999, 3));
+    try std.testing.expectEqual(error.UnknownAsset, catalog.flags_set(999, .{}));
+
+    // A rejected add left no trace — count is unchanged and no orphan
+    // string leaked into the interning table.
+    try std.testing.expectEqual(@as(u32, 1), catalog.count());
+    try std.testing.expectEqual(@as(usize, 1), catalog.cameras.strings.items.len);
+}
+
+test "failure-atomic add: an OOM at the WAL append leaves no trace" {
+    // A FailingAllocator that dies on the Nth allocation. As long as it
+    // fails somewhere inside asset_add, the call errors and the catalog is
+    // byte-for-byte what it was before — no half-added asset, no orphan
+    // string, and reopen agrees.
+    const gpa = std.testing.allocator;
+    var sim = vfs.Sim.init(gpa, 27, .{});
+    defer sim.deinit();
+    var catalog = try TestCatalog.open(gpa, &sim);
+    defer catalog.deinit();
+    _ = try catalog.asset_add(.{ .hash = test_hash(1), .camera = "A", .lens = "L" });
+
+    // Walk the failure point outward until the add either fully succeeds or
+    // cleanly fails; every failure must leave count == 1 and one camera.
+    var fail_at: usize = 0;
+    while (fail_at < 64) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+        catalog.gpa = failing.allocator();
+        const result = catalog.asset_add(.{
+            .hash = test_hash(2),
+            .camera = "NewCamera",
+            .lens = "NewLens",
+        });
+        catalog.gpa = gpa;
+        if (result) |_| break else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(@as(u32, 1), catalog.count());
+            try std.testing.expectEqual(@as(usize, 1), catalog.cameras.strings.items.len);
+            try std.testing.expectEqual(@as(usize, 1), catalog.lenses.strings.items.len);
+            try std.testing.expectEqual(@as(?u32, null), catalog.asset_by_hash(test_hash(2)));
+        }
+    }
+    // It eventually succeeds once enough allocations are permitted.
+    try std.testing.expectEqual(@as(u32, 2), catalog.count());
+
+    // And the durable state matches: reopen sees exactly the two assets.
     var reopened = try TestCatalog.open(gpa, &sim);
     defer reopened.deinit();
     try std.testing.expectEqual(@as(u32, 2), reopened.count());
