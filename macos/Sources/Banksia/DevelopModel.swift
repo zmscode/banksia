@@ -12,7 +12,7 @@ final class DevelopModel {
     var temperature: Double = 0
     /// Green/magenta: positive pulls green down.
     var tint: Double = 0
-    /// 0 identity, 1 full S-curve; engine v1 defines no negative contrast.
+    /// 0 identity, 1 full S-curve; the baseline engine defines no negative contrast.
     var contrast: Double = 0
 
     /// Two white_balance ops compose multiplicatively in the bayer domain:
@@ -22,7 +22,7 @@ final class DevelopModel {
         let gainR = format(exp2(temperature))
         let gainG = format(exp2(-tint))
         let gainB = format(exp2(-temperature))
-        return "{\"engine_version\":1,\"ops\":["
+        return "{\"engine_version\":2,\"ops\":["
             + "{\"black_point\":{}},"
             + "{\"white_balance\":{\"as_shot\":true,\"gain_r\":1,\"gain_g\":1,\"gain_b\":1}},"
             + "{\"white_balance\":{\"as_shot\":false"

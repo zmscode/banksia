@@ -53,5 +53,7 @@ zig build golden       # 25-case v1/v2 golden-render conformance harness
 zig build bench        # ReleaseFast catalog/storage latency gates
 zig build sim          # 10k seeded vault/catalog crash workloads
 zig build corpus       # verify/decode optional local CR2/CR3 corpus
+zig build run-shell    # open the macOS shell, then use Open… for DNG/CR2/CR3
+zig build run-shell -- assets/CR2/shot.CR2  # launch directly into a RAW
 zig-out/bin/banksia synth demo.dng   # write a synthetic demo DNG
 ```

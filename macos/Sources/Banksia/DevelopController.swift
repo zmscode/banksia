@@ -9,7 +9,7 @@ import Observation
 final class DevelopController {
     var develop = DevelopModel()
     private(set) var image: CGImage?
-    private(set) var statusText = "Open a DNG to begin (make one: banksia synth shot.dng)."
+    private(set) var statusText = "Open a DNG, CR2, or CR3 to begin."
     /// Set by the sliders while a drag is in flight: renders are bounded to
     /// `previewEdgeMax` until release.
     var isDragging = false
@@ -24,11 +24,13 @@ final class DevelopController {
 
     func open(url: URL) {
         renderTask?.cancel()
+        statusText = "Opening \(url.lastPathComponent)…"
         renderTask = Task {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             do {
                 try await renderer.load(path: url.path)
+                guard !Task.isCancelled else { return }
                 hasRaw = true
                 statusText = url.lastPathComponent
                 await renderNow(edgeMax: 0)

@@ -5,7 +5,9 @@ struct ContentView: View {
     @State private var controller = DevelopController()
     @State private var importing = false
 
-    private static let dngType = UTType(filenameExtension: "dng") ?? .data
+    private static let rawTypes = ["dng", "cr2", "cr3"].compactMap {
+        UTType(filenameExtension: $0, conformingTo: .image)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -22,15 +24,18 @@ struct ContentView: View {
         }
         .fileImporter(
             isPresented: $importing,
-            allowedContentTypes: [Self.dngType]
+            allowedContentTypes: Self.rawTypes
         ) { result in
             if case .success(let url) = result {
                 controller.open(url: url)
             }
         }
         .frame(minWidth: 800, minHeight: 560)
+        .onOpenURL { url in
+            controller.open(url: url)
+        }
         .onAppear {
-            // Dev loop: `Banksia <shot.dng>` skips the picker entirely.
+            // Dev loop: `Banksia <shot.raw>` skips the picker entirely.
             if let path = CommandLine.arguments.dropFirst().first {
                 controller.open(url: URL(fileURLWithPath: path))
             }

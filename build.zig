@@ -132,6 +132,7 @@ pub fn build(b: *std.Build) void {
 
     const shell_run = b.addSystemCommand(&.{"macos/.build/debug/Banksia"});
     shell_run.step.dependOn(&shell_build.step);
+    if (b.args) |args| shell_run.addArgs(args);
     shell_run.has_side_effects = true;
     const run_shell_step = b.step("run-shell", "Build and launch the inspection shell");
     run_shell_step.dependOn(&shell_run.step);
