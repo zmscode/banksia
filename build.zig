@@ -11,8 +11,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // wombat (storage, Phase 2) and lyrebird (similarity, Phase 4) are stubs;
-    // they exist so the layout, tests, and tidy roots are stable from day one.
+    // wombat provides the durable vault and catalog baseline; lyrebird
+    // (similarity, Phase 4) remains a layout/test stub.
     const wombat_mod = b.createModule(.{
         .root_source_file = b.path("wombat/root.zig"),
         .target = target,
@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
     lib_step.dependOn(&lib_install.step);
 
     // ---- tests -----------------------------------------------------------------
-    //   zig build test-unit   module inline unit tests (emu + stubs)
+    //   zig build test-unit   module inline unit tests (emu + wombat + lyrebird)
     //   zig build test-tidy   source lint (bans, reminders, long-line budget)
     //   zig build test        everything above
     const test_step = b.step("test", "Run all test suites");
@@ -153,10 +153,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_smoke.step);
 
     // ---- `sim`: the wombat crash simulator ---------------------------------------
-    // 10k randomized vault workloads with crash/torn-write injection; the
-    // invariant is zero acknowledged-data loss. The seed defaults to the
-    // commit hash, so every commit explores differently and any CI failure
-    // replays locally from the hash alone.
+    // 10k vault plus 10k catalog workloads with crash/torn-write injection.
+    // The invariant is zero acknowledged blob or mutation loss.
+    // The seed defaults to the commit hash for exact local replay.
     const sim_runs = b.option(u64, "sim-runs", "Crash-simulator runs (default 10000)") orelse
         10_000;
     const sim_seed = b.option(u64, "sim-seed", "Crash-simulator seed (default: commit hash)") orelse
@@ -183,11 +182,11 @@ pub fn build(b: *std.Build) void {
     run_sim.addArgs(&.{ "--seed", b.fmt("{d}", .{sim_seed}) });
     run_sim.addArgs(&.{ "--runs", b.fmt("{d}", .{sim_runs}) });
     run_sim.has_side_effects = true;
-    const sim_step = b.step("sim", "Run the wombat crash simulator (10k seeded runs)");
+    const sim_step = b.step("sim", "Run 10k vault + 10k catalog crash workloads");
     sim_step.dependOn(&run_sim.step);
 
-    // ---- `bench`: the catalog filter speedometer ---------------------------------
-    // Always ReleaseFast — the exit criterion is a ReleaseFast number.
+    // ---- `bench`: the catalog storage speedometers --------------------------------
+    // Always ReleaseFast — phase latency gates are ReleaseFast numbers.
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("wombat/root.zig"),
         .target = target,
@@ -206,7 +205,7 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.has_side_effects = true;
     if (b.args) |args| run_bench.addArgs(args);
-    const bench_step = b.step("bench", "Time the 100k-asset catalog filter (ReleaseFast)");
+    const bench_step = b.step("bench", "Run catalog filter/storage benchmarks (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
 
     // ---- `golden`: the conformance speedometer ---------------------------------

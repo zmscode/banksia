@@ -62,7 +62,15 @@ pub fn VaultType(comptime Fs: type) type {
             assert(bytes.len <= blob_bytes_max);
             const hash = hash_of(bytes);
             const path = object_path(hash);
-            if (try vault.fs.exists(path.slice())) return hash;
+            if (try vault.fs.exists(path.slice())) {
+                // In verified mode, existence alone is not a dedup hit: a
+                // corrupt object at the right path must be reported now.
+                if (vault.verify_on_read) {
+                    const existing = try vault.get_alloc(std.heap.page_allocator, hash);
+                    std.heap.page_allocator.free(existing);
+                }
+                return hash;
+            }
 
             const tmp = tmp_path(hash);
             const dir = object_dir(hash);
@@ -339,8 +347,20 @@ test "put is idempotent: the second write is a dedup hit" {
     const operations_after_first = sim.operations;
     const second = try vault.put("same bytes");
     try std.testing.expectEqualSlices(u8, &first, &second);
-    // Dedup path: exactly one operation (the existence probe), no writes.
-    try std.testing.expectEqual(operations_after_first + 1, sim.operations);
+    // Verified dedup path: existence probe + content read, no writes.
+    try std.testing.expectEqual(operations_after_first + 2, sim.operations);
+}
+
+test "verified dedup rejects a corrupt existing object" {
+    const gpa = std.testing.allocator;
+    var sim = vfs.Sim.init(gpa, 16, .{});
+    defer sim.deinit();
+    var vault = try VaultType(vfs.Sim).open(&sim, .{});
+
+    const hash = try vault.put("pristine");
+    var path: PathBuffer = object_path(hash);
+    try sim.write_file(path.slice(), "tampered");
+    try std.testing.expectEqual(error.CorruptObject, vault.put("pristine"));
 }
 
 test "verify-on-read turns silent corruption into an error (negative space)" {

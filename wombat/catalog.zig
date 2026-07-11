@@ -31,6 +31,7 @@ pub const Error = vfs.Error || error{
     DuplicateAsset,
     UnknownAsset,
     InvalidRating,
+    InvalidFlags,
     StringTooLong,
     LimitExceeded,
 };
@@ -40,6 +41,10 @@ pub const assets_max: u32 = 1 << 24;
 const strings_max: u32 = 1 << 16;
 const string_bytes_max: u32 = 255; // one length byte in the WAL record
 const wal_record_bytes_max: u32 = 1024;
+/// The catalog's files live directly in the filesystem root the catalog is
+/// opened on; `catalog_dir` is that root, fsynced to make new file *names*
+/// durable. (A session directory becomes the root in Phase 2C.)
+const catalog_dir = "";
 const snapshot_path = "catalog";
 const snapshot_tmp_path = "catalog.tmp";
 const wal_path = "wal";
@@ -50,6 +55,24 @@ pub const Flags = packed struct(u8) {
     rejected: bool = false,
     pick: bool = false,
     padding: u6 = 0,
+};
+
+/// Durable append-order handle. Phase 2A has no deletion or row reordering,
+/// so a handle survives compaction and reopen. Callers must treat it as an
+/// opaque identifier; its current integer representation is a format detail.
+pub const AssetId = u32;
+
+/// Stable public projection of one catalog row. Borrowed strings remain valid
+/// until the catalog is closed; hashes and scalar fields are copied out.
+pub const AssetView = struct {
+    id: AssetId,
+    hash: vault.Hash,
+    capture_time: i64,
+    rating: u3,
+    flags: Flags,
+    camera: []const u8,
+    lens: []const u8,
+    iso: u32,
 };
 
 /// One row. Small on purpose: smaller rows = fewer cache misses = faster
@@ -175,9 +198,40 @@ pub fn CatalogType(comptime Fs: type) type {
         }
 
         /// The asset already holding this blob, if any — import dedup.
-        pub fn asset_by_hash(catalog: *const Catalog, hash: vault.Hash) ?u32 {
+        pub fn asset_by_hash(catalog: *const Catalog, hash: vault.Hash) ?AssetId {
             const hash_id = catalog.hash_ids.get(hash) orelse return null;
             return catalog.asset_by_hash_id.get(hash_id);
+        }
+
+        /// Read one asset through the stable public projection.
+        pub fn asset_read(catalog: *const Catalog, id: AssetId) Error!AssetView {
+            if (id >= catalog.assets.len) return error.UnknownAsset;
+            return catalog.asset_view(id);
+        }
+
+        /// Fill `out` with a page beginning at `start`, returning the number
+        /// written. An offset at or beyond the end yields an empty page.
+        pub fn page_read(catalog: *const Catalog, start: u32, out: []AssetView) usize {
+            const available = catalog.assets.len -| @as(usize, start);
+            const len = @min(available, out.len);
+            for (out[0..len], 0..) |*view, offset| {
+                view.* = catalog.asset_view(start + @as(u32, @intCast(offset)));
+            }
+            return len;
+        }
+
+        fn asset_view(catalog: *const Catalog, id: AssetId) AssetView {
+            const hash_id = catalog.assets.items(.hash_id)[id];
+            return .{
+                .id = id,
+                .hash = catalog.hashes.items[hash_id],
+                .capture_time = catalog.assets.items(.capture_time)[id],
+                .rating = catalog.assets.items(.rating)[id],
+                .flags = catalog.assets.items(.flags)[id],
+                .camera = catalog.cameras.get(catalog.assets.items(.camera)[id]),
+                .lens = catalog.lenses.get(catalog.assets.items(.lens)[id]),
+                .iso = catalog.assets.items(.iso)[id],
+            };
         }
 
         /// Append an asset. Durable when this returns, and failure-atomic:
@@ -185,10 +239,11 @@ pub fn CatalogType(comptime Fs: type) type {
         /// record is made durable, so the in-memory apply after the append
         /// cannot fail. A failed call therefore never surfaces as a
         /// successful mutation after reopen.
-        pub fn asset_add(catalog: *Catalog, description: AssetDescription) Error!u32 {
+        pub fn asset_add(catalog: *Catalog, description: AssetDescription) Error!AssetId {
             const gpa = catalog.gpa;
             if (catalog.assets.len >= assets_max) return error.LimitExceeded;
             if (description.rating > rating_max) return error.InvalidRating;
+            if (description.flags.padding != 0) return error.InvalidFlags;
             if (description.camera.len > string_bytes_max) return error.StringTooLong;
             if (description.lens.len > string_bytes_max) return error.StringTooLong;
             if (catalog.asset_by_hash(description.hash) != null) return error.DuplicateAsset;
@@ -221,11 +276,14 @@ pub fn CatalogType(comptime Fs: type) type {
         /// In-memory append with no WAL record: the benchmark builds a
         /// 100k-row catalog and measures the scan, not 100k fsyncs. Not
         /// durable — never call it outside a benchmark.
-        pub fn asset_add_for_bench(catalog: *Catalog, description: AssetDescription) Error!u32 {
+        pub fn asset_add_for_bench(
+            catalog: *Catalog,
+            description: AssetDescription,
+        ) Error!AssetId {
             return catalog.asset_add_apply(description);
         }
 
-        pub fn rating_set(catalog: *Catalog, asset: u32, rating: u8) Error!void {
+        pub fn rating_set(catalog: *Catalog, asset: AssetId, rating: u8) Error!void {
             if (asset >= catalog.assets.len) return error.UnknownAsset;
             if (rating > rating_max) return error.InvalidRating;
             var record: [wal_record_bytes_max]u8 = undefined;
@@ -237,8 +295,9 @@ pub fn CatalogType(comptime Fs: type) type {
             catalog.assets.items(.rating)[asset] = @intCast(rating);
         }
 
-        pub fn flags_set(catalog: *Catalog, asset: u32, flags: Flags) Error!void {
+        pub fn flags_set(catalog: *Catalog, asset: AssetId, flags: Flags) Error!void {
             if (asset >= catalog.assets.len) return error.UnknownAsset;
+            if (flags.padding != 0) return error.InvalidFlags;
             var record: [wal_record_bytes_max]u8 = undefined;
             const payload =
                 record_encode_set(&record, catalog.generation, .set_flags, asset, @bitCast(flags));
@@ -258,11 +317,16 @@ pub fn CatalogType(comptime Fs: type) type {
             try catalog.fs.write_file(snapshot_tmp_path, bytes);
             try catalog.fs.fsync_file(snapshot_tmp_path);
             try catalog.fs.rename(snapshot_tmp_path, snapshot_path);
-            try catalog.fs.fsync_dir("");
+            try catalog.fs.fsync_dir(catalog_dir);
             catalog.generation = generation_next;
 
+            // Clearing the WAL may *create* it (a compact before any append);
+            // fsync the directory so its name is durable, or a later append
+            // that finds the file already present would skip that step and a
+            // crash could drop the whole log.
             try catalog.fs.write_file(wal_path, "");
             try catalog.fs.fsync_file(wal_path);
+            try catalog.fs.fsync_dir(catalog_dir);
         }
 
         // -- filtering ---------------------------------------------------------
@@ -308,7 +372,14 @@ pub fn CatalogType(comptime Fs: type) type {
             std.mem.writeInt(u32, frame[4..8], std.hash.crc.Crc32.hash(payload), .little);
             @memcpy(frame[8..][0..payload.len], payload);
 
-            if (!try catalog.fs.exists(wal_path)) try catalog.fs.write_file(wal_path, "");
+            if (!try catalog.fs.exists(wal_path)) {
+                try catalog.fs.write_file(wal_path, "");
+                // Persist the WAL file's *name*, not just its content: a
+                // crash may otherwise drop the un-fsynced directory entry
+                // and take every acknowledged mutation with it. (The
+                // simulator caught exactly this.)
+                try catalog.fs.fsync_dir(catalog_dir);
+            }
             try catalog.fs.append_file(wal_path, frame[0 .. 8 + payload.len]);
             try catalog.fs.fsync_file(wal_path);
         }
@@ -401,6 +472,7 @@ pub fn CatalogType(comptime Fs: type) type {
                         if (body[4] > rating_max) return error.CorruptCatalog;
                         catalog.assets.items(.rating)[asset] = @intCast(body[4]);
                     } else {
+                        if (body[4] & 0b1111_1100 != 0) return error.CorruptCatalog;
                         catalog.assets.items(.flags)[asset] = @bitCast(body[4]);
                     }
                 },
@@ -435,6 +507,7 @@ pub fn CatalogType(comptime Fs: type) type {
             description.iso = std.mem.readInt(u32, body[40..44], .little);
             if (body[44] > rating_max) return null;
             description.rating = body[44];
+            if (body[45] & 0b1111_1100 != 0) return null;
             description.flags = @bitCast(body[45]);
             var offset: usize = 46;
             const camera_len = body[offset];
@@ -591,20 +664,20 @@ pub fn CatalogType(comptime Fs: type) type {
             const hash_count = try reader.int(u32);
             const camera_count = try reader.int(u16);
             const lens_count = try reader.int(u16);
-            if (asset_count > assets_max) return error.CorruptCatalog;
+            if (asset_count > assets_max or hash_count > assets_max) {
+                return error.CorruptCatalog;
+            }
 
             try catalog.snapshot_load_tables(&reader, hash_count, camera_count, lens_count);
             try catalog.snapshot_load_columns(&reader, asset_count);
             if (reader.offset != reader.bytes.len) return error.CorruptCatalog;
 
-            // Rebuild the asset-by-hash index from the rows.
+            // Rebuild the asset-by-hash index from the rows. One blob maps to
+            // exactly one asset in Phase 2A; duplicate rows are corruption.
             for (catalog.assets.items(.hash_id), 0..) |hash_id, index| {
                 if (hash_id >= catalog.hashes.items.len) return error.CorruptCatalog;
-                try catalog.asset_by_hash_id.put(
-                    catalog.gpa,
-                    hash_id,
-                    @intCast(index),
-                );
+                if (catalog.asset_by_hash_id.contains(hash_id)) return error.CorruptCatalog;
+                try catalog.asset_by_hash_id.put(catalog.gpa, hash_id, @intCast(index));
             }
         }
 
@@ -620,6 +693,7 @@ pub fn CatalogType(comptime Fs: type) type {
             while (index < hash_count) : (index += 1) {
                 var hash: vault.Hash = undefined;
                 @memcpy(&hash, try reader.take(32));
+                if (catalog.hash_ids.contains(hash)) return error.CorruptCatalog;
                 try catalog.hashes.append(gpa, hash);
                 try catalog.hash_ids.put(gpa, hash, index);
             }
@@ -627,13 +701,17 @@ pub fn CatalogType(comptime Fs: type) type {
             while (camera < camera_count) : (camera += 1) {
                 const len = try reader.int(u16);
                 if (len > string_bytes_max) return error.CorruptCatalog;
-                _ = try catalog.cameras.intern(gpa, try reader.take(len));
+                const string = try reader.take(len);
+                if (catalog.cameras.ids.contains(string)) return error.CorruptCatalog;
+                _ = try catalog.cameras.intern(gpa, string);
             }
             var lens: u16 = 0;
             while (lens < lens_count) : (lens += 1) {
                 const len = try reader.int(u16);
                 if (len > string_bytes_max) return error.CorruptCatalog;
-                _ = try catalog.lenses.intern(gpa, try reader.take(len));
+                const string = try reader.take(len);
+                if (catalog.lenses.ids.contains(string)) return error.CorruptCatalog;
+                _ = try catalog.lenses.intern(gpa, string);
             }
         }
 
@@ -651,9 +729,19 @@ pub fn CatalogType(comptime Fs: type) type {
                 if (raw > 5) return error.CorruptCatalog;
                 v.* = @intCast(raw);
             }
-            for (catalog.assets.items(.flags)) |*v| v.* = @bitCast(try reader.int(u8));
-            for (catalog.assets.items(.camera)) |*v| v.* = try reader.int(u16);
-            for (catalog.assets.items(.lens)) |*v| v.* = try reader.int(u16);
+            for (catalog.assets.items(.flags)) |*v| {
+                const raw = try reader.int(u8);
+                if (raw & 0b1111_1100 != 0) return error.CorruptCatalog;
+                v.* = @bitCast(raw);
+            }
+            for (catalog.assets.items(.camera)) |*v| {
+                v.* = try reader.int(u16);
+                if (v.* >= catalog.cameras.strings.items.len) return error.CorruptCatalog;
+            }
+            for (catalog.assets.items(.lens)) |*v| {
+                v.* = try reader.int(u16);
+                if (v.* >= catalog.lenses.strings.items.len) return error.CorruptCatalog;
+            }
             for (catalog.assets.items(.iso)) |*v| v.* = try reader.int(u32);
             for (catalog.assets.items(.burst_group)) |*v| v.* = try reader.int(u32);
             for (catalog.assets.items(.sharpness)) |*v| v.* = @bitCast(try reader.int(u16));
@@ -775,6 +863,72 @@ test "compact folds the WAL into a snapshot; replay stays identical" {
     try std.testing.expectEqual(@as(u64, 1), catalog.generation);
 }
 
+test "compaction recovers from a crash before every filesystem operation" {
+    const gpa = std.testing.allocator;
+    var rename_arm: u64 = 0;
+    while (rename_arm < 2) : (rename_arm += 1) {
+        var boundary: u64 = 1;
+        while (boundary <= 7) : (boundary += 1) {
+            var sim = vfs.Sim.init(gpa, 100 + boundary + 10 * rename_arm, .{
+                .name_lost = vfs.Ratio.init(rename_arm, 1),
+            });
+            defer sim.deinit();
+            var catalog = try TestCatalog.open(gpa, &sim);
+
+            const first = try catalog.asset_add(.{ .hash = test_hash(1) });
+            try catalog.compact(); // establish an old snapshot to replace
+            _ = try catalog.asset_add(.{ .hash = test_hash(2) });
+            try catalog.rating_set(first, 5);
+
+            sim.faults.crash_at_operation = sim.operations + boundary;
+            try std.testing.expectEqual(error.Crashed, catalog.compact());
+            sim.reboot();
+            sim.faults = .{};
+            catalog.deinit();
+
+            var reopened = try TestCatalog.open(gpa, &sim);
+            try std.testing.expectEqual(@as(u32, 2), reopened.count());
+            try std.testing.expectEqual(@as(u3, 5), reopened.assets.items(.rating)[first]);
+            _ = try reopened.asset_add(.{ .hash = test_hash(3) });
+            reopened.deinit();
+
+            var final = try TestCatalog.open(gpa, &sim);
+            defer final.deinit();
+            try std.testing.expectEqual(@as(u32, 3), final.count());
+        }
+    }
+}
+
+test "catalog mutates, compacts, and reopens on the real filesystem" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var real = vfs.Real.init(io, tmp.dir);
+    const RealCatalog = CatalogType(vfs.Real);
+
+    {
+        var catalog = try RealCatalog.open(gpa, &real);
+        defer catalog.deinit();
+        const asset = try catalog.asset_add(.{
+            .hash = test_hash(30),
+            .camera = "Canon",
+            .lens = "50mm",
+        });
+        try catalog.rating_set(asset, 5);
+        try catalog.flags_set(asset, .{ .pick = true });
+        try catalog.compact();
+    }
+
+    var reopened = try RealCatalog.open(gpa, &real);
+    defer reopened.deinit();
+    const asset = reopened.asset_by_hash(test_hash(30)).?;
+    const view = try reopened.asset_read(asset);
+    try std.testing.expectEqual(@as(u3, 5), view.rating);
+    try std.testing.expect(view.flags.pick);
+    try std.testing.expectEqualStrings("Canon", view.camera);
+}
+
 test "a torn WAL tail is truncated, never half-applied (negative space)" {
     const gpa = std.testing.allocator;
     var sim = vfs.Sim.init(gpa, 23, .{});
@@ -835,6 +989,84 @@ test "interior WAL corruption is reported, not silently truncated away" {
     try std.testing.expectEqual(before.len, after.len);
 }
 
+test "WAL framing matrix and generation handling" {
+    const gpa = std.testing.allocator;
+    var payload: [14]u8 = @splat(0);
+    payload[8] = @intFromEnum(TestCatalog.RecordTag.set_rating);
+    payload[13] = 3;
+
+    var valid_buffer: [wal_record_bytes_max]u8 = undefined;
+    const valid = test_wal_frame(&valid_buffer, &payload);
+    var bad_length_buffer = valid_buffer;
+    std.mem.writeInt(u32, bad_length_buffer[0..4], wal_record_bytes_max, .little);
+    var bad_crc_buffer = valid_buffer;
+    bad_crc_buffer[4] ^= 1;
+
+    const Expectation = enum { record, torn, corrupt };
+    const cases = [_]struct { bytes: []const u8, expected: Expectation }{
+        .{ .bytes = valid, .expected = .record },
+        .{ .bytes = valid[0..4], .expected = .torn },
+        .{ .bytes = valid[0 .. valid.len - 1], .expected = .torn },
+        .{ .bytes = bad_length_buffer[0..8], .expected = .corrupt },
+        .{ .bytes = bad_crc_buffer[0..valid.len], .expected = .corrupt },
+    };
+    for (cases) |case| {
+        const scan = TestCatalog.wal_record_scan(case.bytes);
+        switch (case.expected) {
+            .record => switch (scan) {
+                .record => |decoded| try std.testing.expectEqualSlices(u8, &payload, decoded),
+                else => return error.TestUnexpectedResult,
+            },
+            .torn => switch (scan) {
+                .torn => {},
+                else => return error.TestUnexpectedResult,
+            },
+            .corrupt => switch (scan) {
+                .corrupt => {},
+                else => return error.TestUnexpectedResult,
+            },
+        }
+    }
+
+    var sim = vfs.Sim.init(gpa, 31, .{});
+    defer sim.deinit();
+    try sim.write_file(wal_path, "");
+    var empty = try TestCatalog.open(gpa, &sim);
+    empty.deinit();
+
+    var unknown_payload: [9]u8 = @splat(0);
+    unknown_payload[8] = 0xFF;
+    var unknown_buffer: [wal_record_bytes_max]u8 = undefined;
+    const unknown = test_wal_frame(&unknown_buffer, &unknown_payload);
+    try sim.write_file(wal_path, unknown);
+    try std.testing.expectEqual(error.CorruptCatalog, TestCatalog.open(gpa, &sim));
+
+    // A stale record is dead history even when its tag would be unknown in the
+    // current generation.
+    try sim.write_file(wal_path, "");
+    {
+        var catalog = try TestCatalog.open(gpa, &sim);
+        defer catalog.deinit();
+        _ = try catalog.asset_add(.{ .hash = test_hash(31) });
+        try catalog.compact();
+    }
+    try sim.write_file(wal_path, unknown);
+    var stale = try TestCatalog.open(gpa, &sim);
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(u32, 1), stale.count());
+    try std.testing.expectEqual(@as(u64, 1), stale.generation);
+}
+
+fn test_wal_frame(
+    buffer: *[wal_record_bytes_max]u8,
+    payload: []const u8,
+) []u8 {
+    std.mem.writeInt(u32, buffer[0..4], @intCast(payload.len), .little);
+    std.mem.writeInt(u32, buffer[4..8], std.hash.crc.Crc32.hash(payload), .little);
+    @memcpy(buffer[8..][0..payload.len], payload);
+    return buffer[0 .. 8 + payload.len];
+}
+
 test "public boundaries reject bad input by name, never by assertion" {
     const gpa = std.testing.allocator;
     var sim = vfs.Sim.init(gpa, 26, .{});
@@ -860,6 +1092,12 @@ test "public boundaries reject bad input by name, never by assertion" {
     try std.testing.expectEqual(error.InvalidRating, catalog.rating_set(ok, 9));
     try std.testing.expectEqual(error.UnknownAsset, catalog.rating_set(999, 3));
     try std.testing.expectEqual(error.UnknownAsset, catalog.flags_set(999, .{}));
+    const invalid_flags: Flags = @bitCast(@as(u8, 0b0000_0100));
+    try std.testing.expectEqual(error.InvalidFlags, catalog.flags_set(ok, invalid_flags));
+    try std.testing.expectEqual(
+        error.InvalidFlags,
+        catalog.asset_add(.{ .hash = test_hash(4), .flags = invalid_flags }),
+    );
 
     // A rejected add left no trace — count is unchanged and no orphan
     // string leaked into the interning table.
@@ -930,6 +1168,57 @@ test "a bit flipped anywhere in the snapshot is caught by the trailer" {
     try std.testing.expectEqual(error.CorruptCatalog, TestCatalog.open(gpa, &sim));
 }
 
+test "snapshot rejects invalid ids, flags, and duplicate hashes" {
+    const gpa = std.testing.allocator;
+    var sim = vfs.Sim.init(gpa, 29, .{});
+    defer sim.deinit();
+
+    {
+        var catalog = try TestCatalog.open(gpa, &sim);
+        defer catalog.deinit();
+        _ = try catalog.asset_add(.{ .hash = test_hash(1) });
+        _ = try catalog.asset_add(.{ .hash = test_hash(2) });
+        try catalog.compact();
+    }
+
+    const snapshot = try sim.read_alloc(gpa, snapshot_path, 1 << 20);
+    defer gpa.free(snapshot);
+    var tampered = try gpa.dupe(u8, snapshot);
+    defer gpa.free(tampered);
+
+    // Header 28 + two hashes 64 + empty camera/lens entries 4 = columns at 96.
+    tampered[96 + 4] = 0; // second row points at the first row's hash
+    snapshot_reseal(tampered);
+    try sim.write_file(snapshot_path, tampered);
+    try std.testing.expectEqual(error.CorruptCatalog, TestCatalog.open(gpa, &sim));
+
+    @memcpy(tampered, snapshot);
+    @memcpy(tampered[28 + 32 ..][0..32], tampered[28..][0..32]);
+    snapshot_reseal(tampered);
+    try sim.write_file(snapshot_path, tampered);
+    try std.testing.expectEqual(error.CorruptCatalog, TestCatalog.open(gpa, &sim));
+
+    @memcpy(tampered, snapshot);
+    // Two-row columns: hash ids 8, recipe heads 8, capture times 16,
+    // ratings 2, then flags. Set forbidden padding on the first flag.
+    tampered[96 + 8 + 8 + 16 + 2] = 0b0000_0100;
+    snapshot_reseal(tampered);
+    try sim.write_file(snapshot_path, tampered);
+    try std.testing.expectEqual(error.CorruptCatalog, TestCatalog.open(gpa, &sim));
+
+    @memcpy(tampered, snapshot);
+    // Camera ids follow the two flag bytes; id 1 is out of range (one entry).
+    std.mem.writeInt(u16, tampered[96 + 8 + 8 + 16 + 2 + 2 ..][0..2], 1, .little);
+    snapshot_reseal(tampered);
+    try sim.write_file(snapshot_path, tampered);
+    try std.testing.expectEqual(error.CorruptCatalog, TestCatalog.open(gpa, &sim));
+}
+
+fn snapshot_reseal(bytes: []u8) void {
+    const body = bytes[0 .. bytes.len - 32];
+    std.crypto.hash.Blake3.hash(body, bytes[bytes.len - 32 ..][0..32], .{});
+}
+
 test "property: random op sequences replay to identical state (seeded)" {
     const gpa = std.testing.allocator;
     var seed: u64 = 0;
@@ -997,6 +1286,16 @@ test "filter scans match a naive row-by-row oracle" {
     const wide = catalog.lenses.ids.get("wide").?;
     const counted = catalog.filter_count(.{ .rating_min = 4, .lens = wide });
     try std.testing.expectEqual(expected, counted);
+
+    var page: [16]AssetView = undefined;
+    const page_len = catalog.page_read(195, &page);
+    try std.testing.expectEqual(@as(usize, 5), page_len);
+    try std.testing.expectEqual(@as(AssetId, 195), page[0].id);
+    var expected_hash: vault.Hash = @splat(0);
+    std.mem.writeInt(u32, expected_hash[0..4], 195, .little);
+    try std.testing.expectEqualSlices(u8, &expected_hash, &page[0].hash);
+    try std.testing.expectEqual(@as(usize, 0), catalog.page_read(999, &page));
+    try std.testing.expectEqual(error.UnknownAsset, catalog.asset_read(999));
 }
 
 fn splitmix64(state: *u64) u64 {

@@ -214,6 +214,9 @@ pub fn user_file_write(
 // ---- the simulated backend -------------------------------------------------------
 
 pub const Faults = struct {
+    /// Absolute operation number to crash before, for exhaustive boundary
+    /// tests. Null leaves deterministic injection disabled.
+    crash_at_operation: ?u64 = null,
     /// Chance, per operation, that the power dies before it runs.
     crash_per_operation: Ratio = Ratio.never,
     /// At crash: chance an unsynced write survives only as a prefix.
@@ -261,6 +264,9 @@ pub const Sim = struct {
         target: []const u8,
         /// What the source name held before the rename, for the undo arm.
         source_was_durable: bool,
+        /// Atomic replacement keeps the old target available until the
+        /// target directory is fsynced. The undo arm restores it.
+        target_replaced: ?SimFile,
     };
 
     pub fn init(gpa: std.mem.Allocator, seed: u64, faults: Faults) Sim {
@@ -288,7 +294,8 @@ pub const Sim = struct {
     fn operation_begin(self: *Sim) Error!void {
         assert(!self.crashed); // callers must reboot after a crash
         self.operations += 1;
-        if (self.chance(self.faults.crash_per_operation)) {
+        const deterministic = self.faults.crash_at_operation == self.operations;
+        if (deterministic or self.chance(self.faults.crash_per_operation)) {
             self.crashed = true;
             self.crashes += 1;
             return error.Crashed;
@@ -309,6 +316,9 @@ pub const Sim = struct {
                     var file = kv.value;
                     file.name_durable = pending.source_was_durable;
                     self.files.put(self.arena(), pending.source, file) catch @panic("sim oom");
+                }
+                if (pending.target_replaced) |file| {
+                    self.files.put(self.arena(), pending.target, file) catch @panic("sim oom");
                 }
             } else if (self.files.getPtr(pending.target)) |file| {
                 file.name_durable = true;
@@ -383,8 +393,16 @@ pub const Sim = struct {
         }
         if (self.chance(self.faults.write_lost)) return durable;
         if (self.chance(self.faults.write_torn)) {
-            // A torn write keeps a strict prefix of what was in flight.
-            const keep = self.prng_next() % (file.bytes.len + 1);
+            // Append and prefix-truncation cannot tear below their shared
+            // settled prefix. For an unrelated overwrite, old and new bytes
+            // diverge, so the new write may settle at any prefix length.
+            const stable_prefix = if (std.mem.startsWith(u8, file.bytes, durable))
+                durable.len // append: keep all previously durable bytes
+            else if (std.mem.startsWith(u8, durable, file.bytes))
+                file.bytes.len // truncation: keep the requested prefix
+            else
+                0; // unrelated overwrite: any new prefix may settle
+            const keep = stable_prefix + self.prng_next() % (file.bytes.len - stable_prefix + 1);
             return file.bytes[0..keep];
         }
         return file.bytes;
@@ -466,10 +484,12 @@ pub const Sim = struct {
         try self.parent_require(target);
         const removed = self.files.fetchSwapRemove(source) orelse return error.NotFound;
         var file = removed.value;
+        const replaced = self.files.fetchSwapRemove(target);
         try self.renames_pending.append(self.arena(), .{
             .source = try self.key_own(source),
             .target = try self.key_own(target),
             .source_was_durable = file.name_durable,
+            .target_replaced = if (replaced) |entry| entry.value else null,
         });
         file.name_durable = false;
         try self.files.put(self.arena(), try self.key_own(target), file);
@@ -516,14 +536,14 @@ pub const Sim = struct {
         for (self.files.keys()) |key| {
             if (!path_parent_is(key, path)) continue;
             try entries.append(gpa, .{
-                .name = try gpa.dupe(u8, key[if (path.len == 0) 0 else path.len + 1 ..]),
+                .name = try gpa.dupe(u8, key[if (path.len == 0) 0 else path.len + 1..]),
                 .kind = .file,
             });
         }
         for (self.dirs.keys()) |key| {
             if (!path_parent_is(key, path)) continue;
             try entries.append(gpa, .{
-                .name = try gpa.dupe(u8, key[if (path.len == 0) 0 else path.len + 1 ..]),
+                .name = try gpa.dupe(u8, key[if (path.len == 0) 0 else path.len + 1..]),
                 .kind = .directory,
             });
         }
@@ -650,6 +670,57 @@ test "sim: the full sync protocol survives any crash; skipping it may not" {
     try std.testing.expect(unsynced_losses > 0);
 }
 
+test "sim: a torn append never erases the durable prefix" {
+    const gpa = std.testing.allocator;
+    var seed: u64 = 0;
+    while (seed < 100) : (seed += 1) {
+        var sim = Sim.init(gpa, seed, .{
+            .write_torn = Ratio.init(1, 1),
+            .write_lost = Ratio.never,
+        });
+        defer sim.deinit();
+
+        try sim.write_file("wal", "durable-prefix");
+        try sim.fsync_file("wal");
+        try sim.fsync_dir("");
+        try sim.append_file("wal", "-uncommitted-tail");
+
+        sim.crashed = true;
+        sim.crashes += 1;
+        sim.reboot();
+
+        const settled = try sim.read_alloc(gpa, "wal", 1 << 20);
+        defer gpa.free(settled);
+        try std.testing.expect(std.mem.startsWith(u8, settled, "durable-prefix"));
+        try std.testing.expect(settled.len >= "durable-prefix".len);
+    }
+}
+
+test "sim: a torn truncation never erases the retained prefix" {
+    const gpa = std.testing.allocator;
+    var seed: u64 = 0;
+    while (seed < 100) : (seed += 1) {
+        var sim = Sim.init(gpa, seed, .{
+            .write_torn = Ratio.init(1, 1),
+            .write_lost = Ratio.never,
+        });
+        defer sim.deinit();
+
+        try sim.write_file("wal", "durable-prefix-torn-tail");
+        try sim.fsync_file("wal");
+        try sim.fsync_dir("");
+        try sim.write_file("wal", "durable-prefix");
+
+        sim.crashed = true;
+        sim.crashes += 1;
+        sim.reboot();
+
+        const settled = try sim.read_alloc(gpa, "wal", 1 << 20);
+        defer gpa.free(settled);
+        try std.testing.expect(std.mem.startsWith(u8, settled, "durable-prefix"));
+    }
+}
+
 test "sim: a directory survives a crash only once its parent is fsynced" {
     const gpa = std.testing.allocator;
     var durable_survivals: u32 = 0;
@@ -677,6 +748,36 @@ test "sim: a directory survives a crash only once its parent is fsynced" {
     }
     try std.testing.expectEqual(@as(u32, 300), durable_survivals);
     try std.testing.expect(unsynced_losses > 0); // the fault arm fires
+}
+
+test "sim: undoing an overwrite rename restores the durable target" {
+    const gpa = std.testing.allocator;
+    var sim = Sim.init(gpa, 1, .{ .name_lost = Ratio.init(1, 1) });
+    defer sim.deinit();
+
+    try sim.make_path("v/tmp");
+    try sim.make_path("v/data");
+    try sim.fsync_dir("");
+    try sim.fsync_dir("v");
+
+    try sim.write_file("v/data/catalog", "old-snapshot");
+    try sim.fsync_file("v/data/catalog");
+    try sim.fsync_dir("v/data");
+    try sim.write_file("v/tmp/catalog", "new-snapshot");
+    try sim.fsync_file("v/tmp/catalog");
+    try sim.fsync_dir("v/tmp");
+    try sim.rename("v/tmp/catalog", "v/data/catalog");
+
+    sim.crashed = true;
+    sim.crashes += 1;
+    sim.reboot();
+
+    const target = try sim.read_alloc(gpa, "v/data/catalog", 1 << 20);
+    defer gpa.free(target);
+    try std.testing.expectEqualStrings("old-snapshot", target);
+    const source = try sim.read_alloc(gpa, "v/tmp/catalog", 1 << 20);
+    defer gpa.free(source);
+    try std.testing.expectEqualStrings("new-snapshot", source);
 }
 
 test "sim: an un-fsynced rename can undo; a dir-fsynced one cannot" {
