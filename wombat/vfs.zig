@@ -233,7 +233,7 @@ pub const Sim = struct {
     faults: Faults,
     crashed: bool = false,
     files: std.StringArrayHashMapUnmanaged(SimFile) = .empty,
-    dirs: std.StringArrayHashMapUnmanaged(void) = .empty,
+    dirs: std.StringArrayHashMapUnmanaged(SimDir) = .empty,
     renames_pending: std.ArrayList(RenamePending) = .empty,
     /// Statistics the harness prints on failure.
     operations: u64 = 0,
@@ -245,6 +245,14 @@ pub const Sim = struct {
         bytes_durable: ?[]const u8,
         /// The name itself survives a crash (parent dir fsynced since the
         /// name appeared).
+        name_durable: bool,
+    };
+
+    /// Directories are durable objects too: a freshly created directory
+    /// entry can be lost on reboot until its *parent* is fsynced, exactly
+    /// like a file name. Modelling this is what makes the vault's shard-dir
+    /// fsyncs load-bearing rather than decorative.
+    const SimDir = struct {
         name_durable: bool,
     };
 
@@ -307,10 +315,15 @@ pub const Sim = struct {
             }
         }
 
+        self.reboot_dirs();
+
         var index: usize = 0;
         while (index < self.files.count()) {
             const file = &self.files.values()[index];
-            if (!file.name_durable and self.chance(self.faults.name_lost)) {
+            const key = self.files.keys()[index];
+            const self_survives = file.name_durable or !self.chance(self.faults.name_lost);
+            // A file cannot outlive a directory that was itself lost.
+            if (!self_survives or !self.parent_survived(key)) {
                 self.files.swapRemoveAt(index);
                 continue;
             }
@@ -320,6 +333,47 @@ pub const Sim = struct {
             index += 1;
         }
         self.crashed = false;
+    }
+
+    /// Resolve directory survival top-down: a directory survives only if it
+    /// is itself durable (or wins its coin flip) *and* its parent survives.
+    /// Sorted shortest-first, a parent is always judged before its children,
+    /// so one pass settles the whole tree; a `dead` set records the losers.
+    fn reboot_dirs(self: *Sim) void {
+        const Context = struct {
+            keys: [][]const u8,
+            pub fn lessThan(ctx: @This(), a: usize, b: usize) bool {
+                return ctx.keys[a].len < ctx.keys[b].len;
+            }
+        };
+        self.dirs.sort(Context{ .keys = self.dirs.keys() });
+
+        var dead: std.StringHashMapUnmanaged(void) = .empty;
+        defer dead.deinit(self.arena());
+        for (self.dirs.keys(), self.dirs.values()) |key, *dir| {
+            const parent = path_parent(key);
+            const parent_dead = parent.len != 0 and dead.contains(parent);
+            const self_survives = dir.name_durable or !self.chance(self.faults.name_lost);
+            if (!self_survives or parent_dead) {
+                dead.put(self.arena(), key, {}) catch @panic("sim oom");
+            } else {
+                dir.name_durable = true;
+            }
+        }
+
+        var index: usize = 0;
+        while (index < self.dirs.count()) {
+            if (dead.contains(self.dirs.keys()[index])) {
+                self.dirs.swapRemoveAt(index);
+            } else index += 1;
+        }
+    }
+
+    /// The parent directory of `path` still exists (root is always present).
+    fn parent_survived(self: *const Sim, path: []const u8) bool {
+        const parent = path_parent(path);
+        if (parent.len == 0) return true;
+        return self.dirs.contains(parent);
     }
 
     fn crash_content_resolve(self: *Sim, file: SimFile) []const u8 {
@@ -388,8 +442,13 @@ pub const Sim = struct {
     pub fn fsync_dir(self: *Sim, path: []const u8) Error!void {
         try self.operation_begin();
         if (path.len > 0 and !self.dirs.contains(path)) return error.NotFound;
+        // fsync of a directory persists the entries it contains: both the
+        // files and the child directories whose parent is this path.
         for (self.files.keys(), self.files.values()) |key, *file| {
             if (path_parent_is(key, path)) file.name_durable = true;
+        }
+        for (self.dirs.keys(), self.dirs.values()) |key, *dir| {
+            if (path_parent_is(key, path)) dir.name_durable = true;
         }
         // Pending renames whose target lives here are now on stone.
         var index: usize = 0;
@@ -419,14 +478,15 @@ pub const Sim = struct {
     pub fn make_path(self: *Sim, path: []const u8) Error!void {
         path_assert(path);
         try self.operation_begin();
-        // Register every prefix, the way createDirPath does. Directory
-        // names are treated as durable on creation — the crash space we
-        // explore is file content and file names, and the vault recreates
-        // its directories on open anyway.
+        // Register every prefix, the way createDirPath does. A newly created
+        // directory entry starts non-durable — it survives a crash only once
+        // its parent is fsynced. An existing prefix keeps whatever
+        // durability it already had (make_path is idempotent).
         var end: usize = 0;
         while (end < path.len) {
             end = std.mem.indexOfScalarPos(u8, path, end, '/') orelse path.len;
-            try self.dirs.put(self.arena(), try self.key_own(path[0..end]), {});
+            const slot = try self.dirs.getOrPut(self.arena(), try self.key_own(path[0..end]));
+            if (!slot.found_existing) slot.value_ptr.* = .{ .name_durable = false };
             end += 1;
         }
     }
@@ -563,6 +623,7 @@ test "sim: the full sync protocol survives any crash; skipping it may not" {
         var sim = Sim.init(gpa, seed, .{});
         defer sim.deinit();
         try sim.make_path("v");
+        try sim.fsync_dir(""); // persist the directory `v` itself
         try sim.write_file("v/synced", "acknowledged-bytes");
         try sim.fsync_file("v/synced");
         try sim.fsync_dir("v");
@@ -589,6 +650,35 @@ test "sim: the full sync protocol survives any crash; skipping it may not" {
     try std.testing.expect(unsynced_losses > 0);
 }
 
+test "sim: a directory survives a crash only once its parent is fsynced" {
+    const gpa = std.testing.allocator;
+    var durable_survivals: u32 = 0;
+    var unsynced_losses: u32 = 0;
+    var seed: u64 = 0;
+    while (seed < 300) : (seed += 1) {
+        var sim = Sim.init(gpa, seed, .{});
+        defer sim.deinit();
+
+        // `durable` is fsynced through its parent (root); `volatile_dir` is
+        // created and left unsynced.
+        try sim.make_path("durable");
+        try sim.fsync_dir("");
+        try sim.make_path("volatile_dir");
+
+        sim.crashed = true;
+        sim.crashes += 1;
+        sim.reboot();
+
+        // The parent-fsynced directory is always there.
+        try std.testing.expect(try sim.exists("durable"));
+        durable_survivals += 1;
+        // The unsynced one is sometimes gone; when present it is usable.
+        if (!try sim.exists("volatile_dir")) unsynced_losses += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 300), durable_survivals);
+    try std.testing.expect(unsynced_losses > 0); // the fault arm fires
+}
+
 test "sim: an un-fsynced rename can undo; a dir-fsynced one cannot" {
     const gpa = std.testing.allocator;
     var undone: u32 = 0;
@@ -598,6 +688,10 @@ test "sim: an un-fsynced rename can undo; a dir-fsynced one cannot" {
         defer sim.deinit();
         try sim.make_path("v/tmp");
         try sim.make_path("v/objects");
+        // Persist the directories themselves so only file/rename durability
+        // is under test here, not the parent dirs.
+        try sim.fsync_dir("");
+        try sim.fsync_dir("v");
 
         // Fully acknowledged object: rename + dir fsync.
         try sim.write_file("v/tmp/one", "one");

@@ -47,6 +47,11 @@ pub fn VaultType(comptime Fs: type) type {
         pub fn open(fs: *Fs, options: struct { verify_on_read: bool = true }) Error!Vault {
             try fs.make_path("vault/objects");
             try fs.make_path("vault/tmp");
+            // Make the base directories durable: fsync root to persist
+            // `vault`, then `vault` to persist `objects` and `tmp`. Without
+            // this a crash right after open could lose the whole layout.
+            try fs.fsync_dir("");
+            try fs.fsync_dir("vault");
             return .{ .fs = fs, .verify_on_read = options.verify_on_read };
         }
 
@@ -61,9 +66,18 @@ pub fn VaultType(comptime Fs: type) type {
 
             const tmp = tmp_path(hash);
             const dir = object_dir(hash);
+            const shard = shard_dir(hash);
             try vault.fs.write_file(tmp.slice(), bytes);
             try vault.fs.fsync_file(tmp.slice());
+
+            // Make the shard directories durable before the object depends
+            // on them: fsync `objects` to persist the first shard, then the
+            // first shard to persist the second. A directory becomes durable
+            // when its *parent* is fsynced (the POSIX rule the sim models).
             try vault.fs.make_path(dir.slice());
+            try vault.fs.fsync_dir("vault/objects");
+            try vault.fs.fsync_dir(shard.slice());
+
             try vault.fs.rename(tmp.slice(), path.slice());
             try vault.fs.fsync_dir(dir.slice());
 
@@ -262,11 +276,18 @@ const PathBuffer = struct {
     }
 };
 
-fn object_dir(hash: Hash) PathBuffer {
+/// The first shard level, `vault/objects/aa` — the parent of `object_dir`.
+fn shard_dir(hash: Hash) PathBuffer {
     const hex = hex_of(hash);
     var path: PathBuffer = .{};
     path.append("vault/objects/");
     path.append(hex[0..2]);
+    return path;
+}
+
+fn object_dir(hash: Hash) PathBuffer {
+    const hex = hex_of(hash);
+    var path = shard_dir(hash);
     path.append("/");
     path.append(hex[2..4]);
     return path;
