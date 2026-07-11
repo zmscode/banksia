@@ -338,6 +338,30 @@ while safely ignoring those private boxes.
 directly to a quality-95 JPEG. The end-to-end test recovered a 3,456×2,304 RGB
 JPEG from a 1.8 MB proxy.
 
+`tools/capture-one-raw-to-jpeg.sh` takes a RAW path directly. It creates a
+temporary session and JPEG recipe, calls Capture One's `process` AppleScript
+command on a temporary copy of the RAW, waits for the asynchronous
+render, and removes the temporary session. Keeping the processed path in the
+temporary directory prevents Capture One from writing a `.cos` sidecar beside
+the user's original RAW.
+This is a full Capture One render rather than extraction of the RAW's embedded
+preview. It was validated with a Canon CR2 at 3,525×5,288.
+
+### Runtime requirements
+
+- RAW-to-JPEG requires macOS, an installed and activated Capture One edition
+  that supports the AppleScript `process` command, and Automation permission
+  for the terminal or calling application to control Capture One. Capture One
+  is launched automatically if necessary.
+- `.cop`-to-JPEG requires only macOS `file` and `sips` for current JPEG XL
+  proxies; it does not require Capture One once the proxy exists.
+- Calibration extraction requires the Capture One installation plus Perl
+  modules `DBI`, `DBD::SQLite`, and `XML::LibXML`.
+- Re-running the film-curve binary extractor requires `clang`, `codesign`, and
+  Capture One. Re-running the decompilation additionally requires Ghidra and
+  Java 21. The committed reports and Ghidra output need none of these tools to
+  be read.
+
 ImageCore also retains an older `ProxyContainer2006` backend with 23 legacy
 versions, two JPEG XR versions, and S-JPEG versions 1 and 2. Those containers
 are not ordinary JPEG XL and the converter rejects them explicitly rather than
@@ -373,6 +397,7 @@ their assumptions about noise, colour, headroom, and optics disagree.
 - `tools/extract-capture-one-curves.c` exports one curve or the complete curve
   directory; the latter was validated across all 4,095 `.fcrv` files.
 - `tools/capture-one-proxy-to-jpeg.sh` converts current JPEG XL `.cop` proxies.
+- `tools/capture-one-raw-to-jpeg.sh` renders a RAW directly through Capture One.
 - `reverse-engineering/ghidra/capture-one-quality-decompiled.c` contains the
   focused Ghidra output.
 - `reverse-engineering/ghidra/capture-one-proxy-decompiled.c` contains the
