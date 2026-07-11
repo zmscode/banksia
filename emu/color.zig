@@ -100,12 +100,16 @@ pub const Mat3 = struct {
 
 pub const Transform = struct {
     camera_to_rec2020: Mat3,
+    /// LibRaw's normalized camera matrix expects its recorded channel gains
+    /// before conversion; native DNG's AB*CC*CM path incorporates white
+    /// selection through chromatic adaptation instead.
+    apply_as_shot_white_balance: bool,
 
     pub fn init(metadata: dng.Metadata) Error!Transform {
         if (metadata.camera_to_xyz) |values| {
             const camera_to_source_xyz = Mat3.init(values);
             try validate_matrix(camera_to_source_xyz);
-            const source_xyz = camera_to_source_xyz.vector(metadata.wb_neutral);
+            const source_xyz = camera_to_source_xyz.vector(.{ 1, 1, 1 });
             const source_xy = try xyz_to_xy(source_xyz);
             const source_to_d50 = try bradford(source_xy, d50_xy);
             const d50_to_d65 = try bradford(d50_xy, d65_xy);
@@ -113,7 +117,10 @@ pub const Transform = struct {
                 d50_to_d65.multiply(source_to_d50.multiply(camera_to_source_xyz)),
             );
             try validate_matrix(camera_to_rec2020);
-            return .{ .camera_to_rec2020 = camera_to_rec2020 };
+            return .{
+                .camera_to_rec2020 = camera_to_rec2020,
+                .apply_as_shot_white_balance = true,
+            };
         }
         const profile = try Profile.init(metadata);
         const source_xy = try profile.white_xy(metadata.wb_neutral);
@@ -126,7 +133,10 @@ pub const Transform = struct {
         );
         const camera_to_rec2020 = xyz_d65_to_rec2020.multiply(camera_to_d65);
         try validate_matrix(camera_to_rec2020);
-        return .{ .camera_to_rec2020 = camera_to_rec2020 };
+        return .{
+            .camera_to_rec2020 = camera_to_rec2020,
+            .apply_as_shot_white_balance = false,
+        };
     }
 
     pub fn camera_to_working(self: Transform, planes: *image.Planes) void {
@@ -415,6 +425,24 @@ test "identity D50 camera maps its neutral to equal Rec.2020" {
     const transform = try Transform.init(metadata);
     const white = transform.camera_to_rec2020.vector(metadata.wb_neutral);
     for (white) |value| try std.testing.expectApproxEqAbs(@as(f32, 1), value, 3e-4);
+}
+
+test "backend camera matrix consumes an as-shot-balanced neutral" {
+    var metadata = test_metadata();
+    metadata.color_matrix_1 = null;
+    metadata.camera_to_xyz = Mat3.identity.values;
+    metadata.wb_neutral = .{ 0.5, 1, 0.75 };
+    const transform = try Transform.init(metadata);
+    try std.testing.expect(transform.apply_as_shot_white_balance);
+    const balanced_neutral = [3]f32{
+        metadata.wb_neutral[0] * metadata.wb_neutral[1] / metadata.wb_neutral[0],
+        metadata.wb_neutral[1],
+        metadata.wb_neutral[2] * metadata.wb_neutral[1] / metadata.wb_neutral[2],
+    };
+    const white = transform.camera_to_rec2020.vector(balanced_neutral);
+    for (white) |value| {
+        try std.testing.expectApproxEqAbs(white[1], value, 3e-4);
+    }
 }
 
 test "DNG matrix order is analog balance times calibration times color" {

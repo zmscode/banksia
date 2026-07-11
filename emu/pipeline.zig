@@ -297,7 +297,10 @@ fn op_apply(
         },
         .white_balance => {
             const wb = op.white_balance;
-            if (color_transform == null or !wb.as_shot) {
+            if (color_transform == null or
+                !wb.as_shot or
+                color_transform.?.apply_as_shot_white_balance)
+            {
                 const gains = wb_gains(wb, sensor.wb_neutral);
                 kernel_wb(mosaic, sensor.width, sensor.height, sensor.cfa, gains);
             }

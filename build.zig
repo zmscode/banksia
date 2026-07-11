@@ -124,8 +124,15 @@ pub fn build(b: *std.Build) void {
     // The dev loop is zig build, not make: `zig build shell` builds the
     // dylib, installs the header, then drives SwiftPM; `run-shell` opens
     // the app. Requires a Swift toolchain (Xcode), so it is not in `test`.
+    const shell_lib = b.addSystemCommand(&.{
+        "zig",
+        "build",
+        "-Doptimize=ReleaseFast",
+        b.fmt("-Dlibraw-prefix={s}", .{libraw_prefix}),
+        "lib",
+    });
     const shell_build = b.addSystemCommand(&.{ "swift", "build", "--package-path", "macos" });
-    shell_build.step.dependOn(&lib_install.step);
+    shell_build.step.dependOn(&shell_lib.step);
     shell_build.has_side_effects = true; // SwiftPM does its own caching
     const shell_step = b.step("shell", "Build the SwiftUI inspection shell (needs Xcode)");
     shell_step.dependOn(&shell_build.step);
