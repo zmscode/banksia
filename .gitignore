@@ -8,3 +8,4 @@ macos/.build/
 # Local licensed/proprietary RAW corpus. Commit manifests and hashes, not blobs.
 assets/**/*.CR2
 assets/**/*.CR3
+assets/**/*.DNG

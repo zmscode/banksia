@@ -145,6 +145,9 @@ pub const Error = error{
     UnsupportedBitDepth,
     /// CFA patterns beyond the 2x2 Bayer family.
     UnsupportedCfa,
+    /// Valid DNG containing already-demosaiced LinearRaw samples rather than
+    /// the supported one-sample-per-pixel CFA mosaic.
+    UnsupportedLinearRaw,
     /// Valid geometry that requires fractional crop coordinates or another
     /// transform outside the current integer crop profile.
     UnsupportedGeometry,
@@ -213,6 +216,7 @@ const tag_camera_calibration_signature: u16 = 50931;
 const tag_profile_calibration_signature: u16 = 50932;
 
 const photometric_cfa: u32 = 32803;
+const photometric_linear_raw: u32 = 34892;
 
 const type_byte: u16 = 1;
 const type_ascii: u16 = 2;
@@ -400,6 +404,7 @@ fn ifds_select(r: *const Reader) Error!IfdSelection {
     pending[0] = try r.read_u32(4);
     var visited: u32 = 0;
     var raw: ?Ifd = null;
+    var linear_raw = false;
     var first: ?Ifd = null;
 
     while (pending_len > 0 and raw == null) {
@@ -413,10 +418,12 @@ fn ifds_select(r: *const Reader) Error!IfdSelection {
         const ifd = parsed.ifd;
         if (first == null) first = ifd;
         if (ifd.find(tag_photometric)) |p| {
-            if (try value_scalar(r, p, 0) == photometric_cfa) {
+            const photometric = try value_scalar(r, p, 0);
+            if (photometric == photometric_cfa) {
                 raw = ifd;
                 break;
             }
+            linear_raw = linear_raw or photometric == photometric_linear_raw;
         }
         if (parsed.next != 0 and pending_len < ifd_visit_max) {
             pending[pending_len] = parsed.next;
@@ -438,8 +445,12 @@ fn ifds_select(r: *const Reader) Error!IfdSelection {
         const parsed = try ifd_parse(r, try value_scalar(r, entry, 0));
         exif = parsed.ifd;
     }
+    const raw_ifd = raw orelse {
+        if (linear_raw) return error.UnsupportedLinearRaw;
+        return error.UnsupportedStructure;
+    };
     return .{
-        .raw = raw orelse return error.UnsupportedStructure,
+        .raw = raw_ifd,
         .first = first_ifd,
         .exif = exif,
     };
@@ -1178,6 +1189,11 @@ test "unsupported features fail by name, one field away from valid" {
         .{ .tag = tag_samples_per_pixel, .payload = 3, .expected = error.UnsupportedBitDepth },
         // Photometric that never becomes CFA: the walk finds no raw IFD.
         .{ .tag = tag_photometric, .payload = 1, .expected = error.UnsupportedStructure },
+        .{
+            .tag = tag_photometric,
+            .payload = photometric_linear_raw,
+            .expected = error.UnsupportedLinearRaw,
+        },
         // A 3x3 repeat pattern (X-Trans territory) is not Bayer.
         .{ .tag = tag_cfa_repeat_dim, .payload = 3 | (3 << 16), .expected = error.UnsupportedCfa },
         // Compression 7 whose strip bytes are not a JPEG stream at all.

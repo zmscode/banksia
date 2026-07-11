@@ -27,7 +27,7 @@ reported as malformed.
 | White balance | `AsShotNeutral`, with identity fallback while corpus policy is finalized |
 | Geometry | TIFF `Orientation` 1–8; integer `ActiveArea`, `DefaultCropOrigin`, and `DefaultCropSize` |
 | Levels | Scalar DNG or 2×2 LibRaw black/white maps |
-| Colour | DNG colour matrices and calibration are not yet in the supported profile |
+| Colour | `ColorMatrix1/2`, `CameraCalibration1/2`, `AnalogBalance`, `AsShotNeutral`; Bradford adaptation into linear Rec.2020 |
 | Opcodes | Geometry/processing opcodes are not yet applied |
 
 Fractional default-crop geometry is valid DNG but currently returns

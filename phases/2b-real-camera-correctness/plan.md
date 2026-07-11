@@ -51,10 +51,11 @@ unclaimed until licensed fixtures and expected metadata are committed.
 - [ ] Add controlled grey-card and ColorChecker captures when possible.
 - [ ] Produce oracle outputs with exact, committed settings.
 
-The local proprietary corpus is recorded in [corpus.md](corpus.md) and
-[corpus.sha256](corpus.sha256). `zig build corpus` verifies all 18 hashes and
-ImageIO-decodes every file; originals remain untracked pending licence review
-and DNG conversion.
+The local corpus is recorded in [corpus.md](corpus.md) and
+[corpus.sha256](corpus.sha256). `zig build corpus` verifies all 27 hashes,
+decodes 18 CR2/CR3 mosaics, checks 9 Apple LinearRaw DNGs fail by their expected
+unsupported name, and ImageIO-decodes every file. Originals remain untracked
+pending licence review and distributable Bayer DNG conversion.
 
 ### 2B.3 Expand decoded metadata
 
