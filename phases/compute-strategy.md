@@ -300,7 +300,17 @@ Useful work:
 Do not add a tile thread pool merely to improve a headline number while colour
 and geometry semantics are changing.
 
-### Phase 2C — sessions and import
+### Phase 2C — performance architecture and Metal proof
+
+Keep the current synchronous CPU path as the strict oracle while measuring the
+complete input-to-visible path. Define explicit render domains and surface
+ownership, add generation-based supersession and bounded memory admission, then
+prove one on-demand MetalKit viewer path for late develop operations. Avoid
+routine readback, precompile/cache pipelines, and keep at most two viewer frames
+in flight initially. Metal ships only if end-to-visible latency, perceptual
+parity, memory, fallback, and idle-energy gates pass.
+
+### Phase 2D — sessions and import
 
 Use a bounded pipeline:
 
@@ -583,14 +593,15 @@ race detection and soak behavior.
 2. Add semantic recipe validation before further concurrency.
 3. Add a small cancellation token and generation-based stale-result suppression
    for the shell.
-4. Add bounded asset jobs for Phase 2C import.
-5. Introduce one session-owned scheduler for Phase 3 thumbnails.
-6. Add priorities, deduplication, and memory admission as real workloads require.
-7. Add preview-resolution decode/demosaic.
-8. Profile and fuse CPU passes.
+4. Instrument and run the Phase 2C Metal vertical-slice proof.
+5. Add bounded asset jobs for Phase 2D import.
+6. Introduce one session-owned scheduler for Phase 3 thumbnails.
+7. Add priorities, deduplication, and memory admission as real workloads require.
+8. Profile and fuse remaining CPU passes.
 9. Add deterministic tiled CPU execution only if budgets are still missed.
 10. Parallelize export through the same scheduler.
-11. Run the Metal proof only after the Branch C entry gate passes.
+11. Run deeper Branch C work only after the Phase 2C invest decision identifies
+    a measured next bottleneck.
 
 ---
 

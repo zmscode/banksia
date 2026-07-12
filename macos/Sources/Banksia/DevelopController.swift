@@ -27,6 +27,8 @@ final class DevelopController {
     /// Wall-clock latency of the last completed render, as the shell measures
     /// it (actor hop included) — the number a human watches while dragging.
     private(set) var lastRenderMS: Double?
+    private(set) var lastLoadTiming: LoadTiming?
+    private(set) var lastRenderTiming: RenderTiming?
     private(set) var pixelWidth = 0
     private(set) var pixelHeight = 0
     /// Bumps on every displayed frame so the histogram can key its recompute
@@ -70,6 +72,8 @@ final class DevelopController {
         baselineImage = nil
         image = nil
         lastRenderMS = nil
+        lastLoadTiming = nil
+        lastRenderTiming = nil
         fileName = url.lastPathComponent
         currentURL = url
         folderFiles = Self.listRawSiblings(of: url)
@@ -79,7 +83,7 @@ final class DevelopController {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             do {
-                try await renderer.load(path: url.path)
+                lastLoadTiming = try await renderer.loadMeasured(path: url.path)
                 guard !Task.isCancelled else { return }
                 hasRaw = true
                 statusText = url.lastPathComponent
@@ -140,14 +144,15 @@ final class DevelopController {
         let clock = ContinuousClock()
         let start = clock.now
         do {
-            let rendered = try await renderer.render(
+            let rendered = try await renderer.renderMeasured(
                 recipeJSON: develop.recipeJSON,
                 edgeMax: edgeMax
             )
             guard !Task.isCancelled else { return }
-            image = rendered
-            pixelWidth = rendered.width
-            pixelHeight = rendered.height
+            image = rendered.image
+            pixelWidth = rendered.image.width
+            pixelHeight = rendered.image.height
+            lastRenderTiming = rendered.timing
             let elapsed = start.duration(to: clock.now).components
             lastRenderMS = Double(elapsed.seconds) * 1000
                 + Double(elapsed.attoseconds) / 1_000_000_000_000_000

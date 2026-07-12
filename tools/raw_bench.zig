@@ -7,7 +7,7 @@ const std = @import("std");
 const emu = @import("emu");
 
 const file_bytes_max = std.Io.Limit.limited(512 * 1024 * 1024);
-const iterations_max: u32 = 9;
+const iterations_max: u32 = 101;
 
 const Options = struct {
     iterations: u32 = 3,
@@ -42,17 +42,21 @@ const Samples = struct {
             }
             sorted[insertion] = value;
         }
-        const rank = (@as(u64, samples.len - 1) * numerator) / denominator;
-        return sorted[@intCast(rank)];
+        // Nearest-rank percentile: ceil(P * N) - 1. The old interpolation
+        // formula selected the second-highest value for p95 with nine samples,
+        // understating the tail that this harness exists to expose.
+        const rank = (@as(u64, samples.len) * numerator + denominator - 1) / denominator;
+        return sorted[@intCast(rank - 1)];
     }
 
     fn report(samples: Samples, name: []const u8) void {
         std.debug.print(
-            "  {s}: p50={d:.3} ms p95={d:.3} ms ({d} runs)\n",
+            "  {s}: p50={d:.3} ms p95={d:.3} ms p99={d:.3} ms ({d} runs)\n",
             .{
                 name,
                 ms(samples.percentile(50, 100)),
                 ms(samples.percentile(95, 100)),
+                ms(samples.percentile(99, 100)),
                 samples.len,
             },
         );

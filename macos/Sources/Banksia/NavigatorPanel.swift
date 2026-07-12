@@ -85,8 +85,16 @@ struct NavigatorPanel: View {
             infoRow("Last render", controller.lastRenderMS.map {
                 "\(Int($0.rounded())) ms"
             } ?? "—")
+            infoRow("Load/decode", formatMS(controller.lastLoadTiming?.coreLoadDecodeMS))
+            infoRow("Core render", formatMS(controller.lastRenderTiming?.coreRenderMS))
+            infoRow("Pixel copy", formatMS(controller.lastRenderTiming?.pixelCopyMS))
+            infoRow("CGImage", formatMS(controller.lastRenderTiming?.imageBuildMS))
             infoRow("Engine", "v2")
         }
+    }
+
+    private func formatMS(_ value: Double?) -> String {
+        value.map { String(format: "%.1f ms", $0) } ?? "—"
     }
 
     private var recipe: some View {

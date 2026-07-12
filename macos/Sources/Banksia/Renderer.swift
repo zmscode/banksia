@@ -1,6 +1,24 @@
 import CBanksia
 import CoreGraphics
 import Foundation
+import os.signpost
+
+struct LoadTiming: Sendable {
+    let coreLoadDecodeMS: Double
+}
+
+struct RenderTiming: Sendable {
+    let recipeMS: Double
+    let coreRenderMS: Double
+    let pixelCopyMS: Double
+    let imageBuildMS: Double
+    let rendererTotalMS: Double
+}
+
+struct MeasuredRender {
+    let image: CGImage
+    let timing: RenderTiming
+}
 
 /// A failure reported across the C ABI: the returned code plus the message
 /// the engine left in bk_last_error.
@@ -15,6 +33,10 @@ struct EngineError: Error, CustomStringConvertible {
 /// serialization point banksia.h requires. Renders run on the actor, never
 /// on the main thread.
 actor Renderer {
+    private static let performanceLog = OSLog(
+        subsystem: "codes.zms.banksia",
+        category: .pointsOfInterest
+    )
     private var engine: OpaquePointer?
 
     deinit {
@@ -22,8 +44,20 @@ actor Renderer {
     }
 
     func load(path: String) throws {
+        _ = try loadMeasured(path: path)
+    }
+
+    @discardableResult
+    func loadMeasured(path: String) throws -> LoadTiming {
         let engine = try handle()
+        let clock = ContinuousClock()
+        let start = clock.now
+        os_signpost(.begin, log: Self.performanceLog, name: "RAW load and decode")
+        defer {
+            os_signpost(.end, log: Self.performanceLog, name: "RAW load and decode")
+        }
         try check(bk_load_raw(engine, path), engine)
+        return LoadTiming(coreLoadDecodeMS: milliseconds(start.duration(to: clock.now)))
     }
 
     /// Render through the current recipe; `edgeMax` bounds the longest
@@ -32,16 +66,43 @@ actor Renderer {
     /// next render on this handle, and a displayed image must never alias
     /// memory the engine is about to free.
     func render(recipeJSON: String, edgeMax: UInt32) throws -> CGImage {
+        try renderMeasured(recipeJSON: recipeJSON, edgeMax: edgeMax).image
+    }
+
+    func renderMeasured(recipeJSON: String, edgeMax: UInt32) throws -> MeasuredRender {
         let engine = try handle()
-        try check(bk_set_recipe_json(engine, recipeJSON), engine)
+
+        let clock = ContinuousClock()
+        let totalStart = clock.now
+        let recipeStart = clock.now
+        do {
+            os_signpost(.begin, log: Self.performanceLog, name: "Recipe update")
+            defer {
+                os_signpost(.end, log: Self.performanceLog, name: "Recipe update")
+            }
+            try check(bk_set_recipe_json(engine, recipeJSON), engine)
+        }
+        let recipeMS = milliseconds(recipeStart.duration(to: clock.now))
 
         var width: UInt32 = 0
         var height: UInt32 = 0
+        let renderStart = clock.now
+        os_signpost(.begin, log: Self.performanceLog, name: "Core render")
         guard let pixels = bk_render(engine, edgeMax, &width, &height) else {
+            os_signpost(.end, log: Self.performanceLog, name: "Core render")
             throw lastError(engine, code: BK_ERR_RENDER)
         }
-        let data = Data(bytes: pixels, count: Int(width) * Int(height) * 4)
+        os_signpost(.end, log: Self.performanceLog, name: "Core render")
+        let coreRenderMS = milliseconds(renderStart.duration(to: clock.now))
 
+        let copyStart = clock.now
+        os_signpost(.begin, log: Self.performanceLog, name: "Engine pixel copy")
+        let data = Data(bytes: pixels, count: Int(width) * Int(height) * 4)
+        os_signpost(.end, log: Self.performanceLog, name: "Engine pixel copy")
+        let pixelCopyMS = milliseconds(copyStart.duration(to: clock.now))
+
+        let imageStart = clock.now
+        os_signpost(.begin, log: Self.performanceLog, name: "CGImage construction")
         guard let space = CGColorSpace(name: CGColorSpace.sRGB),
               let provider = CGDataProvider(data: data as CFData),
               let image = CGImage(
@@ -58,9 +119,22 @@ actor Renderer {
                   intent: .defaultIntent
               )
         else {
+            os_signpost(.end, log: Self.performanceLog, name: "CGImage construction")
             throw EngineError(code: BK_ERR_RENDER, message: "CGImage construction failed")
         }
-        return image
+        os_signpost(.end, log: Self.performanceLog, name: "CGImage construction")
+        let imageBuildMS = milliseconds(imageStart.duration(to: clock.now))
+
+        return MeasuredRender(
+            image: image,
+            timing: RenderTiming(
+                recipeMS: recipeMS,
+                coreRenderMS: coreRenderMS,
+                pixelCopyMS: pixelCopyMS,
+                imageBuildMS: imageBuildMS,
+                rendererTotalMS: milliseconds(totalStart.duration(to: clock.now))
+            )
+        )
     }
 
     /// Load and render in one actor-isolated step. There is no `await` between
@@ -87,5 +161,11 @@ actor Renderer {
 
     private func lastError(_ engine: OpaquePointer, code: Int32) -> EngineError {
         EngineError(code: code, message: String(cString: bk_last_error(engine)))
+    }
+
+    private func milliseconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) * 1_000
+            + Double(components.attoseconds) / 1_000_000_000_000_000
     }
 }

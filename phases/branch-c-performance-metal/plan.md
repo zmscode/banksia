@@ -1,12 +1,19 @@
 # Branch C — CPU performance and Metal
 
+Phase 2C promotes the backend contract, measurement harness, on-demand Metal
+surface, and one late-develop vertical slice into the mandatory sequence. This
+branch now owns deeper acceleration only after the Phase 2C invest decision:
+GPU demosaic/detail/export, deterministic CPU tiling, additional shader ports,
+and broader throughput or thermal optimization.
+
 ### Hypothesis
 
-After correct caching and CPU planning, Metal may improve measured interaction or
-throughput enough to justify maintaining a second numerical backend.
+After the Phase 2C proof, additional CPU or Metal work may improve a measured
+interaction or throughput bottleneck enough to justify its maintenance cost.
 
 ### Entry gate
 
+- [ ] Phase 2C invest decision identifies the next dominant workload or kernel.
 - [ ] Record p50/p95/p99 for cold render, late slider edit, loupe, export, and
   thumbnails.
 - [ ] Attribute time to decode, demosaic, kernels, allocation, cache, transfer,

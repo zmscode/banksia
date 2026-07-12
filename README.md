@@ -10,7 +10,7 @@ macOS — the platform the shell, the C ABI, and eventually Metal target.
 See [plan.md](plan.md) for the architecture and roadmap, and
 [phases/](phases/) for granular phase plans, exit criteria, and close-outs.
 
-## Status: Phase 2B — real-camera correctness
+## Status: Phase 2C — performance architecture and Metal proof
 
 The develop engine (**emu**) decodes DNG natively and CR2/CR3 through LibRaw's
 sensor-mosaic API, then runs Banksia's deterministic linear scene-referred
@@ -30,7 +30,8 @@ fauna for the libraries inside):
 - **emu** (`emu/`) — the develop engine: decode, colour, pipeline, render
   cache, thumbnails.
 - **wombat** (`wombat/`) — storage: content-addressed blob vault, chunking,
-  and the durable columnar catalog. Sessions follow in Phase 2C.
+  and the durable columnar catalog. GPU/render architecture is Phase 2C;
+  sessions follow in Phase 2D.
 - **lyrebird** (`lyrebird/`) — similarity: perceptual hashing, burst
   grouping, sharpness scoring. *(Phase 4 — stub.)*
 
