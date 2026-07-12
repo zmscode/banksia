@@ -36,6 +36,7 @@ struct ContentView: View {
         // fixed-width panels off-screen when an image loads.
         .background(backdrop)
         .preferredColorScheme(.dark)
+        .tint(Theme.accent)
         .toolbar { toolbar }
         .navigationTitle(controller.fileName ?? "banksia")
         .navigationSubtitle(subtitle)

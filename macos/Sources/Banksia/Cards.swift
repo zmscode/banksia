@@ -30,12 +30,12 @@ struct ToolCard<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 7) {
                 Image(systemName: systemImage)
-                    .font(.system(size: 12))
+                    .font(.system(size: 11))
                     .foregroundStyle(Theme.textSecondary)
-                    .frame(width: 15)
+                    .frame(width: 14)
                 Text(title)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Theme.textPrimary)
@@ -44,7 +44,7 @@ struct ToolCard<Content: View>: View {
             }
             content()
         }
-        .padding(12)
+        .padding(11)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard()
     }

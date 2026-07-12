@@ -1,19 +1,23 @@
 import SwiftUI
 
-/// The right panel: the active controls — the histogram of what came back, then
-/// the adjustment tools that drive the recipe. Capture One's tool stack, in
-/// Liquid Glass.
+/// The right panel: the histogram of what came back, the adjustment tools that
+/// drive the recipe, and the engine's live tone curve. Capture One's tool stack,
+/// in Liquid Glass.
 struct ToolsColumn: View {
     let controller: DevelopController
 
     var body: some View {
-        VStack(spacing: 10) {
-            histogram
-            whiteBalance
-            exposure
-            Spacer(minLength: 0)
+        ScrollView {
+            VStack(spacing: 8) {
+                histogram
+                whiteBalance
+                exposure
+                curve
+            }
+            .padding(.bottom, 4)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .scrollIndicators(.hidden)
+        .scrollBounceBehavior(.basedOnSize)
     }
 
     private var histogram: some View {
@@ -51,6 +55,17 @@ struct ToolsColumn: View {
         }
     }
 
+    private var curve: some View {
+        ToolCard("Tone Curve", systemImage: "point.topleft.down.to.point.bottomright.curvepath") {
+            ToneCurveView(
+                ev: controller.develop.ev,
+                contrast: controller.develop.contrast,
+                temperature: controller.develop.temperature,
+                tint: controller.develop.tint
+            )
+        }
+    }
+
     // MARK: Building blocks
 
     private func resetButton(enabled: Bool, action: @escaping () -> Void) -> some View {
@@ -71,12 +86,22 @@ struct ToolsColumn: View {
     ) -> some View {
         let bipolar = range.lowerBound < 0
         let value = controller.develop[keyPath: keyPath]
+        let edited = value != 0
         let text = String(format: bipolar ? "%+.2f" : "%.2f", value)
         return VStack(spacing: 3) {
             HStack {
-                Text(name).font(.system(size: 11)).foregroundStyle(Theme.textSecondary)
+                // Double-click the name to reset just this slider, once it's off
+                // zero; brightness (not colour) marks it modified.
+                Text(name)
+                    .font(.system(size: 11))
+                    .foregroundStyle(edited ? Theme.textPrimary : Theme.textSecondary)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        if edited { controller.develop[keyPath: keyPath] = 0 }
+                    }
+                    .help(edited ? "Double-click to reset \(name)" : "")
                 Spacer()
-                if value != 0 {
+                if edited {
                     Button { controller.develop[keyPath: keyPath] = 0 } label: {
                         Text(text).valueField()
                     }

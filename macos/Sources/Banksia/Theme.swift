@@ -15,9 +15,9 @@ enum Theme {
     static let textSecondary = Color(white: 0.62)
     static let textTertiary = Color(white: 0.45)
 
-    /// The one saturated hue: a muted slate-blue for the active tool tab and the
-    /// slider handles. Everything else stays glass-neutral.
-    static let accent = Color(red: 0.40, green: 0.62, blue: 0.78)
+    /// Monochrome highlight for slider fills, selection, and "modified" state —
+    /// a light neutral, no hue, so nothing tints blue.
+    static let accent = Color(white: 0.78)
 
     static let card: CGFloat = 13
     static let fieldCorner: CGFloat = 4

@@ -9,13 +9,16 @@ struct NavigatorPanel: View {
     let viewer: ViewerState
 
     var body: some View {
-        VStack(spacing: 10) {
-            navigator
-            info
-            recipe
-            Spacer(minLength: 0)
+        ScrollView {
+            VStack(spacing: 8) {
+                navigator
+                info
+                recipe
+            }
+            .padding(.bottom, 4)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .scrollIndicators(.hidden)
+        .scrollBounceBehavior(.basedOnSize)
     }
 
     private var navigator: some View {
@@ -41,25 +44,27 @@ struct NavigatorPanel: View {
 
     private func thumbnail(_ image: CGImage) -> some View {
         GeometryReader { geo in
-            let box = CGSize(width: geo.size.width - 10, height: geo.size.height - 10)
-            let fitted = fit(CGSize(width: image.width, height: image.height), in: box)
-            let originX = (geo.size.width - fitted.width) / 2
-            let originY = (geo.size.height - fitted.height) / 2
-            ZStack(alignment: .topLeading) {
+            let inset = CGSize(width: geo.size.width - 10, height: geo.size.height - 10)
+            let fitted = fit(CGSize(width: image.width, height: image.height), in: inset)
+            // Centre-align both the image and the rectangle, then offset the
+            // rectangle from centre by the visible region's centre. It lines up
+            // regardless of the pillarbox, with no origin to guess.
+            ZStack {
                 Image(decorative: image, scale: 1)
                     .resizable()
                     .interpolation(.medium)
-                    .scaledToFit()
-                    .padding(5)
+                    .frame(width: fitted.width, height: fitted.height)
                 if let rect = viewer.visibleRect {
                     RoundedRectangle(cornerRadius: 2, style: .continuous)
                         .stroke(Color.white.opacity(0.95), lineWidth: 1.5)
-                        .frame(width: fitted.width * rect.width, height: fitted.height * rect.height)
-                        .offset(x: originX + fitted.width * rect.minX,
-                                y: originY + fitted.height * rect.minY)
+                        .frame(width: fitted.width * rect.width,
+                               height: fitted.height * rect.height)
+                        .offset(x: fitted.width * (rect.midX - 0.5),
+                                y: fitted.height * (rect.midY - 0.5))
                         .shadow(color: .black.opacity(0.5), radius: 1)
                 }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
     }
 

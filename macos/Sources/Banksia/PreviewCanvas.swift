@@ -79,7 +79,7 @@ struct PreviewCanvas: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
-        .overlay { if !splitEnabled { interaction } }
+        .overlay { interaction }
         .shadow(color: .black.opacity(0.5), radius: 18, y: 6)
         .animation(.interactiveSpring(response: 0.26, dampingFraction: 0.85), value: viewer.scale)
     }
@@ -96,6 +96,7 @@ struct PreviewCanvas: View {
 
     private var interaction: some View {
         ViewerInteraction(
+            splitActive: splitEnabled,
             onScroll: { delta, location in zoom(by: exp(delta * 0.002), toward: location) },
             onPan: { translation in panBy(translation) },
             onPanEnded: { settledOffset = viewer.offset },
@@ -104,7 +105,8 @@ struct PreviewCanvas: View {
                 settledScale = viewer.scale
                 settledOffset = viewer.offset
             },
-            onDoubleClick: { toggleZoom() }
+            onDoubleClick: { toggleZoom() },
+            onSplit: { fraction in splitFraction = min(max(fraction, 0.04), 0.96) }
         )
     }
 
@@ -113,12 +115,9 @@ struct PreviewCanvas: View {
     private var splitControls: some View {
         GeometryReader { geo in
             let x = geo.size.width * splitFraction
+            // Seam dragging is handled by the interaction layer (left-drag);
+            // these are just the visuals.
             ZStack(alignment: .topLeading) {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .gesture(DragGesture(minimumDistance: 0).onChanged { value in
-                        splitFraction = min(max(value.location.x / max(geo.size.width, 1), 0.04), 0.96)
-                    })
                 Rectangle().fill(.white.opacity(0.85))
                     .frame(width: 1.5, height: geo.size.height)
                     .position(x: x, y: geo.size.height / 2)
