@@ -61,25 +61,32 @@ ReleaseFast `raw-bench` harness now reports nearest-rank p50/p95/p99 and accepts
 up to 101 samples. See [the seed baseline](baseline.md); presentation,
 histogram/overlay, packing, memory, thermal, and longer workload captures remain.
 
+The first ownership slice is also implemented in the shell: immutable requests
+carry an explicit renderer/execution identity, CPU and Metal identities cannot
+collide, and monotonic publication generations discard obsolete frames and
+obsolete errors. See [the render contract](render-contract.md). The existing C
+ABI remains unchanged; explicit GPU surface ownership and shared-engine request
+types remain before 2C.2 is complete.
+
 ### 2C.2 Define backend-independent render domains and ownership
 
-- [ ] Separate sensor CFA, camera RGB, linear working image, developed image,
+- [x] Separate sensor CFA, camera RGB, linear working image, developed image,
   and display output as explicit domains.
-- [ ] Define immutable render request, renderer manifest, execution contract,
+- [x] Define immutable render request, renderer manifest, execution contract,
   render intent, precision policy, and output-surface identity.
 - [ ] Represent output explicitly as CPU pixels or a platform GPU surface;
   never hide texture ownership behind the current `bk_render` pointer.
-- [ ] Document buffer/texture lifetime, thread ownership, cancellation, and
+- [x] Document buffer/texture lifetime, thread ownership, cancellation, and
   publication rules across Zig, C, and Swift.
-- [ ] Keep existing `bk_render` behavior frozen for CPU callers.
+- [x] Keep existing `bk_render` behavior frozen for CPU callers.
 - [ ] Key CPU and GPU cache artifacts separately unless exact equality is
   demonstrated.
 - [ ] Ensure headless CLI and CI builds do not require Metal.
 
 ### 2C.3 Add cancellation, supersession, and memory admission
 
-- [ ] Give every visible render request a monotonically increasing generation.
-- [ ] Prevent an older completed frame from replacing a newer request.
+- [x] Give every visible render request a monotonically increasing generation.
+- [x] Prevent an older completed frame from replacing a newer request.
 - [ ] Add cooperative cancellation at safe stage/tile boundaries.
 - [ ] Bound queued and in-flight CPU/GPU jobs.
 - [ ] Reserve memory before admitting a render; include CFA, CPU planes, staging
@@ -90,15 +97,24 @@ histogram/overlay, packing, memory, thermal, and longer workload captures remain
 ### 2C.4 Build the macOS Metal surface proof
 
 - [ ] Create the Metal device and command queue once and cache pipeline states.
-- [ ] Add an on-demand `MTKView` through `NSViewRepresentable`, using drawable
+- [x] Add an on-demand `MTKView` through `NSViewRepresentable`, using drawable
   pixels rather than point-space bounds.
 - [ ] Present a test texture directly without `Data`/`CGImage` reconstruction.
 - [ ] Handle nil devices, nil drawables, resize/backing-scale changes, command
   failure, and device/runtime capability checks with clean CPU fallback.
 - [ ] Use build-time compiled MSL and stable shader implementation IDs.
-- [ ] Keep at most two viewer command buffers/drawables in flight initially.
-- [ ] Avoid blocking waits on the main actor and release drawable references
+- [x] Keep at most two viewer command buffers/drawables in flight initially.
+- [x] Avoid blocking waits on the main actor and release drawable references
   promptly.
+
+The first drawable proof is available with `BANKSIA_METAL_PROOF=1`. It creates
+one cached device/queue pair, sets a two-drawable limit, draws only when
+invalidated or resized, and performs no CPU readback. It currently clears the
+drawable directly; presenting an owned test texture, shader compilation, error
+injection/fallback, and the real developed image remain before this section is
+complete. A Retina self-shot confirmed the surface is visible, and a separate
+`MTL_DEBUG_LAYER=1` launch completed with Metal API validation enabled and no
+reported validation errors.
 
 ### 2C.5 Prove a GPU-resident late-develop path
 
@@ -142,7 +158,7 @@ histogram/overlay, packing, memory, thermal, and longer workload captures remain
 - [ ] Existing CPU golden, corpus, ABI, CLI, and shell gates remain green.
 - [ ] Performance telemetry unit tests use a deterministic fake clock where
   practical.
-- [ ] Generation ordering rejects stale completion.
+- [x] Generation ordering rejects stale completion.
 - [ ] Queue and memory admission remain bounded under randomized request bursts.
 - [ ] Metal shader known vectors match the CPU reference.
 - [ ] Full CPU/Metal perceptual corpus report.

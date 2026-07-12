@@ -24,6 +24,8 @@ struct PreviewCanvas: View {
     @State private var cropAngle: Double = 0
 
     private static let rawExtensions: Set<String> = ["dng", "cr2", "cr3"]
+    private static let metalSurfaceProofEnabled =
+        ProcessInfo.processInfo.environment["BANKSIA_METAL_PROOF"] == "1"
     // 1 = fit; below 1 pulls back for breathing room, above 1 pixel-peeps.
     private static let minScale: CGFloat = 0.33
     private static let maxScale: CGFloat = 10
@@ -78,7 +80,9 @@ struct PreviewCanvas: View {
 
     @ViewBuilder
     private var content: some View {
-        if let image = controller.displayImage {
+        if Self.metalSurfaceProofEnabled {
+            MetalSurfaceProof()
+        } else if let image = controller.displayImage {
             imageStage(image)
         } else if controller.fileName != nil, controller.isRendering {
             loadingState

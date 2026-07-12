@@ -27,5 +27,10 @@ let package = Package(
                 ])
             ]
         ),
+        .testTarget(
+            name: "BanksiaTests",
+            dependencies: ["Banksia"],
+            path: "Tests/BanksiaTests"
+        ),
     ]
 )

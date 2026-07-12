@@ -16,6 +16,7 @@ struct RenderTiming: Sendable {
 }
 
 struct MeasuredRender {
+    let request: RenderRequest
     let image: CGImage
     let timing: RenderTiming
 }
@@ -70,6 +71,22 @@ actor Renderer {
     }
 
     func renderMeasured(recipeJSON: String, edgeMax: UInt32) throws -> MeasuredRender {
+        try render(request: RenderRequest(
+            generation: 0,
+            recipeJSON: recipeJSON,
+            edgeMax: edgeMax,
+            intent: .compatibility,
+            execution: .strictCPUDisplay
+        ))
+    }
+
+    func render(request: RenderRequest) throws -> MeasuredRender {
+        guard request.execution == .strictCPUDisplay else {
+            throw EngineError(
+                code: BK_ERR_INVALID_ARGUMENT,
+                message: "strict CPU renderer received an incompatible execution contract"
+            )
+        }
         let engine = try handle()
 
         let clock = ContinuousClock()
@@ -80,7 +97,7 @@ actor Renderer {
             defer {
                 os_signpost(.end, log: Self.performanceLog, name: "Recipe update")
             }
-            try check(bk_set_recipe_json(engine, recipeJSON), engine)
+            try check(bk_set_recipe_json(engine, request.recipeJSON), engine)
         }
         let recipeMS = milliseconds(recipeStart.duration(to: clock.now))
 
@@ -88,7 +105,7 @@ actor Renderer {
         var height: UInt32 = 0
         let renderStart = clock.now
         os_signpost(.begin, log: Self.performanceLog, name: "Core render")
-        guard let pixels = bk_render(engine, edgeMax, &width, &height) else {
+        guard let pixels = bk_render(engine, request.edgeMax, &width, &height) else {
             os_signpost(.end, log: Self.performanceLog, name: "Core render")
             throw lastError(engine, code: BK_ERR_RENDER)
         }
@@ -126,6 +143,7 @@ actor Renderer {
         let imageBuildMS = milliseconds(imageStart.duration(to: clock.now))
 
         return MeasuredRender(
+            request: request,
             image: image,
             timing: RenderTiming(
                 recipeMS: recipeMS,

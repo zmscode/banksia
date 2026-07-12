@@ -55,9 +55,9 @@ final class DevelopController {
     private var hasRaw = false
 
     /// A render is queued: the loop reads the latest recipe when it gets to it,
-    /// so a burst of slider changes coalesces into whatever value is current.
-    private var renderRequested = false
-    private var requestedEdgeMax: UInt32 = 0
+    /// so a burst of slider changes replaces the queued immutable snapshot.
+    private var requestedRender: RenderRequest?
+    private var generationClock = RenderGenerationClock()
 
     /// The "feels responsive" bound while a slider drags; release renders
     /// full resolution.
@@ -68,7 +68,8 @@ final class DevelopController {
         renderTask?.cancel()
         baselineTask?.cancel()
         renderTask = nil
-        renderRequested = false
+        requestedRender = nil
+        _ = generationClock.issue()
         baselineImage = nil
         image = nil
         lastRenderMS = nil
@@ -87,7 +88,7 @@ final class DevelopController {
                 guard !Task.isCancelled else { return }
                 hasRaw = true
                 statusText = url.lastPathComponent
-                await renderNow(edgeMax: 0)
+                await renderNow(makeRequest(edgeMax: 0, intent: .settledPreview))
                 isRendering = false
                 prepareBaseline()
             } catch {
@@ -124,31 +125,42 @@ final class DevelopController {
     /// produces a steady stream of live frames instead of starving.
     private func requestRender(edgeMax: UInt32) {
         guard hasRaw else { return }
-        requestedEdgeMax = edgeMax
-        renderRequested = true
+        requestedRender = makeRequest(
+            edgeMax: edgeMax,
+            intent: edgeMax == 0 ? .settledPreview : .interactivePreview
+        )
         guard renderTask == nil else { return }
         renderTask = Task { await renderLoop() }
     }
 
     private func renderLoop() async {
         isRendering = true
-        while renderRequested, !Task.isCancelled {
-            renderRequested = false
-            await renderNow(edgeMax: requestedEdgeMax)
+        while let request = requestedRender, !Task.isCancelled {
+            requestedRender = nil
+            await renderNow(request)
         }
         isRendering = false
         renderTask = nil
     }
 
-    private func renderNow(edgeMax: UInt32) async {
+    private func makeRequest(edgeMax: UInt32, intent: RenderIntent) -> RenderRequest {
+        RenderRequest(
+            generation: generationClock.issue(),
+            recipeJSON: develop.recipeJSON,
+            edgeMax: edgeMax,
+            intent: intent,
+            execution: .strictCPUDisplay
+        )
+    }
+
+    private func renderNow(_ request: RenderRequest) async {
         let clock = ContinuousClock()
         let start = clock.now
         do {
-            let rendered = try await renderer.renderMeasured(
-                recipeJSON: develop.recipeJSON,
-                edgeMax: edgeMax
-            )
-            guard !Task.isCancelled else { return }
+            let rendered = try await renderer.render(request: request)
+            guard !Task.isCancelled,
+                  generationClock.accepts(rendered.request.generation)
+            else { return }
             image = rendered.image
             pixelWidth = rendered.image.width
             pixelHeight = rendered.image.height
@@ -158,7 +170,7 @@ final class DevelopController {
                 + Double(elapsed.attoseconds) / 1_000_000_000_000_000
             renderID &+= 1
         } catch {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, generationClock.accepts(request.generation) else { return }
             statusText = "\(error)"
         }
     }
