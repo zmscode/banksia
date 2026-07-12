@@ -3,8 +3,24 @@
 The developer supplied 27 RAW files under `assets/`. The approximately 813 MB
 originals are intentionally ignored by Git; `corpus.sha256` identifies the exact
 local files and `corpus.tsv` records their per-file capture and render metadata.
-This corpus is an optional compatibility/oracle corpus until its licence is
-recorded and distributable DNG derivatives are produced.
+The repository owner confirmed direct permission from the photographer on
+2026-07-12. Originals remain an optional local compatibility corpus; eight
+full-resolution Bayer-DNG derivatives form the committed required CI corpus.
+
+## Required CI corpus
+
+`tests/corpus/phase2b` contains eight deterministic derivatives from the two
+Canon groups. Its manifest records each source, scenario, camera, lens, ISO,
+storage, geometry, and permission; `corpus.sha256` pins every byte. The set
+covers daylight, strong and warm backlight, high contrast, skin, neutral/black
+fabric, saturated emerald, fine texture, ISO 1000/1600/12800, and landscape and
+portrait orientations. It exercises uncompressed and lossless-JPEG DNG using
+both strips and 512×256 tiles.
+
+`zig build test-ci-corpus` uses the native DNG backend only. It verifies source
+hashes and metadata, performs all eight full engine-v2 renders, and compares
+dimension-framed RGBA bytes with committed SHA-256 baselines. This gate is part
+of `zig build test` and therefore mandatory in CI.
 
 ## Camera groups
 
@@ -32,10 +48,9 @@ camera-RGB-to-XYZ matrix, Banksia's Bradford/D50 transform, linear Rec.2020
 working space, and final sRGB encoding.
 
 The CR3 filenames provide three scene/wardrobe groups: black strip, olive, and
-emerald. The committed inventory records lens, ISO, capture time, sensor geometry,
-crop, orientation, relevant format features, and the known scene categories from
-LibRaw 0.22.1 and the filenames. CR2 scene content and licensing terms still need
-capture notes or confirmation from the rights holder; unknowns remain explicit.
+emerald. The committed inventories record lens, ISO, capture time, sensor
+geometry, crop, orientation, relevant format features, visually inspected scene
+categories, and the photographer permission conveyed by the repository owner.
 
 ## Role in Phase 2B
 
@@ -45,21 +60,28 @@ capture notes or confirmation from the rights holder; unknowns remain explicit.
   not Banksia's sensor-data path.
 - **Apple iPhone 15 Pro Max DNG:** expected-unsupported LinearRaw compatibility
   corpus and ImageIO oracle; it does not expand Phase 2B's Bayer support claim.
-- **CI:** hashes and manifest are committed, original files are not. A smaller
-  licensed DNG corpus is still required for mandatory CI.
+- **CI:** eight permission-covered DNG derivatives, their manifest, hashes,
+  exact render baselines, and ImageIO comparison metrics are committed.
 
 Run `zig build corpus` on a machine containing the local assets. It verifies all
 27 SHA-256 hashes, requires the hash and metadata path sets to agree, checks 18
-camera/lens/ISO/geometry records against Banksia's LibRaw boundary, unpacks the
-18 sensor mosaics, checks all 9 LinearRaw files fail by their expected name, and
-decodes every file to a temporary 1024px PNG through ImageIO.
+camera/lens/ISO/geometry records against Banksia's LibRaw boundary, completes a
+full engine-v2 render for all 18 Canon files, checks all 9 LinearRaw files fail
+by their expected name, and decodes every file to a temporary 1024px PNG through
+ImageIO.
 
-## Provenance and licence gaps
+## Provenance and remaining coverage gaps
 
-- Provenance: supplied locally by the developer on 2026-07-11.
-- Copyright/licence: not yet recorded; do not redistribute or commit originals.
+- Provenance: supplied locally by the developer on 2026-07-11; photographed by
+  the repository owner's brother; unrestricted project use and redistribution
+  permission confirmed by the owner on 2026-07-12.
+- Permission wording: direct photographer permission, not relabelled as CC0;
+  see `tests/corpus/phase2b/LICENSE.md`.
 - Capture settings: the committed `corpus.tsv` records LibRaw's timestamp, lens,
   ISO, sensor size, orientation, and crop for every file. Scene classification
   remains incomplete where it cannot be established from capture notes.
-- Oracle settings: current ImageIO output uses its default RAW development and
-  Display P3 profile; exact neutral oracle settings remain to be produced.
+- Oracle settings: all eight required DNGs have committed ImageIO/CoreGraphics
+  settings and SSIM/CIEDE2000 measurements in `perceptual-baseline.json`.
+- Deferred standardized coverage: tungsten, mixed light, a controlled grey
+  card, and a ColorChecker. These are explicit follow-up improvements rather
+  than hidden claims about the provisional corpus.

@@ -38,6 +38,9 @@ session without losing edits.
   fixtures.
 - [ ] Add clipped-channel highlight reconstruction or compression suitable for
   the supported DNG corpus.
+  Phase 2B supplies a conservative neutral blend near sensor white; this item
+  remains open for reconstruction of recoverable detail and user-adjustable
+  highlight behavior.
 - [ ] Ensure highlight handling is monotonic and finite.
 - [ ] Record objective and visual improvement before making the new demosaic the
   default.
@@ -104,9 +107,17 @@ them.
 
 - [ ] Basic chromatic-aberration correction.
 - [ ] Basic distortion and vignetting from a small, versioned lens-data source.
+- [ ] Decode stable lens identity, focal length, aperture, and focus distance;
+  never select or interpolate a lens profile from display-name text alone.
+- [ ] Keep distortion, lateral CA, falloff, and detail correction as independent
+  bounded models with the profile ID included in renderer/cache identity.
 - [ ] Conservative input sharpening with a true off state.
 - [ ] Conservative global denoise with a true off state.
 - [ ] Record the evidence that each is required before adding it.
+
+See the [Capture One calibration adoption audit](../../research/capture-one-adoption-audit.md)
+for the initial Canon camera/lens evidence and the rights-cleared implementation
+boundary.
 
 ## Tests
 

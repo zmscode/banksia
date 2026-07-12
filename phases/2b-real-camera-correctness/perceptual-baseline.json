@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "status": "provisional_pending_human_review",
+  "oracle": "macOS ImageIO 26.5.1 default RAW development converted to sRGB",
+  "recipe": "neutral-v2.json",
+  "sampling": "deterministic grid, at most approximately one million pixels",
+  "required_ci_cases": {
+    "canon-1dx2-backlight-action.dng": {
+      "output": "3648x5472",
+      "ssim": 0.951668,
+      "delta_e_00_median": 5.510,
+      "delta_e_00_p95": 16.431
+    },
+    "canon-1dx2-daylight-detail.dng": {
+      "output": "5472x3648",
+      "ssim": 0.838695,
+      "delta_e_00_median": 9.956,
+      "delta_e_00_p95": 17.127
+    },
+    "canon-1dx2-high-contrast.dng": {
+      "output": "5472x3648",
+      "ssim": 0.765533,
+      "delta_e_00_median": 10.716,
+      "delta_e_00_p95": 17.137
+    },
+    "canon-1dx2-high-iso12800.dng": {
+      "output": "5472x3648",
+      "ssim": 0.685856,
+      "delta_e_00_median": 14.257,
+      "delta_e_00_p95": 19.763
+    },
+    "canon-1dx2-skin-iso1000.dng": {
+      "output": "3648x5472",
+      "ssim": 0.715870,
+      "delta_e_00_median": 8.049,
+      "delta_e_00_p95": 16.950
+    },
+    "canon-1dx2-warm-backlight.dng": {
+      "output": "3648x5472",
+      "ssim": 0.954695,
+      "delta_e_00_median": 5.474,
+      "delta_e_00_p95": 16.712
+    },
+    "canon-r3-black-fabric.dng": {
+      "output": "4000x6000",
+      "ssim": 0.797476,
+      "delta_e_00_median": 11.146,
+      "delta_e_00_p95": 17.427
+    },
+    "canon-r3-emerald-fabric.dng": {
+      "output": "4000x6000",
+      "ssim": 0.790168,
+      "delta_e_00_median": 11.025,
+      "delta_e_00_p95": 13.385
+    }
+  },
+  "cases": {
+    "assets/CR2/AM4I0053.CR2": {
+      "output": "3648x5472",
+      "ssim": 0.668447,
+      "delta_e_00_median": 12.629,
+      "delta_e_00_p95": 19.769
+    },
+    "assets/CR3/S1-NU26643BlackStrip-25992-Nude Lucy-0101.CR3": {
+      "output": "4000x6000",
+      "ssim": 0.729158,
+      "delta_e_00_median": 15.000,
+      "delta_e_00_p95": 23.631
+    }
+  }
+}

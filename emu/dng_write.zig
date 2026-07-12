@@ -34,6 +34,11 @@ pub const Description = struct {
     camera_calibration_1: dng.Matrix3x3 = identity_matrix,
     analog_balance: [3]f32 = .{ 1, 1, 1 },
     calibration_illuminant_1: u16 = 23,
+    make: []const u8 = "",
+    model: []const u8 = "",
+    unique_model: []const u8 = "",
+    lens: []const u8 = "",
+    iso: ?u16 = null,
     orientation: dng.Orientation = .normal,
     /// Sensor-relative active pixels; null selects the full sensor.
     active_area: ?dng.Rect = null,
@@ -79,6 +84,10 @@ pub fn write(gpa: std.mem.Allocator, desc: Description) ![]u8 {
     assert(desc.bayer.len == @as(usize, desc.width) * desc.height);
     assert(desc.white_level > desc.black_level);
     for (desc.wb_neutral) |n| assert(n > 0);
+    text_assert(desc.make);
+    text_assert(desc.model);
+    text_assert(desc.unique_model);
+    text_assert(desc.lens);
     const orientation = @intFromEnum(desc.orientation);
     assert(orientation >= 1 and orientation <= 8);
     const geometry = geometry_of(desc);
@@ -202,6 +211,10 @@ const Assembly = struct {
     camera_calibration_1_off: u32,
     analog_balance_off: u32,
     active_area_off: u32,
+    make_off: u32,
+    model_off: u32,
+    unique_model_off: u32,
+    lens_off: u32,
     /// 0 when the single segment's values are stored inline.
     offsets_array_off: u32,
     byte_counts_array_off: u32,
@@ -209,8 +222,12 @@ const Assembly = struct {
     total: u32,
 };
 
-fn assembly_plan(grid: Grid, payloads: []const []const u8, tiled: bool) Assembly {
-    const entry_count: u32 = if (tiled) 25 else 24;
+fn assembly_plan(desc: Description, grid: Grid, payloads: []const []const u8) Assembly {
+    var entry_count: u32 = if (desc.tile != null) 25 else 24;
+    for ([_][]const u8{ desc.make, desc.model, desc.unique_model, desc.lens }) |value| {
+        if (value.len != 0) entry_count += 1;
+    }
+    if (desc.iso != null) entry_count += 1;
     const arrays = grid.count() > 1;
     const array_bytes: u64 = if (arrays) 4 * @as(u64, grid.count()) else 0;
     const values_off = @as(u64, ifd_off) + 2 + @as(u64, entry_count) * 12 + 4;
@@ -222,7 +239,12 @@ fn assembly_plan(grid: Grid, payloads: []const []const u8, tiled: bool) Assembly
     const camera_calibration_1_off = color_matrix_1_off + 72;
     const analog_balance_off = camera_calibration_1_off + 72;
     const active_area_off = analog_balance_off + 24;
-    const offsets_array_off = active_area_off + 16;
+    var text_cursor = active_area_off + 16;
+    const make_off = text_offset(&text_cursor, desc.make);
+    const model_off = text_offset(&text_cursor, desc.model);
+    const unique_model_off = text_offset(&text_cursor, desc.unique_model);
+    const lens_off = text_offset(&text_cursor, desc.lens);
+    const offsets_array_off = text_cursor;
     const byte_counts_array_off = offsets_array_off + array_bytes;
     const data_off = byte_counts_array_off + array_bytes;
     assert(data_off % 2 == 0);
@@ -242,6 +264,10 @@ fn assembly_plan(grid: Grid, payloads: []const []const u8, tiled: bool) Assembly
         .camera_calibration_1_off = @intCast(camera_calibration_1_off),
         .analog_balance_off = @intCast(analog_balance_off),
         .active_area_off = @intCast(active_area_off),
+        .make_off = @intCast(make_off),
+        .model_off = @intCast(model_off),
+        .unique_model_off = @intCast(unique_model_off),
+        .lens_off = @intCast(lens_off),
         .offsets_array_off = if (arrays) @intCast(offsets_array_off) else 0,
         .byte_counts_array_off = if (arrays) @intCast(byte_counts_array_off) else 0,
         .data_off = @intCast(data_off),
@@ -256,7 +282,7 @@ fn assemble(
     grid: Grid,
     payloads: []const []const u8,
 ) ![]u8 {
-    const plan = assembly_plan(grid, payloads, desc.tile != null);
+    const plan = assembly_plan(desc, grid, payloads);
     const out = try gpa.alloc(u8, @intCast(plan.total));
     errdefer comptime unreachable; // single allocation; all writes below succeed
     @memset(out, 0);
@@ -302,6 +328,10 @@ fn assemble(
     put_u32(out, plan.active_area_off + 4, active.x);
     put_u32(out, plan.active_area_off + 8, active.y + active.height);
     put_u32(out, plan.active_area_off + 12, active.x + active.width);
+    text_put(out, plan.make_off, desc.make);
+    text_put(out, plan.model_off, desc.model);
+    text_put(out, plan.unique_model_off, desc.unique_model);
+    text_put(out, plan.lens_off, desc.lens);
 
     // Segment data, with the offset/byte-count arrays when out-of-line.
     var data_cursor: u64 = plan.data_off;
@@ -349,6 +379,12 @@ fn entries_put(
     sink.put(258, type_short, 1, 16); // BitsPerSample
     sink.put(259, type_short, 1, compression); // Compression
     sink.put(262, type_short, 1, 32803); // Photometric: CFA
+    if (desc.make.len != 0) {
+        sink.put(271, type_ascii, @intCast(desc.make.len + 1), plan.make_off); // Make
+    }
+    if (desc.model.len != 0) {
+        sink.put(272, type_ascii, @intCast(desc.model.len + 1), plan.model_off); // Model
+    }
     if (desc.tile == null) {
         sink.put(273, type_long, grid.count(), offsets_payload); // StripOffsets
     }
@@ -357,7 +393,8 @@ fn entries_put(
     if (desc.tile == null) {
         sink.put(278, type_long, 1, desc.height); // RowsPerStrip
         sink.put(279, type_long, grid.count(), byte_counts_payload); // StripByteCounts
-    } else {
+    }
+    if (desc.tile != null) {
         sink.put(322, type_long, 1, grid.segment_width); // TileWidth
         sink.put(323, type_long, 1, grid.segment_height); // TileLength
         sink.put(324, type_long, grid.count(), offsets_payload); // TileOffsets
@@ -365,7 +402,14 @@ fn entries_put(
     }
     sink.put(33421, type_short, 2, 2 | (2 << 16)); // CFARepeatPatternDim
     sink.put(33422, type_byte, 4, pattern); // CFAPattern
+    if (desc.iso) |iso| sink.put(34855, type_short, 1, iso); // ISOSpeedRatings
+    if (desc.lens.len != 0) {
+        sink.put(42036, type_ascii, @intCast(desc.lens.len + 1), plan.lens_off); // LensModel
+    }
     sink.put(50706, type_byte, 4, 1 | (4 << 8)); // DNGVersion 1.4.0.0
+    if (desc.unique_model.len != 0) {
+        sink.put(50708, type_ascii, @intCast(desc.unique_model.len + 1), plan.unique_model_off);
+    }
     sink.put(50714, type_rational, 1, plan.black_off); // BlackLevel
     sink.put(50717, type_long, 1, desc.white_level); // WhiteLevel
     sink.put(50719, type_long, 2, plan.default_crop_origin_off); // DefaultCropOrigin
@@ -381,6 +425,7 @@ fn entries_put(
 }
 
 const type_byte: u16 = 1;
+const type_ascii: u16 = 2;
 const type_short: u16 = 3;
 const type_long: u16 = 4;
 const type_rational: u16 = 5;
@@ -433,6 +478,30 @@ fn signed_fraction_put(out: []u8, off: u32, v: f32) void {
     put_u32(out, off + 4, fraction_denominator);
 }
 
+fn text_assert(value: []const u8) void {
+    assert(value.len <= 127);
+    assert(value.len == 0 or value.len >= 4);
+    for (value) |byte| assert(byte >= 0x20 and byte <= 0x7e);
+}
+
+fn text_offset(cursor: *u64, value: []const u8) u64 {
+    if (value.len == 0) return 0;
+    const off = cursor.*;
+    cursor.* += value.len + 1;
+    cursor.* += cursor.* % 2;
+    return off;
+}
+
+fn text_put(out: []u8, off: u32, value: []const u8) void {
+    if (value.len == 0) {
+        assert(off == 0);
+        return;
+    }
+    assert(off != 0);
+    @memcpy(out[off..][0..value.len], value);
+    out[off + value.len] = 0;
+}
+
 fn expect_tag_values(
     blob: []const u8,
     tag: u16,
@@ -477,6 +546,20 @@ fn expect_tag_values(
     }
 }
 
+fn retag(blob: []u8, old: u16, new: u16) !void {
+    const ifd = std.mem.readInt(u32, blob[4..8], .little);
+    const count = std.mem.readInt(u16, blob[ifd..][0..2], .little);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const off = ifd + 2 + i * 12;
+        if (std.mem.readInt(u16, blob[off..][0..2], .little) == old) {
+            std.mem.writeInt(u16, blob[off..][0..2], new, .little);
+            return;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "write/decode roundtrip preserves every field and every sample" {
     const gpa = std.testing.allocator;
     var bayer: [6 * 4]u16 = undefined;
@@ -489,6 +572,11 @@ test "write/decode roundtrip preserves every field and every sample" {
         .black_level = 128,
         .white_level = 16000,
         .wb_neutral = .{ 0.5, 1.0, 0.75 },
+        .make = "Banksia",
+        .model = "Fixture Camera",
+        .unique_model = "Banksia Fixture Camera",
+        .lens = "Fixture 50mm",
+        .iso = 800,
         .active_area = .{ .x = 1, .y = 1, .width = 4, .height = 2 },
         .default_crop = .{ .x = 2, .y = 1, .width = 2, .height = 2 },
         .bayer = &bayer,
@@ -519,6 +607,11 @@ test "write/decode roundtrip preserves every field and every sample" {
     try std.testing.expectEqual(identity_matrix, metadata.camera_calibration_1.?);
     try std.testing.expectEqual([3]f32{ 1, 1, 1 }, metadata.analog_balance);
     try std.testing.expectEqual(@as(?u16, 23), metadata.calibration_illuminant_1);
+    try std.testing.expectEqualStrings("Banksia", metadata.make.slice());
+    try std.testing.expectEqualStrings("Fixture Camera", metadata.model.slice());
+    try std.testing.expectEqualStrings("Banksia Fixture Camera", metadata.unique_model.slice());
+    try std.testing.expectEqualStrings("Fixture 50mm", metadata.lens.slice());
+    try std.testing.expectEqual(@as(?f32, 800), metadata.iso);
 
     try std.testing.expectEqual(@as(u32, 6), sensor.width);
     try std.testing.expectEqual(@as(u32, 4), sensor.height);
@@ -598,4 +691,25 @@ test "the decoder rejects a corrupted fixture (negative space)" {
     const metadata = try dng.decode_metadata(truncated);
     try std.testing.expectEqual(@as(u32, 2), metadata.width);
     try std.testing.expectError(error.Corrupt, dng.decode(gpa, truncated));
+}
+
+test "DNG opcode lists fail by their actionable unsupported name" {
+    const gpa = std.testing.allocator;
+    const bayer = [_]u16{ 100, 200, 300, 400 };
+    const opcode_tags = [_]u16{ 51008, 51009, 51022 };
+    for (opcode_tags) |opcode_tag| {
+        const blob = try write(gpa, .{ .width = 2, .height = 2, .bayer = &bayer });
+        defer gpa.free(blob);
+        // ColorMatrix1 has an out-of-line nine-value payload, so retagging it
+        // creates a structurally valid, non-empty opcode-list-shaped entry.
+        try retag(blob, 50721, opcode_tag);
+        try std.testing.expectError(
+            error.UnsupportedGeometryOpcode,
+            dng.decode_metadata(blob),
+        );
+        try std.testing.expectError(
+            error.UnsupportedGeometryOpcode,
+            dng.decode(gpa, blob),
+        );
+    }
 }

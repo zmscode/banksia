@@ -123,20 +123,165 @@ pub fn render_decoded(
     return switch (recipe.engine_version) {
         1 => render(gpa, &raw.sensor, recipe, options),
         2 => {
-            const color_transform = color.Transform.init(raw.metadata) catch {
-                return error.InvalidColorMetadata;
-            };
-            return render_internal(
-                gpa,
-                &raw.sensor,
-                recipe,
-                options,
-                geometry.Transform.init(raw.metadata),
-                color_transform,
-            );
+            const dimensions = geometry.Transform.init(raw.metadata).output_dimensions();
+            const longest = @max(dimensions.width, dimensions.height);
+            const ratio = if (options.edge_px_max_out == 0)
+                0
+            else
+                longest / options.edge_px_max_out;
+            const factor = ratio & ~@as(u32, 1);
+            if (factor >= 2) {
+                var preview = try preview_raw_make(gpa, raw, factor);
+                defer preview.deinit(gpa);
+                return render_decoded_v2(gpa, &preview, recipe, options);
+            }
+            return render_decoded_v2(gpa, raw, recipe, options);
         },
         else => error.UnsupportedEngineVersion,
     };
+}
+
+fn render_decoded_v2(
+    gpa: std.mem.Allocator,
+    raw: *const dng.DecodedRaw,
+    recipe: Recipe,
+    options: RenderOptions,
+) RenderError!Rendered {
+    const color_transform = color.Transform.init(raw.metadata) catch {
+        return error.InvalidColorMetadata;
+    };
+    return render_internal(
+        gpa,
+        &raw.sensor,
+        recipe,
+        options,
+        geometry.Transform.init(raw.metadata),
+        color_transform,
+    );
+}
+
+fn preview_raw_make(
+    gpa: std.mem.Allocator,
+    source: *const dng.DecodedRaw,
+    factor: u32,
+) RenderError!dng.DecodedRaw {
+    assert(factor >= 2);
+    assert(factor % 2 == 0);
+    const width = (source.sensor.width + factor - 1) / factor;
+    const height = (source.sensor.height + factor - 1) / factor;
+    const bayer = try gpa.alloc(u16, @as(usize, width) * height);
+    errdefer gpa.free(bayer);
+    preview_bayer_reduce(
+        bayer,
+        width,
+        height,
+        source.sensor.bayer,
+        source.sensor.width,
+        source.sensor.height,
+        factor,
+    );
+
+    var metadata = source.metadata;
+    metadata.width = width;
+    metadata.height = height;
+    metadata.active_area = rect_scale(source.metadata.active_area, factor);
+    const crop_sensor = dng.Rect{
+        .x = source.metadata.active_area.x + source.metadata.default_crop.x,
+        .y = source.metadata.active_area.y + source.metadata.default_crop.y,
+        .width = source.metadata.default_crop.width,
+        .height = source.metadata.default_crop.height,
+    };
+    const crop = rect_scale(crop_sensor, factor);
+    metadata.default_crop = .{
+        .x = crop.x - metadata.active_area.x,
+        .y = crop.y - metadata.active_area.y,
+        .width = crop.width,
+        .height = crop.height,
+    };
+    return .{
+        .metadata = metadata,
+        .sensor = .{
+            .width = width,
+            .height = height,
+            .cfa = source.sensor.cfa,
+            .black_level = source.sensor.black_level,
+            .white_level = source.sensor.white_level,
+            .black_level_site = source.sensor.black_level_site,
+            .white_level_site = source.sensor.white_level_site,
+            .wb_neutral = source.sensor.wb_neutral,
+            .bayer = bayer,
+        },
+    };
+}
+
+fn rect_scale(rect: dng.Rect, factor: u32) dng.Rect {
+    assert(rect.width > 0);
+    assert(rect.height > 0);
+    const right = (@as(u64, rect.x) + rect.width + factor - 1) / factor;
+    const bottom = (@as(u64, rect.y) + rect.height + factor - 1) / factor;
+    const x = rect.x / factor;
+    const y = rect.y / factor;
+    return .{
+        .x = x,
+        .y = y,
+        .width = @intCast(right - x),
+        .height = @intCast(bottom - y),
+    };
+}
+
+fn preview_bayer_reduce(
+    target: []u16,
+    width_out: u32,
+    height_out: u32,
+    source: []const u16,
+    width: u32,
+    height: u32,
+    factor: u32,
+) void {
+    assert(target.len == @as(usize, width_out) * height_out);
+    assert(source.len == @as(usize, width) * height);
+    assert(factor >= 2);
+    assert(factor % 2 == 0);
+    var y: u32 = 0;
+    while (y < height_out) : (y += 1) {
+        var x: u32 = 0;
+        while (x < width_out) : (x += 1) {
+            const x_end = @min(width, (x + 1) * factor);
+            const y_end = @min(height, (y + 1) * factor);
+            var source_y = preview_site_first(y * factor, y & 1, height);
+            var sum: u64 = 0;
+            var count: u32 = 0;
+            while (source_y < y_end) : (source_y += 2) {
+                var source_x = preview_site_first(x * factor, x & 1, width);
+                while (source_x < x_end) : (source_x += 2) {
+                    sum += source[@as(usize, source_y) * width + source_x];
+                    count += 1;
+                }
+            }
+            if (count == 0) {
+                const source_x = preview_site_last(x & 1, width);
+                const fallback_y = preview_site_last(y & 1, height);
+                sum = source[@as(usize, fallback_y) * width + source_x];
+                count = 1;
+            }
+            target[@as(usize, y) * width_out + x] = @intCast(sum / count);
+        }
+    }
+}
+
+fn preview_site_first(start: u32, parity: u32, limit: u32) u32 {
+    assert(parity <= 1);
+    assert(limit > 0);
+    const candidate = start + ((start ^ parity) & 1);
+    return if (candidate < limit) candidate else limit;
+}
+
+fn preview_site_last(parity: u32, limit: u32) u32 {
+    assert(parity <= 1);
+    assert(limit > 0);
+    const last = limit - 1;
+    if (last & 1 == parity or last == 0) return last;
+    return last - 1;
 }
 
 fn render_internal(
@@ -167,9 +312,18 @@ fn render_internal(
     const count = @as(usize, sensor.width) * sensor.height;
     const mosaic = try arena.alloc(f32, count);
     var planes = try image.Planes.init(arena, sensor.width, sensor.height);
+    var applied_wb_gains: ?[3]f32 = null;
 
     for (0..ops.len) |i| {
-        try op_apply(ops.get(i), sensor, mosaic, &planes, color_transform);
+        try op_apply(
+            ops.get(i),
+            recipe.engine_version,
+            sensor,
+            mosaic,
+            &planes,
+            color_transform,
+            &applied_wb_gains,
+        );
     }
     if (color_transform != null) color.working_to_linear_srgb(&planes);
 
@@ -272,10 +426,12 @@ fn planes_downsample(
 
 fn op_apply(
     op: Op,
+    engine_version: u32,
     sensor: *const dng.SensorData,
     mosaic: []f32,
     planes: *image.Planes,
     color_transform: ?color.Transform,
+    applied_wb_gains: *?[3]f32,
 ) RenderError!void {
     switch (op) {
         .black_point => {
@@ -303,11 +459,21 @@ fn op_apply(
             {
                 const gains = wb_gains(wb, sensor.wb_neutral);
                 kernel_wb(mosaic, sensor.width, sensor.height, sensor.cfa, gains);
+                applied_wb_gains.* = gains;
             }
         },
         .demosaic => {
             try demosaic_dispatch(sensor.cfa, mosaic, planes);
-            if (color_transform) |value| value.camera_to_working(planes);
+            if (color_transform) |value| {
+                if (engine_version >= 2) {
+                    if (applied_wb_gains.*) |gains| {
+                        kernel_highlight_recovery_balanced(planes, gains);
+                    } else {
+                        kernel_highlight_recovery_unbalanced(planes, sensor.wb_neutral);
+                    }
+                }
+                value.camera_to_working(planes);
+            }
         },
         .exposure => {
             const gain = std.math.exp2(op.exposure.ev);
@@ -317,6 +483,11 @@ fn op_apply(
         },
         .tone_curve => {
             const contrast = op.tone_curve.contrast;
+            // A neutral v2 tone operation is an identity in the linear
+            // working space. Gamut/output clipping belongs after the working
+            // space is converted to linear sRGB; clipping Rec.2020 channels
+            // here creates false highlight hues.
+            if (engine_version >= 2 and contrast == 0) return;
             for ([_][]f32{ planes.r, planes.g, planes.b }) |plane| {
                 kernel_tone_curve(plane, contrast);
             }
@@ -461,6 +632,63 @@ fn kernel_gain(plane: []f32, gain: f32) void {
         plane[i..][0..vector_len].* = v * gain_v;
     }
     while (i < plane.len) : (i += 1) plane[i] *= gain;
+}
+
+/// White balance cannot recover a channel that already hit sensor white. Near
+/// that boundary, progressively remove the false chroma produced when clipped
+/// camera channels receive different WB gains. Values below 80% of the second
+/// brightest channel's pre-WB range are bit-identical; clipped highlights converge
+/// to the strongest surviving common camera-RGB value.
+fn kernel_highlight_recovery_balanced(planes: *image.Planes, gains: [3]f32) void {
+    assert(planes.r.len == planes.g.len);
+    assert(planes.r.len == planes.b.len);
+    for (gains) |gain| assert(gain > 0);
+
+    const start: f32 = 0.8;
+    const scale: f32 = 1 / (1 - start);
+    for (planes.r, planes.g, planes.b) |*r, *g, *b| {
+        const sensor_peak = middle3(r.* / gains[0], g.* / gains[1], b.* / gains[2]);
+        const blend = std.math.clamp((sensor_peak - start) * scale, 0, 1);
+        if (blend == 0) continue;
+        const neutral = @min(r.*, @min(g.*, b.*));
+        r.* += (neutral - r.*) * blend;
+        g.* += (neutral - g.*) * blend;
+        b.* += (neutral - b.*) * blend;
+    }
+}
+
+/// Native DNG colour selection is performed by the camera transform rather
+/// than Bayer-domain gains. Convert each camera channel to its neutral-relative
+/// intensity for blending, then return it to the original camera-RGB ratios.
+fn kernel_highlight_recovery_unbalanced(planes: *image.Planes, neutral: [3]f32) void {
+    assert(planes.r.len == planes.g.len);
+    assert(planes.r.len == planes.b.len);
+    for (neutral) |value| assert(value > 0);
+
+    const neutral_max = @max(neutral[0], @max(neutral[1], neutral[2]));
+    const ratios = [3]f32{
+        neutral[0] / neutral_max,
+        neutral[1] / neutral_max,
+        neutral[2] / neutral_max,
+    };
+    const start: f32 = 0.8;
+    const scale: f32 = 1 / (1 - start);
+    for (planes.r, planes.g, planes.b) |*r, *g, *b| {
+        const sensor_peak = middle3(r.*, g.*, b.*);
+        const blend = std.math.clamp((sensor_peak - start) * scale, 0, 1);
+        if (blend == 0) continue;
+        const common = @min(
+            r.* / ratios[0],
+            @min(g.* / ratios[1], b.* / ratios[2]),
+        );
+        r.* += (common * ratios[0] - r.*) * blend;
+        g.* += (common * ratios[1] - g.*) * blend;
+        b.* += (common * ratios[2] - b.*) * blend;
+    }
+}
+
+fn middle3(a: f32, b: f32, c: f32) f32 {
+    return @max(@min(a, b), @min(@max(a, b), c));
 }
 
 /// Contrast as a linear blend toward the smoothstep S-curve, on values
@@ -817,6 +1045,58 @@ test "box downsample bins tile the source and average exactly" {
     kernel_box_downsample(&uneven, 2, 1, &flat, 5, 1, &scratch);
     try std.testing.expectEqual(@as(f32, 0.25), uneven[0]);
     try std.testing.expectEqual(@as(f32, 0.25), uneven[1]);
+}
+
+test "v2 highlight recovery is neutral below sensor white" {
+    var r = [_]f32{ 0.8, 2.0, 1.9 };
+    var g = [_]f32{ 0.7, 1.0, 0.95 };
+    var b = [_]f32{ 0.6, 1.5, 1.425 };
+    var planes = image.Planes{
+        .width = 3,
+        .height = 1,
+        .r = &r,
+        .g = &g,
+        .b = &b,
+    };
+    kernel_highlight_recovery_balanced(&planes, .{ 2, 1, 1.5 });
+
+    // Nothing below 80% of the sensor range changes.
+    try std.testing.expectEqual(@as(f32, 0.8), r[0]);
+    try std.testing.expectEqual(@as(f32, 0.7), g[0]);
+    try std.testing.expectEqual(@as(f32, 0.6), b[0]);
+    // A fully clipped neutral converges to its surviving common value.
+    try std.testing.expectEqual(@as(f32, 1), r[1]);
+    try std.testing.expectEqual(@as(f32, 1), g[1]);
+    try std.testing.expectEqual(@as(f32, 1), b[1]);
+    // Recovery ramps continuously through the final 10%.
+    try std.testing.expectApproxEqAbs(@as(f32, 1.1875), r[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.95), g[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.06875), b[2], 1e-6);
+}
+
+test "v2 unbalanced DNG highlight recovery follows AsShotNeutral" {
+    var r = [_]f32{ 0.4, 1.0, 1.0 };
+    var g = [_]f32{ 0.7, 1.0, 0.2 };
+    var b = [_]f32{ 0.5, 1.0, 0.1 };
+    var planes = image.Planes{
+        .width = 3,
+        .height = 1,
+        .r = &r,
+        .g = &g,
+        .b = &b,
+    };
+    kernel_highlight_recovery_unbalanced(&planes, .{ 0.5, 1, 0.75 });
+
+    try std.testing.expectEqual(@as(f32, 0.4), r[0]);
+    try std.testing.expectEqual(@as(f32, 0.7), g[0]);
+    try std.testing.expectEqual(@as(f32, 0.5), b[0]);
+    try std.testing.expectEqual(@as(f32, 0.5), r[1]);
+    try std.testing.expectEqual(@as(f32, 1), g[1]);
+    try std.testing.expectEqual(@as(f32, 0.75), b[1]);
+    // One legitimately saturated colour channel is not a neutral highlight.
+    try std.testing.expectEqual(@as(f32, 1), r[2]);
+    try std.testing.expectEqual(@as(f32, 0.2), g[2]);
+    try std.testing.expectEqual(@as(f32, 0.1), b[2]);
 }
 
 test "a flat grey field survives the pipeline as flat grey" {

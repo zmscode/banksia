@@ -30,7 +30,7 @@ fi
 count=0
 find "$asset_root/CR2" "$asset_root/CR3" -type f \( -iname '*.cr2' -o -iname '*.cr3' \) \
     -print0 | while IFS= read -r -d '' path; do
-    zig-out/bin/banksia inspect "$path" --decode >/dev/null
+    zig-out/bin/banksia inspect "$path" --render >/dev/null
     sips -s format png --resampleHeightWidthMax 1024 "$path" --out "$tmp" >/dev/null 2>&1
     count=$((count + 1))
     printf '%s\n' "$count" > "$tmp/count"
@@ -95,7 +95,7 @@ if [ "$actual_linear" -ne "$expected_linear" ]; then
 fi
 
 actual=$((actual_supported + actual_linear))
-printf 'corpus: %d hashes verified; %d mosaics decoded; ' "$actual" "$actual_supported"
+printf 'corpus: %d hashes verified; %d full v2 renders; ' "$actual" "$actual_supported"
 printf '%d metadata rows checked; %d LinearRaw files rejected by name; ' \
     "$actual_supported" "$actual_linear"
 printf '%d ImageIO previews decoded\n' "$actual"

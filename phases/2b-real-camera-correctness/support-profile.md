@@ -28,7 +28,7 @@ reported as malformed.
 | Geometry | TIFF `Orientation` 1–8; integer `ActiveArea`, `DefaultCropOrigin`, and `DefaultCropSize` |
 | Levels | Scalar DNG or 2×2 LibRaw black/white maps |
 | Colour | `ColorMatrix1/2`, `CameraCalibration1/2`, `AnalogBalance`, `AsShotNeutral`; Bradford adaptation into linear Rec.2020 |
-| Opcodes | Geometry/processing opcodes are not yet applied |
+| Opcodes | Geometry/processing opcodes return `UnsupportedGeometryOpcode` |
 
 Fractional default-crop geometry is valid DNG but currently returns
 `UnsupportedGeometry`; malformed or out-of-sensor rectangles return `Corrupt`.
@@ -54,3 +54,7 @@ A camera/workflow becomes declared-supported only when the corpus manifest
 records provenance, licence, SHA-256, expected dimensions/orientation/crop, and
 relevant DNG features, and CI decodes and renders it successfully. Accidental
 compatibility is not a support claim.
+
+Canon EOS-1D X Mark II CR2 and Canon EOS R3 CR3 now satisfy this rule through
+the permission-covered committed DNG derivatives and mandatory render gate in
+`tests/corpus/phase2b`.

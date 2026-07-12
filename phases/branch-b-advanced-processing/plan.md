@@ -18,6 +18,8 @@ without attempting broad Capture One parity.
 #### B1. Camera profiles
 
 - [ ] Immutable matrix + optional curves + optional LUT format.
+- [ ] Keep camera colour profile and camera tone curve independently selectable.
+- [ ] Add camera/ISO calibration records with stable IDs and provenance.
 - [ ] Profile provenance and supported illuminants.
 - [ ] ColorChecker solver.
 - [ ] Dual-illuminant interpolation.
@@ -44,7 +46,8 @@ without attempting broad Capture One parity.
 
 #### B4. Detail processing
 
-- [ ] Lens correction expansion.
+- [ ] Lens correction expansion over focal length, aperture, and available focus
+  distance, with distortion, lateral CA, falloff, and detail models independent.
 - [ ] Improved sharpening.
 - [ ] Profiled denoise.
 - [ ] Clarity/structure.
@@ -64,6 +67,11 @@ without attempting broad Capture One parity.
 - [ ] Proposed default preferred over bare matrix in ≥ 60% of at least 100
   randomized comparisons with confidence interval reported.
 - [ ] Three demanding shoots completed without another RAW developer.
+
+The [Capture One calibration adoption audit](../../research/capture-one-adoption-audit.md)
+records the evidence behind this split. Capture One extraction artifacts guide
+architecture and comparison only; Banksia profiles require distributable
+provenance.
 
 ### Invest gate
 

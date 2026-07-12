@@ -151,6 +151,9 @@ pub const Error = error{
     /// Valid geometry that requires fractional crop coordinates or another
     /// transform outside the current integer crop profile.
     UnsupportedGeometry,
+    /// DNG OpcodeList1/2/3 is present. Opcodes may alter pixels or geometry;
+    /// silently ignoring an unknown list would render the wrong crop.
+    UnsupportedGeometryOpcode,
     /// Black-level repeat maps beyond the supported 2×2 CFA-site layout.
     UnsupportedBlackLevel,
     /// Image larger than `image.edge_px_max` on a side.
@@ -214,6 +217,9 @@ const tag_calibration_illuminant_2: u16 = 50779;
 const tag_active_area: u16 = 50829;
 const tag_camera_calibration_signature: u16 = 50931;
 const tag_profile_calibration_signature: u16 = 50932;
+const tag_opcode_list_1: u16 = 51008;
+const tag_opcode_list_2: u16 = 51009;
+const tag_opcode_list_3: u16 = 51022;
 
 const photometric_cfa: u32 = 32803;
 const photometric_linear_raw: u32 = 34892;
@@ -465,11 +471,15 @@ fn metadata_from_ifd(
     ifd0: *const Ifd,
     exif: ?Ifd,
 ) Error!Metadata {
+    try geometry_opcodes_reject(ifd, ifd0);
     const exif_ptr: ?*const Ifd = if (exif) |*value| value else null;
     const width = try require_scalar(r, ifd, tag_image_width);
     const height = try require_scalar(r, ifd, tag_image_height);
     if (width == 0 or height == 0) return error.Corrupt;
     if (width > image.edge_px_max or height > image.edge_px_max) {
+        return error.UnsupportedDimensions;
+    }
+    if (@as(u64, width) * height > image.pixel_count_max) {
         return error.UnsupportedDimensions;
     }
     if (try require_scalar(r, ifd, tag_bits_per_sample) != 16) {
@@ -568,6 +578,15 @@ fn metadata_from_ifd(
         ),
         .analog_balance = try analog_balance_read(r, ifd, ifd0),
     };
+}
+
+fn geometry_opcodes_reject(ifd: *const Ifd, ifd0: *const Ifd) Error!void {
+    const tags = [_]u16{ tag_opcode_list_1, tag_opcode_list_2, tag_opcode_list_3 };
+    for (tags) |tag| {
+        if (ifd.find(tag) != null or ifd0.find(tag) != null) {
+            return error.UnsupportedGeometryOpcode;
+        }
+    }
 }
 
 fn sensor_from_ifd(
@@ -1093,6 +1112,30 @@ test "truncated and garbage input is Corrupt, never a crash" {
     );
 }
 
+test "independent TinyDNG endian and lossless JPEG fixtures decode exactly" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { bytes: []const u8, width: u32, height: u32 }{
+        .{ .bytes = @embedFile("fixtures/tinydng-big-endian.dng"), .width = 8, .height = 6 },
+        .{
+            .bytes = @embedFile("fixtures/tinydng-lossless-jpeg.dng"),
+            .width = 16,
+            .height = 3,
+        },
+    };
+    for (cases) |case| {
+        var raw = try decode_raw(gpa, case.bytes);
+        defer raw.deinit(gpa);
+        try std.testing.expectEqual(case.width, raw.sensor.width);
+        try std.testing.expectEqual(case.height, raw.sensor.height);
+        try std.testing.expectEqual(@as(usize, 48), raw.sensor.bayer.len);
+        for (raw.sensor.bayer, 0..) |sample, index| {
+            const x = index % 8;
+            const y = index / 8;
+            try std.testing.expectEqual(@as(u16, @intCast(512 + y * 1000 + x * 73)), sample);
+        }
+    }
+}
+
 /// Overwrite one IFD0 entry of a little-endian fixture in place. Tests
 /// know the writer's layout (IFD at offset 8); this keeps negative-space
 /// cases one field away from a valid file instead of hand-built blobs.
@@ -1251,6 +1294,18 @@ test "geometry tags distinguish malformed bounds from unsupported fractions" {
         test_entry_patch(blob, tag_default_crop_origin, neutral_off);
         try std.testing.expectError(error.UnsupportedGeometry, decode_metadata(blob));
     }
+}
+
+test "pixel-area bound rejects hostile dimensions before allocation" {
+    const gpa = std.testing.allocator;
+    const dng_write = @import("dng_write.zig");
+    const bayer = [_]u16{ 100, 200, 300, 400 };
+    const blob = try dng_write.write(gpa, .{ .width = 2, .height = 2, .bayer = &bayer });
+    defer gpa.free(blob);
+    test_entry_patch(blob, tag_image_width, image.edge_px_max);
+    test_entry_patch(blob, tag_image_height, image.edge_px_max);
+    try std.testing.expectError(error.UnsupportedDimensions, decode_metadata(blob));
+    try std.testing.expectError(error.UnsupportedDimensions, decode(gpa, blob));
 }
 
 fn test_ifd_entry(

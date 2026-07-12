@@ -8,6 +8,10 @@ const assert = std.debug.assert;
 /// Longest edge the engine will process. A bound, not a target: 65535 keeps
 /// `width * height` inside u32 and any byte size inside u64 by construction.
 pub const edge_px_max: u32 = 65535;
+/// A separate area bound prevents a hostile square image near edge_px_max
+/// from requesting multi-gigabyte mosaics and planes. This still covers the
+/// 48 MP Phase 2B corpus with headroom.
+pub const pixel_count_max: u64 = 64 * 1024 * 1024;
 
 comptime {
     // The pixel count of the largest image must fit in usize arithmetic on
@@ -27,6 +31,7 @@ pub const Planes = struct {
         assert(height > 0);
         assert(width <= edge_px_max);
         assert(height <= edge_px_max);
+        assert(@as(u64, width) * height <= pixel_count_max);
         const count = @as(usize, width) * @as(usize, height);
         const r = try gpa.alloc(f32, count);
         errdefer gpa.free(r);

@@ -48,7 +48,8 @@ is the default; use `-Dlibraw-prefix=/path` for another installation prefix.
 zig build              # build the CLI
 zig build test         # unit tests + tidy lint
 zig build render -- <raw.dng> <recipe.json> <out.png>
-zig-out/bin/banksia inspect <raw> [--decode]  # metadata or full mosaic probe
+zig-out/bin/banksia inspect <raw> [--decode|--render]  # metadata, mosaic, or v2 probe
+zig build test-ci-corpus                    # 8 committed licensed DNG full renders
 zig build golden       # 25-case v1/v2 golden-render conformance harness
 zig build bench        # ReleaseFast catalog/storage latency gates
 zig build sim          # 10k seeded vault/catalog crash workloads

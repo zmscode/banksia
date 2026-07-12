@@ -3,8 +3,10 @@
 //!   banksia render <raw.dng> <recipe.json> <out.png>
 //!   banksia synth <out.dng> [<width> <height>]
 //!       write a synthetic demo DNG (dev fixture; defaults to 512x384)
-//!   banksia inspect <raw> [--decode]
-//!       parse RAW metadata; optionally unpack and validate the sensor mosaic
+//!   banksia convert-dng <raw> <out.dng> <storage>
+//!       create a deterministic native-DNG corpus derivative
+//!   banksia inspect <raw> [--decode|--render]
+//!       parse metadata; optionally unpack the mosaic or complete a v2 render
 //!
 //! The CLI reads inputs itself; emu stays a pure function over the bytes
 //! it is handed, and every output byte goes through wombat (which owns
@@ -34,12 +36,25 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "inspect")) {
         const raw_path = args.next() orelse return usage();
         var decode_pixels = false;
+        var render_pixels = false;
         if (args.next()) |option| {
-            if (!std.mem.eql(u8, option, "--decode")) return usage();
-            decode_pixels = true;
+            if (std.mem.eql(u8, option, "--decode")) {
+                decode_pixels = true;
+            } else if (std.mem.eql(u8, option, "--render")) {
+                decode_pixels = true;
+                render_pixels = true;
+            } else return usage();
         }
         if (args.next() != null) return usage();
-        return inspect_file(gpa, io, raw_path, decode_pixels);
+        return inspect_file(gpa, io, raw_path, decode_pixels, render_pixels);
+    }
+    if (std.mem.eql(u8, command, "convert-dng")) {
+        const raw_path = args.next() orelse return usage();
+        const out_path = args.next() orelse return usage();
+        const storage_name = args.next() orelse return usage();
+        if (args.next() != null) return usage();
+        const storage = storage_parse(storage_name) orelse return usage();
+        return convert_dng_file(gpa, io, raw_path, out_path, storage);
     }
     if (std.mem.eql(u8, command, "synth")) {
         const out_path = args.next() orelse return usage();
@@ -58,11 +73,106 @@ pub fn main(init: std.process.Init) !void {
     return usage();
 }
 
+const FixtureStorage = enum {
+    uncompressed_strip,
+    uncompressed_tile,
+    lossless_strip,
+    lossless_tile,
+};
+
+fn storage_parse(name: []const u8) ?FixtureStorage {
+    inline for (std.meta.fields(FixtureStorage)) |field| {
+        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+fn convert_dng_file(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    raw_path: []const u8,
+    out_path: []const u8,
+    storage: FixtureStorage,
+) !void {
+    const cwd = std.Io.Dir.cwd();
+    const bytes = cwd.readFileAlloc(io, raw_path, gpa, file_bytes_max) catch |err| {
+        return fail("cannot read raw '{s}': {s}", .{ raw_path, @errorName(err) });
+    };
+    defer gpa.free(bytes);
+    var raw = emu.raw.decode_raw(gpa, bytes) catch |err| {
+        return fail("cannot decode '{s}': {s}", .{ raw_path, @errorName(err) });
+    };
+    defer raw.deinit(gpa);
+
+    const camera_to_xyz = raw.metadata.camera_to_xyz orelse {
+        return fail("'{s}' has no backend camera matrix", .{raw_path});
+    };
+    const xyz_to_camera = emu.color.Mat3.init(camera_to_xyz).inverse() catch |err| {
+        return fail("cannot invert camera matrix for '{s}': {s}", .{ raw_path, @errorName(err) });
+    };
+    const blob = try corpus_dng_make(gpa, &raw, xyz_to_camera.values, storage);
+    defer gpa.free(blob);
+    wombat.vfs.user_file_write(io, cwd, out_path, blob) catch |err| {
+        return fail("cannot write DNG '{s}': {s}", .{ out_path, @errorName(err) });
+    };
+    try status(io, "converted {s} -> {s} ({d} bytes, {s})\n", .{
+        raw_path,
+        out_path,
+        blob.len,
+        @tagName(storage),
+    });
+}
+
+fn corpus_dng_make(
+    gpa: std.mem.Allocator,
+    raw: *const emu.dng.DecodedRaw,
+    color_matrix: emu.dng.Matrix3x3,
+    storage: FixtureStorage,
+) ![]u8 {
+    const active = raw.metadata.active_area;
+    const crop = raw.metadata.default_crop;
+    const compression: emu.dng_write.Compression = switch (storage) {
+        .uncompressed_strip, .uncompressed_tile => .none,
+        .lossless_strip, .lossless_tile => .lossless_jpeg,
+    };
+    const tile: ?emu.dng_write.Tile = switch (storage) {
+        .uncompressed_tile, .lossless_tile => .{ .width = 512, .height = 256 },
+        .uncompressed_strip, .lossless_strip => null,
+    };
+    return emu.dng_write.write(gpa, .{
+        .width = raw.sensor.width,
+        .height = raw.sensor.height,
+        .cfa = raw.sensor.cfa,
+        .black_level = @intFromFloat(@round(raw.sensor.black_level)),
+        .white_level = @intFromFloat(@round(raw.sensor.white_level)),
+        .wb_neutral = raw.sensor.wb_neutral,
+        .color_matrix_1 = color_matrix,
+        .calibration_illuminant_1 = 21,
+        .make = raw.metadata.make.slice(),
+        .model = raw.metadata.model.slice(),
+        .unique_model = raw.metadata.unique_model.slice(),
+        .lens = raw.metadata.lens.slice(),
+        .iso = if (raw.metadata.iso) |iso| @intFromFloat(@round(iso)) else null,
+        .orientation = raw.metadata.orientation,
+        .active_area = active,
+        .default_crop = .{
+            .x = active.x + crop.x,
+            .y = active.y + crop.y,
+            .width = crop.width,
+            .height = crop.height,
+        },
+        .bayer = raw.sensor.bayer,
+        .compression = compression,
+        .tile = tile,
+    });
+}
+
 fn inspect_file(
     gpa: std.mem.Allocator,
     io: std.Io,
     raw_path: []const u8,
     decode_pixels: bool,
+    render_pixels: bool,
 ) !void {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, raw_path, gpa, file_bytes_max) catch |err| {
         return fail("cannot read raw '{s}': {s}", .{ raw_path, @errorName(err) });
@@ -147,6 +257,22 @@ fn inspect_file(
             raw.sensor.bayer.len,
             raw.sensor.bayer.len * @sizeOf(u16),
         });
+        if (render_pixels) {
+            var rendered = emu.pipeline.render_decoded(
+                gpa,
+                raw,
+                .{ .engine_version = 2, .ops = &emu.recipe.default_ops },
+                .{},
+            ) catch |err| {
+                return fail("cannot render '{s}': {s}", .{ raw_path, @errorName(err) });
+            };
+            defer rendered.deinit(gpa);
+            try status(io, "  rendered v2: {d}x{d} ({d} bytes)\n", .{
+                rendered.width,
+                rendered.height,
+                rendered.rgba.len,
+            });
+        }
     }
 }
 
@@ -269,7 +395,8 @@ fn usage() error{Usage} {
     std.debug.print(
         \\usage: banksia render <raw.dng> <recipe.json> <out.png>
         \\       banksia synth <out.dng> [<width> <height>]
-        \\       banksia inspect <raw> [--decode]
+        \\       banksia convert-dng <raw> <out.dng> <storage>
+        \\       banksia inspect <raw> [--decode|--render]
         \\
     , .{});
     return error.Usage;

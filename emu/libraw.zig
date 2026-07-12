@@ -5,6 +5,7 @@
 //! brightness, and output encoding are deliberately not used.
 
 const std = @import("std");
+const color_math = @import("color.zig");
 const dng = @import("dng.zig");
 const image = @import("image.zig");
 
@@ -100,6 +101,9 @@ fn metadata_from_context(context: *c.libraw_data_t) Error!dng.Metadata {
     if (width > image.edge_px_max or height > image.edge_px_max) {
         return error.UnsupportedDimensions;
     }
+    if (@as(u64, width) * height > image.pixel_count_max) {
+        return error.UnsupportedDimensions;
+    }
 
     const black_sites = try black_levels_read(context);
     const white: f32 = @floatFromInt(context.color.maximum);
@@ -159,17 +163,28 @@ fn default_crop_read(context: *const c.libraw_data_t) Error!dng.Rect {
 }
 
 fn camera_to_xyz_read(context: *const c.libraw_data_t) Error!?dng.Matrix3x3 {
-    var matrix: dng.Matrix3x3 = undefined;
+    return camera_to_xyz_from_libraw(context.color.cam_xyz);
+}
+
+fn camera_to_xyz_from_libraw(cam_xyz: anytype) Error!?dng.Matrix3x3 {
+    var xyz_to_camera: dng.Matrix3x3 = undefined;
     var nonzero = false;
-    for (0..3) |xyz| {
-        for (0..3) |camera| {
-            const value = context.color.cam_xyz[xyz][camera];
+    for (0..3) |camera| {
+        for (0..3) |xyz| {
+            // Despite the historical cam_xyz name and API documentation,
+            // LibRaw's per-camera table is the DNG-style XYZ-to-camera
+            // matrix, indexed [camera channel][XYZ component]. Its own
+            // raw-identify tool reports the same values as XYZ->CamRGB.
+            const value = cam_xyz[camera][xyz];
             if (!std.math.isFinite(value)) return error.InvalidMetadata;
             nonzero = nonzero or value != 0;
-            matrix[xyz * 3 + camera] = value;
+            xyz_to_camera[camera * 3 + xyz] = value;
         }
     }
-    return if (nonzero) matrix else null;
+    if (!nonzero) return null;
+    return (color_math.Mat3.init(xyz_to_camera).inverse() catch {
+        return error.InvalidMetadata;
+    }).values;
 }
 
 fn cfa_read(context: *c.libraw_data_t) Error![4]dng.CfaColor {
@@ -247,6 +262,21 @@ fn c_text(array: anytype) dng.Text {
 
 test "installed LibRaw exposes a supported version" {
     try std.testing.expect(std.mem.startsWith(u8, version(), "0.22."));
+}
+
+test "LibRaw XYZ-to-camera table is inverted at the backend boundary" {
+    const cam_xyz = [4][3]f32{
+        .{ 1, 2, 0 },
+        .{ 0, 1, 3 },
+        .{ 0, 0, 1 },
+        .{ 0, 0, 0 },
+    };
+    const actual = (try camera_to_xyz_from_libraw(cam_xyz)).?;
+    try std.testing.expectEqualSlices(f32, &.{
+        1, -2, 6,
+        0, 1,  -3,
+        0, 0,  1,
+    }, &actual);
 }
 
 test "native DNG and LibRaw agree at the sensor boundary" {

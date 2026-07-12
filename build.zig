@@ -10,20 +10,7 @@ pub fn build(b: *std.Build) void {
     ) orelse "/opt/homebrew/opt/libraw";
 
     // ---- emu: the develop engine module --------------------------------------
-    const emu_mod = b.createModule(.{
-        .root_source_file = b.path("emu/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    emu_mod.addIncludePath(.{
-        .cwd_relative = b.fmt("{s}/include", .{libraw_prefix}),
-    });
-    emu_mod.addLibraryPath(.{
-        .cwd_relative = b.fmt("{s}/lib", .{libraw_prefix}),
-    });
-    emu_mod.linkSystemLibrary("raw_r", .{ .use_pkg_config = .no });
-    emu_mod.linkSystemLibrary("c++", .{});
+    const emu_mod = emu_module(b, target, optimize, libraw_prefix);
 
     // wombat provides the durable vault and catalog baseline; lyrebird
     // (similarity, Phase 4) remains a layout/test stub.
@@ -183,6 +170,59 @@ pub fn build(b: *std.Build) void {
     const corpus_step = b.step("corpus", "Verify and ImageIO-decode the local RAW corpus");
     corpus_step.dependOn(&corpus_check.step);
 
+    // ---- `test-ci-corpus`: committed licensed DNG render gate ---------------------
+    const ci_corpus_emu = emu_module(b, target, .ReleaseSafe, libraw_prefix);
+    const ci_corpus = b.addExecutable(.{
+        .name = "ci_corpus",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/ci_corpus.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "emu", .module = ci_corpus_emu }},
+        }),
+    });
+    const run_ci_corpus = b.addRunArtifact(ci_corpus);
+    run_ci_corpus.setCwd(b.path("."));
+    run_ci_corpus.has_side_effects = true;
+    if (b.args) |args| run_ci_corpus.addArgs(args);
+    const ci_corpus_step = b.step("test-ci-corpus", "Render the committed Phase 2B DNG corpus");
+    ci_corpus_step.dependOn(&run_ci_corpus.step);
+    test_step.dependOn(&run_ci_corpus.step);
+
+    // ---- `raw-swarm`: deterministic DNG truncation/mutation parser swarm ----------
+    const raw_swarm_emu = emu_module(b, target, .ReleaseSafe, libraw_prefix);
+    const raw_swarm = b.addExecutable(.{
+        .name = "raw_swarm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/raw_swarm.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "emu", .module = raw_swarm_emu }},
+        }),
+    });
+    const run_raw_swarm = b.addRunArtifact(raw_swarm);
+    run_raw_swarm.has_side_effects = true;
+    if (b.args) |args| run_raw_swarm.addArgs(args);
+    const raw_swarm_step = b.step("raw-swarm", "Run the seeded DNG parser swarm");
+    raw_swarm_step.dependOn(&run_raw_swarm.step);
+
+    // ---- `raw-bench`: split real-camera decode/render timing ----------------------
+    const raw_bench_emu = emu_module(b, target, .ReleaseFast, libraw_prefix);
+    const raw_bench = b.addExecutable(.{
+        .name = "raw_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/raw_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "emu", .module = raw_bench_emu }},
+        }),
+    });
+    const run_raw_bench = b.addRunArtifact(raw_bench);
+    run_raw_bench.has_side_effects = true;
+    if (b.args) |args| run_raw_bench.addArgs(args);
+    const raw_bench_step = b.step("raw-bench", "Benchmark real RAW decode and v2 render");
+    raw_bench_step.dependOn(&run_raw_bench.step);
+
     // ---- `sim`: the wombat crash simulator ---------------------------------------
     // 10k vault plus 10k catalog workloads with crash/torn-write injection.
     // The invariant is zero acknowledged blob or mutation loss.
@@ -260,6 +300,29 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_golden.addArgs(args);
     const golden_step = b.step("golden", "Run the golden-render conformance harness");
     golden_step.dependOn(&run_golden.step);
+}
+
+fn emu_module(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    libraw_prefix: []const u8,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("emu/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    module.addIncludePath(.{
+        .cwd_relative = b.fmt("{s}/include", .{libraw_prefix}),
+    });
+    module.addLibraryPath(.{
+        .cwd_relative = b.fmt("{s}/lib", .{libraw_prefix}),
+    });
+    module.linkSystemLibrary("raw_r", .{ .use_pkg_config = .no });
+    module.linkSystemLibrary("c++", .{});
+    return module;
 }
 
 /// The low 64 bits of HEAD's commit hash: every commit explores a
