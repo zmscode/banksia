@@ -2,6 +2,7 @@
 .zig-global-cache/
 zig-out/
 macos/.build/
+macos/Sources/Banksia/Shaders/*.metallib
 /*.dng
 .DS_Store
 

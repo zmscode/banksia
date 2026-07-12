@@ -43,6 +43,10 @@ typedef struct bk_engine bk_engine;
 /* bk_render was called before a successful bk_load_raw. */
 #define BK_ERR_NO_RAW (-6)
 #define BK_ERR_OUT_OF_MEMORY (-7)
+/* A cooperative render cancellation callback requested termination. */
+#define BK_ERR_CANCELLED (-8)
+
+typedef int32_t (*bk_should_cancel_fn)(void *context);
 
 /* Create an engine. Returns NULL only on allocation failure. The handle
  * owns all memory it hands out and must be released with
@@ -75,6 +79,28 @@ int32_t bk_set_recipe_json(bk_engine *engine, const char *json);
  * in bk_last_error. */
 const uint8_t *bk_render(bk_engine *engine, uint32_t edge_px_max,
                          uint32_t *out_width, uint32_t *out_height);
+
+/* Render the early, reusable preview stage for accelerated late develop.
+ * On success writes row-major RGBA32F pixels in linear Rec.2020 after black
+ * level, white balance, highlight recovery, demosaic, camera-to-working
+ * conversion, crop/orientation, and preview scaling. Exposure, tone, output
+ * conversion, and transfer encoding have not run; alpha is 1.
+ *
+ * The engine owns the returned buffer: it is valid until the next
+ * bk_render_linear on this handle or bk_engine_destroy. This does not alter
+ * the lifetime or behavior of a buffer returned by bk_render. */
+const float *bk_render_linear(bk_engine *engine, uint32_t edge_px_max,
+                              uint32_t *out_width, uint32_t *out_height);
+
+/* The admitted form of bk_render_linear. A nonzero memory_budget_bytes rejects
+ * the render before pipeline allocation when its conservative combined CPU/GPU
+ * estimate exceeds the budget. should_cancel is polled between safe pipeline
+ * stages; return nonzero to stop with BK_ERR_CANCELLED. The callback and context
+ * are borrowed only for this synchronous call. */
+const float *bk_render_linear_with_admission(
+    bk_engine *engine, uint32_t edge_px_max, uint64_t memory_budget_bytes,
+    bk_should_cancel_fn should_cancel, void *cancel_context,
+    uint32_t *out_width, uint32_t *out_height);
 
 /* The message for the most recent failure on this handle, or "" after a
  * success. Owned by the engine; valid until the next call on the handle.

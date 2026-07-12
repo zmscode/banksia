@@ -3,6 +3,13 @@ import CoreGraphics
 import Foundation
 import os.signpost
 
+private func rendererShouldCancel(_ context: UnsafeMutableRawPointer?) -> Int32 {
+    _ = context
+    return withUnsafeCurrentTask { task in
+        task?.isCancelled == true ? 1 : 0
+    }
+}
+
 struct LoadTiming: Sendable {
     let coreLoadDecodeMS: Double
 }
@@ -19,6 +26,29 @@ struct MeasuredRender {
     let request: RenderRequest
     let image: CGImage
     let timing: RenderTiming
+}
+
+struct LinearPreview: Sendable {
+    let width: Int
+    let height: Int
+    /// Interleaved RGBA32F in linear Rec.2020. This owned copy does not alias
+    /// the C engine and is ready for one Metal texture upload.
+    let rgba32Float: Data
+
+    var bytesPerRow: Int { width * 4 * MemoryLayout<Float>.stride }
+}
+
+struct LinearPreviewTiming: Sendable {
+    let recipeMS: Double
+    let coreRenderMS: Double
+    let pixelCopyMS: Double
+    let totalMS: Double
+}
+
+struct MeasuredLinearPreview: Sendable {
+    let request: RenderRequest
+    let preview: LinearPreview
+    let timing: LinearPreviewTiming
 }
 
 /// A failure reported across the C ABI: the returned code plus the message
@@ -39,6 +69,12 @@ actor Renderer {
         category: .pointsOfInterest
     )
     private var engine: OpaquePointer?
+    private static let memoryBudgetBytes: UInt64 = {
+        let headroom: UInt64 = 1 << 30
+        let physical = ProcessInfo.processInfo.physicalMemory
+        let available = physical > headroom ? physical - headroom : 0
+        return min(available, 1_536 << 20)
+    }()
 
     deinit {
         if let engine { bk_engine_destroy(engine) }
@@ -50,6 +86,7 @@ actor Renderer {
 
     @discardableResult
     func loadMeasured(path: String) throws -> LoadTiming {
+        try Task.checkCancellation()
         let engine = try handle()
         let clock = ContinuousClock()
         let start = clock.now
@@ -81,6 +118,7 @@ actor Renderer {
     }
 
     func render(request: RenderRequest) throws -> MeasuredRender {
+        try Task.checkCancellation()
         guard request.execution == .strictCPUDisplay else {
             throw EngineError(
                 code: BK_ERR_INVALID_ARGUMENT,
@@ -155,12 +193,78 @@ actor Renderer {
         )
     }
 
+    func renderLinearPreview(request: RenderRequest) throws -> MeasuredLinearPreview {
+        try Task.checkCancellation()
+        guard request.execution == .strictCPULinearWorking else {
+            throw EngineError(
+                code: BK_ERR_INVALID_ARGUMENT,
+                message: "linear CPU renderer received an incompatible execution contract"
+            )
+        }
+        let engine = try handle()
+        let clock = ContinuousClock()
+        let totalStart = clock.now
+
+        let recipeStart = clock.now
+        do {
+            os_signpost(.begin, log: Self.performanceLog, name: "Linear recipe update")
+            defer {
+                os_signpost(.end, log: Self.performanceLog, name: "Linear recipe update")
+            }
+            try check(bk_set_recipe_json(engine, request.recipeJSON), engine)
+        }
+        let recipeMS = milliseconds(recipeStart.duration(to: clock.now))
+
+        var width: UInt32 = 0
+        var height: UInt32 = 0
+        let renderStart = clock.now
+        os_signpost(.begin, log: Self.performanceLog, name: "Linear base render")
+        guard let pixels = bk_render_linear_with_admission(
+            engine,
+            request.edgeMax,
+            Self.memoryBudgetBytes,
+            rendererShouldCancel,
+            nil,
+            &width,
+            &height
+        ) else {
+            os_signpost(.end, log: Self.performanceLog, name: "Linear base render")
+            throw lastError(engine, code: BK_ERR_RENDER)
+        }
+        os_signpost(.end, log: Self.performanceLog, name: "Linear base render")
+        let coreRenderMS = milliseconds(renderStart.duration(to: clock.now))
+
+        let copyStart = clock.now
+        os_signpost(.begin, log: Self.performanceLog, name: "Linear base copy")
+        let byteCount = Int(width) * Int(height) * 4 * MemoryLayout<Float>.stride
+        let data = Data(bytes: pixels, count: byteCount)
+        os_signpost(.end, log: Self.performanceLog, name: "Linear base copy")
+        let pixelCopyMS = milliseconds(copyStart.duration(to: clock.now))
+
+        return MeasuredLinearPreview(
+            request: request,
+            preview: LinearPreview(
+                width: Int(width),
+                height: Int(height),
+                rgba32Float: data
+            ),
+            timing: LinearPreviewTiming(
+                recipeMS: recipeMS,
+                coreRenderMS: coreRenderMS,
+                pixelCopyMS: pixelCopyMS,
+                totalMS: milliseconds(totalStart.duration(to: clock.now))
+            )
+        )
+    }
+
     /// Load and render in one actor-isolated step. There is no `await` between
     /// the load and the render, so concurrent callers can't interleave a load
     /// between another caller's load and its render — each call renders its own
     /// raw. The filmstrip relies on this to thumbnail many files on one handle.
     func loadAndRender(path: String, recipeJSON: String, edgeMax: UInt32) throws -> CGImage {
+        try Task.checkCancellation()
         try load(path: path)
+        try Task.checkCancellation()
         return try render(recipeJSON: recipeJSON, edgeMax: edgeMax)
     }
 

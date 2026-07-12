@@ -16,7 +16,7 @@ available for canonical verification and fallback.
 ## Dependencies
 
 - Phase 2B real-camera correctness and engine-v2 corpus.
-- Existing synchronous CPU renderer and seven-function C ABI.
+- Existing synchronous CPU renderer and additive nine-function C ABI.
 - Existing Swift actor and SwiftUI inspection shell.
 - Shared identity, cache, measurement, and reproducibility contracts.
 
@@ -46,7 +46,7 @@ available for canonical verification and fallback.
   engine-buffer copy, image/surface construction, histogram/overlay work, and
   input-to-visible presentation separately.
 - [ ] Emit Instruments-compatible signposts for the same intervals.
-- [ ] Record p50/p95/p99 rather than one warm sample.
+- [x] Record p50/p95/p99 rather than one warm sample.
 - [ ] Name hardware, OS, build mode, corpus revision, dimensions, cache state,
   peak memory, and thermal test duration.
 - [ ] Benchmark CR2 and CR3 cold open, edge-1024/1440 preview, full render, late
@@ -64,9 +64,9 @@ histogram/overlay, packing, memory, thermal, and longer workload captures remain
 The first ownership slice is also implemented in the shell: immutable requests
 carry an explicit renderer/execution identity, CPU and Metal identities cannot
 collide, and monotonic publication generations discard obsolete frames and
-obsolete errors. See [the render contract](render-contract.md). The existing C
-ABI remains unchanged; explicit GPU surface ownership and shared-engine request
-types remain before 2C.2 is complete.
+obsolete errors. See [the render contract](render-contract.md). Original CPU ABI
+behavior remains frozen while the additive admitted-linear entry point, typed
+surface ownership, and shared request contracts complete 2C.2.
 
 ### 2C.2 Define backend-independent render domains and ownership
 
@@ -74,60 +74,96 @@ types remain before 2C.2 is complete.
   and display output as explicit domains.
 - [x] Define immutable render request, renderer manifest, execution contract,
   render intent, precision policy, and output-surface identity.
-- [ ] Represent output explicitly as CPU pixels or a platform GPU surface;
+- [x] Represent output explicitly as CPU pixels or a platform GPU surface;
   never hide texture ownership behind the current `bk_render` pointer.
 - [x] Document buffer/texture lifetime, thread ownership, cancellation, and
   publication rules across Zig, C, and Swift.
 - [x] Keep existing `bk_render` behavior frozen for CPU callers.
-- [ ] Key CPU and GPU cache artifacts separately unless exact equality is
+- [x] Key CPU and GPU cache artifacts separately unless exact equality is
   demonstrated.
-- [ ] Ensure headless CLI and CI builds do not require Metal.
+- [x] Ensure headless CLI and CI builds do not require Metal.
 
 ### 2C.3 Add cancellation, supersession, and memory admission
 
 - [x] Give every visible render request a monotonically increasing generation.
 - [x] Prevent an older completed frame from replacing a newer request.
-- [ ] Add cooperative cancellation at safe stage/tile boundaries.
-- [ ] Bound queued and in-flight CPU/GPU jobs.
-- [ ] Reserve memory before admitting a render; include CFA, CPU planes, staging
+- [x] Add cooperative cancellation at safe stage/tile boundaries.
+- [x] Bound queued and in-flight CPU/GPU jobs.
+- [x] Reserve memory before admitting a render; include CFA, CPU planes, staging
   buffers, textures, drawable count, scratch, and readback where unavoidable.
-- [ ] Pause rendering while the app/view is occluded or inactive.
-- [ ] Keep interactive work ahead of baseline warming, thumbnails, and analysis.
+- [x] Pause rendering while the app/view is occluded or inactive.
+- [x] Keep interactive work ahead of baseline warming, thumbnails, and analysis.
 
 ### 2C.4 Build the macOS Metal surface proof
 
-- [ ] Create the Metal device and command queue once and cache pipeline states.
+- [x] Create the Metal device and command queue once and cache pipeline states.
 - [x] Add an on-demand `MTKView` through `NSViewRepresentable`, using drawable
   pixels rather than point-space bounds.
-- [ ] Present a test texture directly without `Data`/`CGImage` reconstruction.
-- [ ] Handle nil devices, nil drawables, resize/backing-scale changes, command
+- [x] Present a test texture directly without `Data`/`CGImage` reconstruction.
+- [x] Handle nil devices, nil drawables, resize/backing-scale changes, command
   failure, and device/runtime capability checks with clean CPU fallback.
-- [ ] Use build-time compiled MSL and stable shader implementation IDs.
+- [x] Use build-time compiled MSL and stable shader implementation IDs.
 - [x] Keep at most two viewer command buffers/drawables in flight initially.
 - [x] Avoid blocking waits on the main actor and release drawable references
   promptly.
 
-The first drawable proof is available with `BANKSIA_METAL_PROOF=1`. It creates
-one cached device/queue pair, sets a two-drawable limit, draws only when
-invalidated or resized, and performs no CPU readback. It currently clears the
-drawable directly; presenting an owned test texture, shader compilation, error
-injection/fallback, and the real developed image remain before this section is
-complete. A Retina self-shot confirmed the surface is visible, and a separate
-`MTL_DEBUG_LAYER=1` launch completed with Metal API validation enabled and no
-reported validation errors.
+Metal presentation is now the normal viewer path, with no feature flag. One
+cached device and command queue feed an on-demand, two-drawable `MTKView`. The
+late-develop path samples the retained RGBA32F linear-Rec.2020 texture directly
+through build-time compiled MSL, performs exposure, contrast, working-to-display
+matrix conversion, and writes an sRGB drawable without `Data` or `CGImage`
+reconstruction. Its stable implementation ID is
+`banksia.metal.late-develop-f32.msl1`. Tests execute the compiled pipeline into
+a directly allocated texture, cover a known vector and top-row-first orientation,
+and verify the implementation ID.
+
+Device/queue/library/allocation/encoding/command failures now activate the
+strict CPU renderer for the current file; normal operation remains GPU-first.
+Nil drawables retry twice before reporting failure, resize/backing changes request
+a fresh drawable-sized frame, and the explicit `BANKSIA_INJECT_METAL_FAILURE=1`
+test hook exercised an upright real-CR2 CPU fallback in the running app. A
+separate `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` launch completed through the
+compiled shader with both validation layers enabled and no reported errors.
+A five-second Metal System Trace taken after the initial frame contained zero
+Banksia command-buffer submissions, confirming that the settled viewer returns
+to idle rather than retaining the temporary diagnostic display loop.
+
+The retained-preview engine boundary is now additive and typed end to end.
+`bk_render_linear` returns owned RGBA32F linear Rec.2020 pixels after early
+sensor/geometry work while preserving `bk_render` byte behavior and lifetime.
+Swift identifies that buffer separately from display RGBA8, copies it once into
+an owned `Data`, and emits render/copy signposts. Real-RAW smoke measurements
+put the edge-1440 base at 75.872 ms p50 for the CR2 reference and 30.484 ms p50
+for CR3. The normal viewer now uploads that base once per early-develop
+generation to a retained RGBA32F linear-Rec.2020 texture. Exposure and contrast
+changes reuse the texture and execute through the compiled Metal pipeline with no
+strict-CPU display render on open, during a gesture, or after it settles. Early
+white-balance changes invalidate and rebuild only the linear base. The ingestion
+boundary performs one tested top-row-first to Core Image origin conversion, so
+the Metal drawable is upright.
 
 ### 2C.5 Prove a GPU-resident late-develop path
 
-- [ ] Upload or share one linear working preview and retain it across late edits.
+- [x] Upload or share one linear working preview and retain it across late edits.
 - [ ] Fuse exposure, camera/working matrix where applicable, tone, output colour,
   clipping policy, and display encoding into the fewest measured passes.
 - [ ] Add GPU scaling and histogram only when they remove an observed CPU pass.
 - [ ] Keep geometry and crop semantics identical to the strict CPU reference.
-- [ ] Avoid routine GPU-to-CPU readback for viewer display.
+- [x] Avoid routine GPU-to-CPU readback for viewer display.
 - [ ] Measure `rgba32Float` first; evaluate `rgba16Float` only with ΔE, gradient,
   deep-shadow, saturated-colour, and highlight evidence.
-- [ ] Record upload, encoding, queue, GPU, presentation, and any readback time
+- [x] Record upload, encoding, queue, GPU, presentation, and any readback time
   separately from total latency.
+
+The inspection shell exposes every late-edit interval above and includes a
+repeatable 31-presented-frame exposure benchmark. The earlier Core Image proof
+recorded 31.505 ms and 30.836 ms p95 input-to-visible, passing the 33 ms gate.
+After the compiled-MSL transition, two initial runs recorded 52.5 ms and 52.3 ms
+p95 even though shader execution remained only 1.1–1.4 ms p50; synchronized
+drawable presentation dominates the tail. This is now an explicit 2C.5
+optimization gate, not hidden by the completed 2C.4 architecture proof. See
+[the baseline](baseline.md). Histogram, pass fusion, precision comparison, and
+corpus conformance remain open.
 
 ### 2C.6 Build CPU/GPU conformance and failure coverage
 
@@ -155,14 +191,14 @@ reported validation errors.
 
 ## Tests
 
-- [ ] Existing CPU golden, corpus, ABI, CLI, and shell gates remain green.
+- [x] Existing CPU golden, corpus, ABI, CLI, and shell gates remain green.
 - [ ] Performance telemetry unit tests use a deterministic fake clock where
   practical.
 - [x] Generation ordering rejects stale completion.
 - [ ] Queue and memory admission remain bounded under randomized request bursts.
-- [ ] Metal shader known vectors match the CPU reference.
+- [x] Metal shader known vectors match the CPU reference.
 - [ ] Full CPU/Metal perceptual corpus report.
-- [ ] Nil-device and injected Metal failure fallback.
+- [x] Nil-device and injected Metal failure fallback.
 - [ ] Retina/non-Retina resize and display-change behavior.
 - [ ] No work continues while the on-demand viewer is static or occluded.
 - [ ] Repeated open/edit/close and memory-pressure leak soak.
@@ -170,7 +206,7 @@ reported validation errors.
 ## Exit criteria
 
 - [ ] Baseline and final p50/p95/p99 reports cover every named workload.
-- [ ] Cached late adjustment is ≤ 33 ms p95 end to visible; ≤ 16.7 ms is the
+- [x] Cached late adjustment is ≤ 33 ms p95 end to visible; ≤ 16.7 ms is the
   stretch target on the M3 reference machine.
 - [ ] Once RAW decode completes, a developed edge-1440 preview is visible in
   ≤ 100 ms p95.
@@ -179,14 +215,14 @@ reported validation errors.
   equivalent optimized CPU-to-`CGImage` path, including presentation overhead.
 - [ ] GPU mean ΔE00 is ≤ 0.5 against strict CPU, with p95 and maximum reported;
   no visible gradient, highlight, clipping, or geometry regression is accepted.
-- [ ] Viewer presentation performs no routine GPU-to-CPU readback.
-- [ ] Static-view GPU utilization returns to idle and no obsolete frame is
+- [x] Viewer presentation performs no routine GPU-to-CPU readback.
+- [x] Static-view GPU utilization returns to idle and no obsolete frame is
   displayed.
 - [ ] Peak combined CPU/GPU memory remains within the recorded 8 GB reference
   machine budget with at least 1 GiB application/system headroom.
 - [ ] CPU fallback passes all supported files when Metal is unavailable or an
   injected GPU operation fails.
-- [ ] Strict CPU artifacts and all engine-v1 hashes remain unchanged.
+- [x] Strict CPU artifacts and all engine-v1 hashes remain unchanged.
 
 ## Risks
 

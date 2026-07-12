@@ -1,6 +1,6 @@
 //! The C ABI: everything the shell may touch, and nothing else.
 //!
-//! Seven exported functions, `bk_` prefixed, hand-documented in
+//! Nine exported functions, `bk_` prefixed, hand-documented in
 //! `include/banksia.h` — the header changes in the same commit as this file,
 //! and the header-sync test below holds the two together.
 //!
@@ -33,6 +33,7 @@ const err_recipe: i32 = -4;
 const err_render: i32 = -5;
 const err_no_raw: i32 = -6;
 const err_out_of_memory: i32 = -7;
+const err_cancelled: i32 = -8;
 
 const error_message_bytes_max = 256;
 const raw_bytes_max = std.Io.Limit.limited(512 * 1024 * 1024);
@@ -49,6 +50,7 @@ const Engine = struct {
     raw: ?emu.dng.DecodedRaw = null,
     recipe: ?std.json.Parsed(emu.pipeline.Recipe) = null,
     rendered: ?emu.pipeline.Rendered = null,
+    linear_rendered: ?emu.pipeline.LinearRendered = null,
     /// Always NUL-terminated; index error_message_bytes_max is the fence.
     last_error: [error_message_bytes_max + 1]u8,
 };
@@ -69,6 +71,7 @@ pub export fn bk_engine_destroy(engine_maybe: ?*Engine) void {
     if (engine.raw) |*raw| raw.deinit(engine.gpa);
     if (engine.recipe) |*recipe| recipe.deinit();
     if (engine.rendered) |*rendered| rendered.deinit(engine.gpa);
+    if (engine.linear_rendered) |*rendered| rendered.deinit(engine.gpa);
     if (verify) {
         // The leak gate: every allocation made through this handle must be
         // gone. In release builds the report (and the assert) compile out.
@@ -165,6 +168,97 @@ pub export fn bk_render(
     return engine.rendered.?.rgba.ptr;
 }
 
+pub export fn bk_render_linear(
+    engine_maybe: ?*Engine,
+    edge_px_max: u32,
+    width_out: ?*u32,
+    height_out: ?*u32,
+) ?[*]f32 {
+    return render_linear_with_admission(
+        engine_maybe,
+        edge_px_max,
+        0,
+        null,
+        null,
+        width_out,
+        height_out,
+    );
+}
+
+pub export fn bk_render_linear_with_admission(
+    engine_maybe: ?*Engine,
+    edge_px_max: u32,
+    memory_budget_bytes: u64,
+    should_cancel: ?*const fn (?*anyopaque) callconv(.c) i32,
+    cancel_context: ?*anyopaque,
+    width_out: ?*u32,
+    height_out: ?*u32,
+) ?[*]f32 {
+    return render_linear_with_admission(
+        engine_maybe,
+        edge_px_max,
+        memory_budget_bytes,
+        should_cancel,
+        cancel_context,
+        width_out,
+        height_out,
+    );
+}
+
+fn render_linear_with_admission(
+    engine_maybe: ?*Engine,
+    edge_px_max: u32,
+    memory_budget_bytes: u64,
+    should_cancel: ?*const fn (?*anyopaque) callconv(.c) i32,
+    cancel_context: ?*anyopaque,
+    width_out: ?*u32,
+    height_out: ?*u32,
+) ?[*]f32 {
+    const engine = engine_maybe orelse return null;
+    const width_ptr = width_out orelse {
+        _ = fail(engine, err_invalid_argument, "width_out is null", .{});
+        return null;
+    };
+    const height_ptr = height_out orelse {
+        _ = fail(engine, err_invalid_argument, "height_out is null", .{});
+        return null;
+    };
+    if (engine.raw == null) {
+        _ = fail(engine, err_no_raw, "no raw loaded: bk_load_raw must succeed first", .{});
+        return null;
+    }
+
+    const recipe = if (engine.recipe) |parsed| parsed.value else emu.recipe.default_recipe();
+    const rendered = emu.pipeline.render_linear_decoded(
+        engine.gpa,
+        &engine.raw.?,
+        recipe,
+        .{
+            .edge_px_max_out = edge_px_max,
+            .memory_budget_bytes = memory_budget_bytes,
+            .cancellation = .{
+                .context = cancel_context,
+                .callback = should_cancel,
+            },
+        },
+    ) catch |err| {
+        const code = switch (err) {
+            error.OutOfMemory => err_out_of_memory,
+            error.Cancelled => err_cancelled,
+            else => err_render,
+        };
+        _ = fail(engine, code, "linear render failed: {s}", .{@errorName(err)});
+        return null;
+    };
+
+    if (engine.linear_rendered) |*old| old.deinit(engine.gpa);
+    engine.linear_rendered = rendered;
+    width_ptr.* = rendered.width;
+    height_ptr.* = rendered.height;
+    _ = succeed(engine);
+    return engine.linear_rendered.?.rgba.ptr;
+}
+
 pub export fn bk_last_error(engine_maybe: ?*const Engine) [*:0]const u8 {
     const engine = engine_maybe orelse return "invalid engine handle";
     assert(engine.last_error[error_message_bytes_max] == 0);
@@ -207,8 +301,9 @@ const exported_names = blk: {
 };
 
 comptime {
-    // The plan caps the surface at 8; growth beyond it is a design smell.
-    assert(exported_names.len == 7);
+    // The admitted linear call is the sole Phase 2C extension to the frozen
+    // eight-function surface.
+    assert(exported_names.len == 9);
 }
 
 test "the hand-written header declares exactly the exported surface" {
@@ -318,6 +413,53 @@ test "create/load/render/destroy round trip through a real DNG file" {
     try std.testing.expectEqual(@as(u32, 64), width);
     try std.testing.expectEqual(@as(u32, 40), height);
     try std.testing.expectEqual(@as(u8, 255), full.?[3]); // alpha is opaque
+
+    try std.testing.expectEqual(ok, bk_set_recipe_json(
+        engine,
+        "{\"engine_version\":2,\"ops\":[" ++
+            "{\"black_point\":{}},{\"white_balance\":{\"as_shot\":true," ++
+            "\"gain_r\":1,\"gain_g\":1,\"gain_b\":1}},{\"demosaic\":{}}," ++
+            "{\"exposure\":{\"ev\":0}},{\"tone_curve\":{\"contrast\":0}}," ++
+            "{\"srgb_encode\":{}}]}",
+    ));
+    const linear = bk_render_linear(engine, 16, &width, &height);
+    try std.testing.expect(linear != null);
+    try std.testing.expectEqual(@as(u32, 16), width);
+    try std.testing.expectEqual(@as(u32, 10), height);
+    try std.testing.expectEqual(@as(f32, 1), linear.?[3]);
+
+    try std.testing.expectEqual(
+        null,
+        bk_render_linear_with_admission(engine, 16, 1, null, null, &width, &height),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        std.mem.span(bk_last_error(engine)),
+        "OutOfMemory",
+    ) != null);
+
+    try std.testing.expectEqual(
+        null,
+        bk_render_linear_with_admission(
+            engine,
+            16,
+            std.math.maxInt(u64),
+            test_should_cancel,
+            null,
+            &width,
+            &height,
+        ),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        std.mem.span(bk_last_error(engine)),
+        "Cancelled",
+    ) != null);
+}
+
+fn test_should_cancel(context: ?*anyopaque) callconv(.c) i32 {
+    assert(context == null);
+    return 1;
 }
 
 fn message_length(engine: *const Engine) usize {

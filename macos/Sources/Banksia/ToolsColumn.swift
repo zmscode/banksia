@@ -41,8 +41,8 @@ struct ToolsColumn: View {
             Text("As shot")
                 .font(.system(size: 10))
                 .foregroundStyle(Theme.textTertiary)
-            sliderRow("Temperature", \.temperature, -1...1)
-            sliderRow("Tint", \.tint, -0.5...0.5)
+            sliderRow("Temperature", \.temperature, -1...1, domain: .early)
+            sliderRow("Tint", \.tint, -0.5...0.5, domain: .early)
         }
     }
 
@@ -54,8 +54,8 @@ struct ToolsColumn: View {
                 controller.develop.contrast = 0
             }
         }) {
-            sliderRow("Exposure", \.ev, -3...3)
-            sliderRow("Contrast", \.contrast, 0...1)
+            sliderRow("Exposure", \.ev, -3...3, domain: .late)
+            sliderRow("Contrast", \.contrast, 0...1, domain: .late)
         }
     }
 
@@ -86,7 +86,8 @@ struct ToolsColumn: View {
     private func sliderRow(
         _ name: String,
         _ keyPath: ReferenceWritableKeyPath<DevelopModel, Double>,
-        _ range: ClosedRange<Double>
+        _ range: ClosedRange<Double>,
+        domain: DevelopChangeDomain
     ) -> some View {
         let bipolar = range.lowerBound < 0
         let value = controller.develop[keyPath: keyPath]
@@ -117,12 +118,12 @@ struct ToolsColumn: View {
             }
             Slider(value: binding(keyPath), in: range) { editing in
                 controller.isDragging = editing
-                if !editing { controller.dragEnded() }
+                if !editing { controller.dragEnded(domain) }
             }
             .controlSize(.small)
             .tint(Theme.accent)
             .onChange(of: controller.develop[keyPath: keyPath]) {
-                controller.parameterChanged()
+                controller.parameterChanged(domain)
             }
         }
     }

@@ -24,8 +24,6 @@ struct PreviewCanvas: View {
     @State private var cropAngle: Double = 0
 
     private static let rawExtensions: Set<String> = ["dng", "cr2", "cr3"]
-    private static let metalSurfaceProofEnabled =
-        ProcessInfo.processInfo.environment["BANKSIA_METAL_PROOF"] == "1"
     // 1 = fit; below 1 pulls back for breathing room, above 1 pixel-peeps.
     private static let minScale: CGFloat = 0.33
     private static let maxScale: CGFloat = 10
@@ -80,10 +78,8 @@ struct PreviewCanvas: View {
 
     @ViewBuilder
     private var content: some View {
-        if Self.metalSurfaceProofEnabled {
-            MetalSurfaceProof()
-        } else if let image = controller.displayImage {
-            imageStage(image)
+        if controller.linearPreview != nil || controller.displayImage != nil {
+            imageStage(controller.displayImage)
         } else if controller.fileName != nil, controller.isRendering {
             loadingState
         } else if controller.fileName != nil {
@@ -93,9 +89,9 @@ struct PreviewCanvas: View {
         }
     }
 
-    private func imageStage(_ image: CGImage) -> some View {
+    private func imageStage(_ image: CGImage?) -> some View {
         ZStack {
-            transformed(splitEnabled ? (controller.image ?? image) : image)
+            primaryTransformed(fallback: image)
             if splitEnabled, let before = controller.baselineImage {
                 transformed(before)
                     .mask(alignment: .leading) {
@@ -122,11 +118,53 @@ struct PreviewCanvas: View {
         .animation(.interactiveSpring(response: 0.26, dampingFraction: 0.85), value: viewer.scale)
     }
 
+    @ViewBuilder
+    private func primaryTransformed(fallback: CGImage?) -> some View {
+        if controller.useCPUFallback, let fallback {
+            transformedCPU(fallback)
+        } else if !controller.showBaseline, let preview = controller.linearPreview {
+            transformedLinear(preview)
+        } else if controller.showBaseline, let fallback {
+            transformed(fallback)
+        } else if controller.isRendering {
+            loadingState
+        }
+    }
+
+    private func transformedLinear(_ preview: LinearPreview) -> some View {
+        let fitted = viewer.fittedSize()
+        return MetalLinearImageSurface(
+            preview: preview,
+            previewGeneration: controller.linearPreviewGeneration,
+            exposureEV: controller.develop.ev,
+            contrast: controller.develop.contrast,
+            nearestSampling: viewer.scale > 3,
+            onTiming: controller.recordMetalTiming,
+            onFailure: controller.handleMetalFailure
+        )
+        .frame(width: fitted.width, height: fitted.height)
+        .scaleEffect(viewer.scale)
+        .offset(viewer.offset)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
     private func transformed(_ cg: CGImage) -> some View {
         // Size to the inset-aware fitted size (not scaledToFit on the whole
         // frame), so Fit lands in the clear region between the panels.
         let fitted = viewer.fittedSize()
-        return Image(decorative: cg, scale: 1)
+        return MetalImageSurface(
+            image: cg,
+            nearestSampling: viewer.scale > 3
+        )
+            .frame(width: fitted.width, height: fitted.height)
+            .scaleEffect(viewer.scale)
+            .offset(viewer.offset)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func transformedCPU(_ cg: CGImage) -> some View {
+        let fitted = viewer.fittedSize()
+        return Image(decorative: cg, scale: 1, orientation: .up)
             .resizable()
             .interpolation(viewer.scale > 3 ? .none : .high)
             .frame(width: fitted.width, height: fitted.height)

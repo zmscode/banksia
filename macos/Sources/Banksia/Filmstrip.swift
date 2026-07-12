@@ -8,27 +8,71 @@ import SwiftUI
 @MainActor
 @Observable
 final class ThumbnailStore {
+    static let maximumQueuedRequests = 12
+
     private(set) var images: [URL: CGImage] = [:]
     private let renderer = Renderer()
     private let neutral = DevelopModel().recipeJSON
-    private var inFlight: Set<URL> = []
+    private var pending: [URL] = []
+    private var active: URL?
+    private var worker: Task<Void, Never>?
+    private var applicationActive = true
+    private var interactiveWorkActive = false
+
+    private var isPaused: Bool { !applicationActive || interactiveWorkActive }
 
     func request(_ url: URL) {
-        guard images[url] == nil, !inFlight.contains(url) else { return }
-        inFlight.insert(url)
-        Task {
-            defer { inFlight.remove(url) }
+        guard images[url] == nil, active != url, !pending.contains(url) else { return }
+        guard pending.count < Self.maximumQueuedRequests else { return }
+        pending.append(url)
+        startWorkerIfNeeded()
+    }
+
+    func cancel(_ url: URL) {
+        pending.removeAll { $0 == url }
+    }
+
+    func setApplicationActive(_ active: Bool) {
+        applicationActive = active
+        updateWorkerState()
+    }
+
+    func setInteractiveWorkActive(_ active: Bool) {
+        interactiveWorkActive = active
+        updateWorkerState()
+    }
+
+    private func updateWorkerState() {
+        if isPaused {
+            worker?.cancel()
+        } else {
+            startWorkerIfNeeded()
+        }
+    }
+
+    private func startWorkerIfNeeded() {
+        guard worker == nil, !isPaused else { return }
+        worker = Task { await drainQueue() }
+    }
+
+    private func drainQueue() async {
+        while !Task.isCancelled, !isPaused, !pending.isEmpty {
+            let url = pending.removeFirst()
+            active = url
             do {
                 // One atomic call — a concurrent request can't swap the loaded
                 // raw out from under this render, so each thumbnail is its own.
                 let image = try await renderer.loadAndRender(
                     path: url.path, recipeJSON: neutral, edgeMax: 220
                 )
-                images[url] = image
+                if !Task.isCancelled { images[url] = image }
             } catch {
                 // Leave a placeholder; a failed thumbnail isn't worth surfacing.
             }
+            active = nil
         }
+        worker = nil
+        if !isPaused, !pending.isEmpty { startWorkerIfNeeded() }
     }
 }
 
@@ -89,5 +133,6 @@ struct Filmstrip: View {
         }
         .buttonStyle(.plain)
         .onAppear { store.request(url) }
+        .onDisappear { store.cancel(url) }
     }
 }

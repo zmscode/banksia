@@ -129,12 +129,21 @@ fn bench_file(
         .ops = &emu.recipe.default_ops,
     };
     var preview_samples = Samples{};
+    var linear_preview_samples = Samples{};
     var full_samples = Samples{};
     try render_warm(gpa, &raw, recipe, 1024);
+    try render_linear_warm(gpa, &raw, recipe, 1440);
     try render_warm(gpa, &raw, recipe, 0);
     iteration = 0;
     while (iteration < iterations) : (iteration += 1) {
         preview_samples.append(try render_timed(gpa, io, &raw, recipe, 1024));
+        linear_preview_samples.append(try render_linear_timed(
+            gpa,
+            io,
+            &raw,
+            recipe,
+            1440,
+        ));
         full_samples.append(try render_timed(gpa, io, &raw, recipe, 0));
     }
 
@@ -146,6 +155,7 @@ fn bench_file(
     metadata_samples.report("metadata parse");
     decode_samples.report("sensor decode");
     preview_samples.report("warm edge-1024 v2 render");
+    linear_preview_samples.report("warm edge-1440 linear base");
     full_samples.report("warm full v2 render");
 }
 
@@ -173,6 +183,40 @@ fn render_timed(
 ) !u64 {
     const started = std.Io.Clock.now(.awake, io);
     var rendered = try emu.pipeline.render_decoded(
+        gpa,
+        raw,
+        recipe,
+        .{ .edge_px_max_out = edge_px_max_out },
+    );
+    const finished = std.Io.Clock.now(.awake, io);
+    rendered.deinit(gpa);
+    return elapsed_ns(started, finished);
+}
+
+fn render_linear_warm(
+    gpa: std.mem.Allocator,
+    raw: *const emu.dng.DecodedRaw,
+    recipe: emu.pipeline.Recipe,
+    edge_px_max_out: u32,
+) !void {
+    var rendered = try emu.pipeline.render_linear_decoded(
+        gpa,
+        raw,
+        recipe,
+        .{ .edge_px_max_out = edge_px_max_out },
+    );
+    rendered.deinit(gpa);
+}
+
+fn render_linear_timed(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    raw: *const emu.dng.DecodedRaw,
+    recipe: emu.pipeline.Recipe,
+    edge_px_max_out: u32,
+) !u64 {
+    const started = std.Io.Clock.now(.awake, io);
+    var rendered = try emu.pipeline.render_linear_decoded(
         gpa,
         raw,
         recipe,

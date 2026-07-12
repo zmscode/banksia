@@ -9,10 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scheduleSelfShots()
     }
 
-    /// Dev capture: an app may photograph its own on-screen window with no
-    /// Screen Recording permission — the one path that works over a remote
-    /// session. Opt in with BANKSIA_SELFSHOT=<path>; fires a few times so a shot
-    /// lands after the async render settles.
+    /// Dev capture: an app may photograph its AppKit/SwiftUI content with no
+    /// Screen Recording permission. CAMetalLayer pixels are intentionally not
+    /// captured by cacheDisplay, so use this for shell chrome rather than Metal
+    /// image validation. Opt in with BANKSIA_SELFSHOT=<path>.
     private func scheduleSelfShots() {
         guard let path = ProcessInfo.processInfo.environment["BANKSIA_SELFSHOT"] else { return }
         for delay in [3.0, 6.0, 9.0] {

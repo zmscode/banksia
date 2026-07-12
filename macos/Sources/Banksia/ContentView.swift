@@ -3,6 +3,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var controller = DevelopController()
     @State private var viewer = ViewerState()
     @State private var thumbs = ThumbnailStore()
@@ -55,8 +56,28 @@ struct ContentView: View {
         .frame(minWidth: 1240, minHeight: 720)
         .onOpenURL { controller.open(url: $0) }
         .onChange(of: solo) { updateInsets() }
+        .onChange(of: scenePhase, initial: true) {
+            let active = scenePhase == .active
+            controller.setApplicationActive(active)
+            thumbs.setApplicationActive(active)
+        }
+        .onChange(of: controller.isRendering, initial: true) {
+            thumbs.setInteractiveWorkActive(controller.isRendering || controller.isDragging)
+        }
+        .onChange(of: controller.isDragging) {
+            thumbs.setInteractiveWorkActive(controller.isRendering || controller.isDragging)
+        }
         .onAppear {
             updateInsets()
+            // Environment form avoids AppKit treating a positional path as a
+            // document-open launch during automated shell validation.
+            if let path = ProcessInfo.processInfo.environment["BANKSIA_OPEN"] {
+                controller.open(url: URL(fileURLWithPath: path))
+                if ProcessInfo.processInfo.environment["BANKSIA_METAL_BENCHMARK"] == "1" {
+                    controller.runMetalBenchmark()
+                }
+                return
+            }
             // Dev loop: `Banksia <shot.raw>` skips the picker entirely; ignore
             // any leading flags.
             if let path = CommandLine.arguments.dropFirst().first,
@@ -97,6 +118,16 @@ struct ContentView: View {
             }
             .disabled(!controller.develop.hasEdits)
             .help("Reset all adjustments")
+        }
+        ToolbarItem {
+            Button(action: controller.runMetalBenchmark) {
+                Label(
+                    controller.isMetalBenchmarking ? "Benchmarking…" : "Benchmark GPU",
+                    systemImage: "gauge.with.dots.needle.67percent"
+                )
+            }
+            .disabled(controller.linearPreview == nil || controller.isMetalBenchmarking)
+            .help("Run the 31-frame Phase 2C late-edit benchmark")
         }
         ToolbarItemGroup {
             Button {

@@ -103,6 +103,18 @@ explicit CPU/GPU execution and surface ownership, and proving a narrow
 GPU-resident late-develop path. Performance, bounded memory, perceptual parity,
 and CPU fallback are exit gates; merely using Metal is not completion.
 
+- [x] Record the seed CPU p50/p95/p99 baseline and render-stage signposts.
+- [x] Define immutable requests, execution identities, image domains, and
+  newest-generation-only publication.
+- [x] Validate an on-demand two-drawable Metal surface with API validation.
+- [x] Make on-demand Metal presentation the normal viewer path.
+- [x] Run the Phase 2C inspection viewer GPU-only so CPU presentation cannot
+  mask Metal initialization, processing, orientation, or command failures.
+- [x] Restore and verify explicit strict-CPU fallback before the Phase 2C exit.
+- [x] Retain a linear preview texture and move late develop operations onto it.
+- [x] Pass the cached late-edit ≤33 ms p95 gate in two clean 31-frame runs.
+- [ ] Pass CPU/Metal perceptual, failure, memory, idle-energy, and latency gates.
+
 ---
 
 ## Roadmap

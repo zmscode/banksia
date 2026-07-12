@@ -89,12 +89,33 @@ struct NavigatorPanel: View {
             infoRow("Core render", formatMS(controller.lastRenderTiming?.coreRenderMS))
             infoRow("Pixel copy", formatMS(controller.lastRenderTiming?.pixelCopyMS))
             infoRow("CGImage", formatMS(controller.lastRenderTiming?.imageBuildMS))
+            infoRow("Texture upload", formatMS(controller.lastMetalTiming?.uploadMS))
+            infoRow("Metal encode", formatMS(controller.lastMetalTiming?.encodeMS))
+            infoRow("Queue wait", formatMS(controller.lastMetalTiming?.queueMS))
+            infoRow("GPU", formatMS(controller.lastMetalTiming?.gpuMS))
+            infoRow("Present wait", formatMS(controller.lastMetalTiming?.presentWaitMS))
+            infoRow("Input → visible", formatMS(controller.lastMetalTiming?.inputToPresentedMS))
+            if let summary = controller.metalBenchmarkSummary {
+                Divider().opacity(0.25)
+                infoRow("Late-edit samples", "\(summary.sampleCount)")
+                infoRow("Visible p50", formatMS(summary.inputToPresentedP50MS))
+                infoRow("Visible p95", formatMS(summary.inputToPresentedP95MS))
+                infoRow("Visible p99", formatMS(summary.inputToPresentedP99MS))
+                infoRow("Encode p50", formatMS(summary.encodeP50MS))
+                infoRow("Queue p50", formatMS(summary.queueP50MS))
+                infoRow("GPU p50", formatMS(summary.gpuP50MS))
+                infoRow("Present p50", formatMS(summary.presentWaitP50MS))
+            }
             infoRow("Engine", "v2")
         }
     }
 
     private func formatMS(_ value: Double?) -> String {
         value.map { String(format: "%.1f ms", $0) } ?? "—"
+    }
+
+    private func formatMS(_ value: Double) -> String {
+        String(format: "%.1f ms", value)
     }
 
     private var recipe: some View {

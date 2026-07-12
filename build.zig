@@ -118,8 +118,34 @@ pub fn build(b: *std.Build) void {
         b.fmt("-Dlibraw-prefix={s}", .{libraw_prefix}),
         "lib",
     });
+    const metal_compile = b.addSystemCommand(&.{
+        "xcrun",
+        "--toolchain",
+        "Metal",
+        "-sdk",
+        "macosx",
+        "metal",
+        "-std=metal3.0",
+        "-c",
+        "macos/Sources/Banksia/Shaders/LateDevelop.metal",
+        "-o",
+        ".zig-cache/LateDevelop.air",
+    });
+    const metal_link = b.addSystemCommand(&.{
+        "xcrun",
+        "--toolchain",
+        "Metal",
+        "-sdk",
+        "macosx",
+        "metallib",
+        ".zig-cache/LateDevelop.air",
+        "-o",
+        "macos/Sources/Banksia/Shaders/LateDevelop.metallib",
+    });
+    metal_link.step.dependOn(&metal_compile.step);
     const shell_build = b.addSystemCommand(&.{ "swift", "build", "--package-path", "macos" });
     shell_build.step.dependOn(&shell_lib.step);
+    shell_build.step.dependOn(&metal_link.step);
     shell_build.has_side_effects = true; // SwiftPM does its own caching
     const shell_step = b.step("shell", "Build the SwiftUI inspection shell (needs Xcode)");
     shell_step.dependOn(&shell_build.step);

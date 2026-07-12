@@ -4,7 +4,7 @@ import Foundation
 /// interpreting one stage's pixels as another's. The current C ABI exposes
 /// only the final display output; the remaining cases define the shared
 /// vocabulary for the GPU surface work.
-enum RenderDomain: String, Sendable {
+enum RenderDomain: String, Hashable, Sendable {
     case sensorCFA
     case cameraRGB
     case linearWorkingRGB
@@ -12,7 +12,7 @@ enum RenderDomain: String, Sendable {
     case displayEncodedRGB
 }
 
-enum RenderIntent: String, Sendable {
+enum RenderIntent: String, Hashable, Sendable {
     case interactivePreview
     case settledPreview
     case baseline
@@ -20,24 +20,25 @@ enum RenderIntent: String, Sendable {
     case compatibility
 }
 
-enum RenderBackend: String, Sendable {
+enum RenderBackend: String, Hashable, Sendable {
     case strictCPU
     case metalCandidate
 }
 
-enum RenderPrecision: String, Sendable {
+enum RenderPrecision: String, Hashable, Sendable {
     case float32
     case float16Candidate
 }
 
-enum RenderOutputKind: String, Sendable {
+enum RenderOutputKind: String, Hashable, Sendable {
     case cpuRGBA8SRGB
+    case cpuRGBA32FloatLinearWorking
     case platformGPUTexture
 }
 
 /// Stable identity for numerical behavior. CPU and Metal requests deliberately
 /// cannot share an identity or cache entry merely because their recipes match.
-struct RendererManifest: Equatable, Sendable {
+struct RendererManifest: Hashable, Sendable {
     let implementationID: String
     let engineVersion: UInt32
     let backend: RenderBackend
@@ -49,9 +50,16 @@ struct RendererManifest: Equatable, Sendable {
         backend: .strictCPU,
         precision: .float32
     )
+
+    static let metalLateDevelopV1 = RendererManifest(
+        implementationID: "banksia.metal.late-develop-f32.v1",
+        engineVersion: 2,
+        backend: .metalCandidate,
+        precision: .float32
+    )
 }
 
-struct RenderExecutionContract: Equatable, Sendable {
+struct RenderExecutionContract: Hashable, Sendable {
     let renderer: RendererManifest
     let output: RenderOutputKind
 
@@ -59,6 +67,25 @@ struct RenderExecutionContract: Equatable, Sendable {
         renderer: .strictCPUV2,
         output: .cpuRGBA8SRGB
     )
+
+    static let strictCPULinearWorking = RenderExecutionContract(
+        renderer: .strictCPUV2,
+        output: .cpuRGBA32FloatLinearWorking
+    )
+
+    static let metalLateDevelop = RenderExecutionContract(
+        renderer: .metalLateDevelopV1,
+        output: .platformGPUTexture
+    )
+}
+
+struct RenderArtifactKey: Hashable, Sendable {
+    let sourceIdentity: String
+    let recipeIdentity: String
+    let edgeMax: UInt32
+    let pixelWidth: UInt32
+    let pixelHeight: UInt32
+    let execution: RenderExecutionContract
 }
 
 /// A complete immutable snapshot of work. Once issued, later UI mutations

@@ -73,12 +73,26 @@ pub const Recipe = struct {
     ops: []const Op,
 };
 
+pub const Cancellation = struct {
+    context: ?*anyopaque = null,
+    callback: ?*const fn (?*anyopaque) callconv(.c) i32 = null,
+
+    pub const never: Cancellation = .{};
+
+    pub fn requested(self: Cancellation) bool {
+        const callback = self.callback orelse return false;
+        return callback(self.context) != 0;
+    }
+};
+
 pub const RenderOptions = struct {
     /// Longest edge of the output in pixels; 0 renders at sensor resolution.
     /// Smaller outputs render at full resolution first and then box
     /// downsample: correct and deterministic first. The subsampled-demosaic
     /// fast path is a Phase 6 optimization tested against this reference.
     edge_px_max_out: u32 = 0,
+    memory_budget_bytes: u64 = 0,
+    cancellation: Cancellation = .never,
 };
 
 pub const Rendered = struct {
@@ -94,12 +108,30 @@ pub const Rendered = struct {
     }
 };
 
+/// Retained preview boundary for accelerated late develop. Pixels are
+/// row-major RGBA32F in linear Rec.2020 after sensor-domain operations,
+/// demosaic, camera-to-working conversion, crop/orientation, and optional
+/// preview scaling. Exposure, tone, output conversion, and transfer encoding
+/// have not run. Alpha is exactly 1.
+pub const LinearRendered = struct {
+    width: u32,
+    height: u32,
+    rgba: []f32,
+
+    pub fn deinit(self: *LinearRendered, gpa: std.mem.Allocator) void {
+        assert(self.rgba.len == @as(usize, self.width) * self.height * 4);
+        gpa.free(self.rgba);
+        self.* = undefined;
+    }
+};
+
 pub const RenderError = error{
     InvalidRecipe,
     UnsupportedEngineVersion,
     UnsupportedSensor,
     InvalidColorMetadata,
     OutOfMemory,
+    Cancelled,
 };
 
 pub fn render(
@@ -141,6 +173,66 @@ pub fn render_decoded(
     };
 }
 
+/// Produce the immutable linear-working preview consumed by the Metal late
+/// develop proof. Version 1 remains byte-frozen and has no split-stage API.
+pub fn render_linear_decoded(
+    gpa: std.mem.Allocator,
+    raw: *const dng.DecodedRaw,
+    recipe: Recipe,
+    options: RenderOptions,
+) RenderError!LinearRendered {
+    if (recipe.engine_version != 2) return error.UnsupportedEngineVersion;
+    try cancellation_check(options.cancellation);
+    const memory_bytes_max = render_linear_memory_bytes_max(raw, options.edge_px_max_out);
+    if (options.memory_budget_bytes > 0 and
+        memory_bytes_max > options.memory_budget_bytes)
+    {
+        return error.OutOfMemory;
+    }
+    const dimensions = geometry.Transform.init(raw.metadata).output_dimensions();
+    const longest = @max(dimensions.width, dimensions.height);
+    const ratio = if (options.edge_px_max_out == 0)
+        0
+    else
+        longest / options.edge_px_max_out;
+    const factor = ratio & ~@as(u32, 1);
+    if (factor >= 2) {
+        var preview = try preview_raw_make(gpa, raw, factor);
+        defer preview.deinit(gpa);
+        try cancellation_check(options.cancellation);
+        return render_linear_decoded_v2(gpa, &preview, recipe, options);
+    }
+    return render_linear_decoded_v2(gpa, raw, recipe, options);
+}
+
+pub fn render_linear_memory_bytes_max(raw: *const dng.DecodedRaw, edge_px_max_out: u32) u64 {
+    const dimensions = geometry.Transform.init(raw.metadata).output_dimensions();
+    const longest = @max(dimensions.width, dimensions.height);
+    const ratio = if (edge_px_max_out == 0) 0 else longest / edge_px_max_out;
+    const factor = @max(1, ratio & ~@as(u32, 1));
+    const work_width = (raw.sensor.width + factor - 1) / factor;
+    const work_height = (raw.sensor.height + factor - 1) / factor;
+    const oriented_width = (dimensions.width + factor - 1) / factor;
+    const oriented_height = (dimensions.height + factor - 1) / factor;
+    const width_out, const height_out = dims_out(
+        oriented_width,
+        oriented_height,
+        edge_px_max_out,
+    );
+
+    const raw_pixels = @as(u64, raw.sensor.width) * raw.sensor.height;
+    const work_pixels = @as(u64, work_width) * work_height;
+    const output_pixels = @as(u64, width_out) * height_out;
+    const cfa_bytes = raw_pixels * @sizeOf(u16) + work_pixels * @sizeOf(u16);
+    const early_stage_bytes = work_pixels * @sizeOf(f32) * 7;
+    const output_stage_bytes = output_pixels * 72;
+    return cfa_bytes + early_stage_bytes + output_stage_bytes;
+}
+
+fn cancellation_check(cancellation: Cancellation) RenderError!void {
+    if (cancellation.requested()) return error.Cancelled;
+}
+
 fn render_decoded_v2(
     gpa: std.mem.Allocator,
     raw: *const dng.DecodedRaw,
@@ -151,6 +243,25 @@ fn render_decoded_v2(
         return error.InvalidColorMetadata;
     };
     return render_internal(
+        gpa,
+        &raw.sensor,
+        recipe,
+        options,
+        geometry.Transform.init(raw.metadata),
+        color_transform,
+    );
+}
+
+fn render_linear_decoded_v2(
+    gpa: std.mem.Allocator,
+    raw: *const dng.DecodedRaw,
+    recipe: Recipe,
+    options: RenderOptions,
+) RenderError!LinearRendered {
+    const color_transform = color.Transform.init(raw.metadata) catch {
+        return error.InvalidColorMetadata;
+    };
+    return render_linear_internal(
         gpa,
         &raw.sensor,
         recipe,
@@ -348,6 +459,72 @@ fn render_internal(
     }
 
     assert(rgba.len == count_out * 4);
+    return .{ .width = width_out, .height = height_out, .rgba = rgba };
+}
+
+fn render_linear_internal(
+    gpa: std.mem.Allocator,
+    sensor: *const dng.SensorData,
+    recipe: Recipe,
+    options: RenderOptions,
+    transform: geometry.Transform,
+    color_transform: color.Transform,
+) RenderError!LinearRendered {
+    assert(sensor.bayer.len == @as(usize, sensor.width) * sensor.height);
+    assert(sensor.white_level > sensor.black_level);
+
+    var ops: std.MultiArrayList(Op) = .empty;
+    defer ops.deinit(gpa);
+    try ops.ensureTotalCapacity(gpa, recipe.ops.len);
+    for (recipe.ops) |op| ops.appendAssumeCapacity(op);
+    try stack_validate(ops.items(.tags));
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const count = @as(usize, sensor.width) * sensor.height;
+    const mosaic = try arena.alloc(f32, count);
+    var planes = try image.Planes.init(arena, sensor.width, sensor.height);
+    var applied_wb_gains: ?[3]f32 = null;
+
+    for (0..ops.len) |i| {
+        try cancellation_check(options.cancellation);
+        const op = ops.get(i);
+        switch (op) {
+            .exposure, .tone_curve, .srgb_encode => {},
+            else => try op_apply(
+                op,
+                recipe.engine_version,
+                sensor,
+                mosaic,
+                &planes,
+                color_transform,
+                &applied_wb_gains,
+            ),
+        }
+    }
+
+    try cancellation_check(options.cancellation);
+    const transformed = try planes_transform(arena, &planes, transform);
+    try cancellation_check(options.cancellation);
+    const width_out, const height_out = dims_out(
+        transformed.width,
+        transformed.height,
+        options.edge_px_max_out,
+    );
+    const output_planes = if (width_out == transformed.width and
+        height_out == transformed.height)
+        transformed
+    else
+        try planes_downsample(arena, &transformed, width_out, height_out);
+
+    try cancellation_check(options.cancellation);
+    const count_out = @as(usize, width_out) * height_out;
+    const rgba = try gpa.alloc(f32, count_out * 4);
+    errdefer gpa.free(rgba);
+    kernel_linear_pack(rgba, output_planes.r, output_planes.g, output_planes.b);
+    try cancellation_check(options.cancellation);
     return .{ .width = width_out, .height = height_out, .rgba = rgba };
 }
 
@@ -791,6 +968,18 @@ fn kernel_srgb_pack(rgba: []u8, r: []const f32, g: []const f32, b: []const f32) 
     }
 }
 
+fn kernel_linear_pack(rgba: []f32, r: []const f32, g: []const f32, b: []const f32) void {
+    assert(r.len == g.len);
+    assert(g.len == b.len);
+    assert(rgba.len == r.len * 4);
+    for (r, g, b, 0..) |red, green, blue, i| {
+        rgba[i * 4 + 0] = red;
+        rgba[i * 4 + 1] = green;
+        rgba[i * 4 + 2] = blue;
+        rgba[i * 4 + 3] = 1;
+    }
+}
+
 /// The exact sRGB transfer function, quantized to u8.
 fn srgb_encode_scalar(linear: f32) u8 {
     const x = std.math.clamp(linear, 0, 1);
@@ -923,6 +1112,11 @@ const test_ops_default = [_]Op{
     .{ .srgb_encode = .{} },
 };
 
+fn test_cancel_requested(context: ?*anyopaque) callconv(.c) i32 {
+    assert(context == null);
+    return 1;
+}
+
 fn test_sensor(gpa: std.mem.Allocator, width: u32, height: u32) !dng.SensorData {
     const bayer = try gpa.alloc(u16, width * height);
     for (bayer, 0..) |*s, i| {
@@ -1022,6 +1216,61 @@ test "engine v2 applies default crop and orientation before preview sizing" {
     defer preview.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 2), preview.width);
     try std.testing.expectEqual(@as(u32, 3), preview.height);
+
+    var late_ops = test_ops_default;
+    late_ops[3] = .{ .exposure = .{ .ev = 1.25 } };
+    late_ops[4] = .{ .tone_curve = .{ .contrast = 0.8 } };
+    var linear_neutral = try render_linear_decoded(
+        gpa,
+        &raw,
+        recipe,
+        .{ .edge_px_max_out = 3 },
+    );
+    defer linear_neutral.deinit(gpa);
+    var linear_late_edit = try render_linear_decoded(
+        gpa,
+        &raw,
+        .{ .engine_version = 2, .ops = &late_ops },
+        .{ .edge_px_max_out = 3 },
+    );
+    defer linear_late_edit.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 2), linear_neutral.width);
+    try std.testing.expectEqual(@as(u32, 3), linear_neutral.height);
+    try std.testing.expectEqualSlices(f32, linear_neutral.rgba, linear_late_edit.rgba);
+    const memory_bytes_max = render_linear_memory_bytes_max(&raw, 3);
+    try std.testing.expect(memory_bytes_max > 0);
+    try std.testing.expectError(error.OutOfMemory, render_linear_decoded(
+        gpa,
+        &raw,
+        recipe,
+        .{ .edge_px_max_out = 3, .memory_budget_bytes = memory_bytes_max - 1 },
+    ));
+    try std.testing.expectError(error.Cancelled, render_linear_decoded(
+        gpa,
+        &raw,
+        recipe,
+        .{ .cancellation = .{ .callback = test_cancel_requested } },
+    ));
+    for (linear_neutral.rgba, 0..) |value, i| {
+        try std.testing.expect(std.math.isFinite(value));
+        if (i % 4 == 3) try std.testing.expectEqual(@as(f32, 1), value);
+    }
+
+    var early_ops = test_ops_default;
+    early_ops[1] = .{ .white_balance = .{
+        .as_shot = false,
+        .gain_r = 1.2,
+        .gain_g = 1,
+        .gain_b = 0.8,
+    } };
+    var linear_early_edit = try render_linear_decoded(
+        gpa,
+        &raw,
+        .{ .engine_version = 2, .ops = &early_ops },
+        .{ .edge_px_max_out = 3 },
+    );
+    defer linear_early_edit.deinit(gpa);
+    try std.testing.expect(!std.mem.eql(f32, linear_neutral.rgba, linear_early_edit.rgba));
 }
 
 test "box downsample bins tile the source and average exactly" {

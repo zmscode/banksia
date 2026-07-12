@@ -41,6 +41,21 @@ final class RenderContractTests: XCTestCase {
         XCTAssertNotEqual(metal.implementationID, RendererManifest.strictCPUV2.implementationID)
     }
 
+    func testLinearWorkingOutputHasItsOwnExecutionContract() {
+        XCTAssertNotEqual(
+            RenderExecutionContract.strictCPULinearWorking,
+            .strictCPUDisplay
+        )
+        XCTAssertEqual(
+            RenderExecutionContract.strictCPULinearWorking.output,
+            .cpuRGBA32FloatLinearWorking
+        )
+        XCTAssertEqual(
+            RenderExecutionContract.strictCPULinearWorking.renderer,
+            .strictCPUV2
+        )
+    }
+
     func testStrictCPURendererRejectsMetalExecutionContract() async {
         let metal = RendererManifest(
             implementationID: "banksia.metal.candidate-f32.v1",
@@ -67,5 +82,25 @@ final class RenderContractTests: XCTestCase {
         } catch {
             XCTFail("unexpected error: \(error)")
         }
+    }
+
+    func testArtifactKeysSeparateCPUAndMetalBackends() {
+        func key(_ execution: RenderExecutionContract) -> RenderArtifactKey {
+            RenderArtifactKey(
+                sourceIdentity: "sha256:source",
+                recipeIdentity: "sha256:recipe",
+                edgeMax: 1_440,
+                pixelWidth: 960,
+                pixelHeight: 1_440,
+                execution: execution
+            )
+        }
+
+        let cpuLinear = key(.strictCPULinearWorking)
+        let cpuDisplay = key(.strictCPUDisplay)
+        let metal = key(.metalLateDevelop)
+        XCTAssertEqual(Set([cpuLinear, cpuDisplay, metal]).count, 3)
+        XCTAssertNotEqual(cpuLinear.execution.renderer, metal.execution.renderer)
+        XCTAssertNotEqual(cpuDisplay.execution.output, metal.execution.output)
     }
 }

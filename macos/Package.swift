@@ -20,6 +20,8 @@ let package = Package(
             name: "Banksia",
             dependencies: ["CBanksia"],
             path: "Sources/Banksia",
+            exclude: ["Shaders/LateDevelop.metal"],
+            resources: [.copy("Shaders/LateDevelop.metallib")],
             linkerSettings: [
                 .unsafeFlags([
                     "-L\(zigOutLib)",
