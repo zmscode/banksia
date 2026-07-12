@@ -3,7 +3,11 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var controller = DevelopController()
+    @State private var viewer = ViewerState()
+    @State private var thumbs = ThumbnailStore()
     @State private var importing = false
+    @State private var leftWidth: CGFloat = 268
+    @State private var rightWidth: CGFloat = 322
 
     private static let rawTypes = ["dng", "cr2", "cr3"].compactMap {
         UTType(filenameExtension: $0, conformingTo: .image)
@@ -11,17 +15,30 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            preview
-            Divider()
-            controls
-                .padding()
-        }
-        .toolbar {
-            ToolbarItem {
-                Button("Open…") { importing = true }
-                    .keyboardShortcut("o")
+            HStack(spacing: 0) {
+                NavigatorPanel(controller: controller, viewer: viewer)
+                    .frame(width: leftWidth)
+                    .padding(.leading, 10).padding(.vertical, 10)
+                PanelDivider(width: $leftWidth, range: 210...440, sign: 1)
+                PreviewCanvas(controller: controller, viewer: viewer) { importing = true }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                PanelDivider(width: $rightWidth, range: 250...460, sign: -1)
+                ToolsColumn(controller: controller)
+                    .frame(width: rightWidth)
+                    .padding(.trailing, 10).padding(.vertical, 10)
+            }
+            if controller.folderFiles.count > 1 {
+                Filmstrip(controller: controller, store: thumbs)
             }
         }
+        // Backdrop as a background, never a sibling: a background is sized to the
+        // content, so the blurred frame can't inflate the layout and shove the
+        // fixed-width panels off-screen when an image loads.
+        .background(backdrop)
+        .preferredColorScheme(.dark)
+        .toolbar { toolbar }
+        .navigationTitle(controller.fileName ?? "banksia")
+        .navigationSubtitle(subtitle)
         .fileImporter(
             isPresented: $importing,
             allowedContentTypes: Self.rawTypes
@@ -30,64 +47,65 @@ struct ContentView: View {
                 controller.open(url: url)
             }
         }
-        .frame(minWidth: 800, minHeight: 560)
-        .onOpenURL { url in
-            controller.open(url: url)
-        }
+        .frame(minWidth: 1240, minHeight: 720)
+        .onOpenURL { controller.open(url: $0) }
         .onAppear {
-            // Dev loop: `Banksia <shot.raw>` skips the picker entirely.
-            if let path = CommandLine.arguments.dropFirst().first {
+            // Dev loop: `Banksia <shot.raw>` skips the picker entirely; ignore
+            // any leading flags.
+            if let path = CommandLine.arguments.dropFirst().first,
+               !path.hasPrefix("-") {
                 controller.open(url: URL(fileURLWithPath: path))
             }
         }
     }
 
-    private var preview: some View {
+    /// A heavily blurred, darkened copy of the current frame fills the window so
+    /// the Liquid Glass tool cards refract the photograph's own colour. Falls
+    /// back to flat near-black before anything is loaded.
+    private var backdrop: some View {
         ZStack {
-            Color(white: 0.1)
+            Theme.base
             if let image = controller.image {
                 Image(decorative: image, scale: 1)
                     .resizable()
-                    .interpolation(.high)
-                    .scaledToFit()
-                    .padding(8)
-            } else {
-                Text(controller.statusText)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                    .scaledToFill()
+                    .blur(radius: 90, opaque: true)
+                    .opacity(0.38)
             }
+            LinearGradient(
+                colors: [.black.opacity(0.5), .black.opacity(0.32)],
+                startPoint: .top, endPoint: .bottom
+            )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+        .ignoresSafeArea()
     }
 
-    private var controls: some View {
-        Grid(alignment: .leading, verticalSpacing: 6) {
-            sliderRow("EV", value: $controller.develop.ev, range: -3...3)
-            sliderRow("Temp", value: $controller.develop.temperature, range: -1...1)
-            sliderRow("Tint", value: $controller.develop.tint, range: -0.5...0.5)
-            sliderRow("Contrast", value: $controller.develop.contrast, range: 0...1)
+    private var subtitle: String {
+        guard controller.pixelWidth > 0 else { return "" }
+        var parts = ["\(controller.pixelWidth) × \(controller.pixelHeight)"]
+        if let ms = controller.lastRenderMS {
+            parts.append("\(Int(ms.rounded())) ms")
         }
+        return parts.joined(separator: "   ·   ")
     }
 
-    private func sliderRow(
-        _ label: String,
-        value: Binding<Double>,
-        range: ClosedRange<Double>
-    ) -> some View {
-        GridRow {
-            Text(label)
-                .gridColumnAlignment(.trailing)
-            Slider(value: value, in: range) { editing in
-                controller.isDragging = editing
-                if !editing { controller.dragEnded() }
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Button { importing = true } label: {
+                Label("Open", systemImage: "folder")
             }
-            .onChange(of: value.wrappedValue) {
-                controller.parameterChanged()
+            .keyboardShortcut("o")
+            .help("Open a RAW file")
+        }
+        ToolbarItem {
+            Button(action: controller.resetAdjustments) {
+                Label("Reset", systemImage: "arrow.counterclockwise")
             }
-            Text(String(format: "%+.2f", value.wrappedValue))
-                .monospacedDigit()
-                .frame(width: 56, alignment: .trailing)
-                .foregroundStyle(.secondary)
+            .disabled(!controller.develop.hasEdits)
+            .help("Reset all adjustments")
         }
     }
 }

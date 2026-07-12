@@ -10,7 +10,10 @@ let zigOutLib = Context.packageDirectory + "/../zig-out/lib"
 
 let package = Package(
     name: "Banksia",
-    platforms: [.macOS(.v14)],
+    // macOS 26: the shell is dev-only and leans on Liquid Glass (glassEffect,
+    // .buttonStyle(.glass)), so it targets Tahoe directly rather than guarding
+    // every glass call behind availability.
+    platforms: [.macOS("26.0")],
     targets: [
         .systemLibrary(name: "CBanksia", path: "Sources/CBanksia"),
         .executableTarget(

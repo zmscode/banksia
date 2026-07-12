@@ -63,6 +63,15 @@ actor Renderer {
         return image
     }
 
+    /// Load and render in one actor-isolated step. There is no `await` between
+    /// the load and the render, so concurrent callers can't interleave a load
+    /// between another caller's load and its render — each call renders its own
+    /// raw. The filmstrip relies on this to thumbnail many files on one handle.
+    func loadAndRender(path: String, recipeJSON: String, edgeMax: UInt32) throws -> CGImage {
+        try load(path: path)
+        return try render(recipeJSON: recipeJSON, edgeMax: edgeMax)
+    }
+
     private func handle() throws -> OpaquePointer {
         if let engine { return engine }
         guard let created = bk_engine_create() else {

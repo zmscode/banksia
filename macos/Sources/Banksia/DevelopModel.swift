@@ -15,6 +15,21 @@ final class DevelopModel {
     /// 0 identity, 1 full S-curve; the baseline engine defines no negative contrast.
     var contrast: Double = 0
 
+    /// True when any slider is off its identity value — drives the reset
+    /// affordance and the before/after compare being meaningful.
+    var hasEdits: Bool {
+        ev != 0 || temperature != 0 || tint != 0 || contrast != 0
+    }
+
+    /// Return every slider to identity. The neutral recipe this produces is
+    /// exactly the "before" the compare gesture renders against.
+    func reset() {
+        ev = 0
+        temperature = 0
+        tint = 0
+        contrast = 0
+    }
+
     /// Two white_balance ops compose multiplicatively in the bayer domain:
     /// the camera's as-shot neutral first, the user's temperature/tint on
     /// top. That keeps "sliders at zero" looking like the camera intended.
