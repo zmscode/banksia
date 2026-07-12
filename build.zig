@@ -175,8 +175,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_smoke.step);
 
     // ---- `corpus`: optional local proprietary-RAW compatibility gate --------------
-    // The 483 MB source files are intentionally untracked. This verifies their
-    // hashes, LibRaw mosaics, and macOS ImageIO 1024px previews.
+    // The 812 MB source files are intentionally untracked. This verifies their
+    // hashes, committed metadata, LibRaw mosaics, and ImageIO 1024px previews.
     const corpus_check = b.addSystemCommand(&.{ "sh", "tools/verify-raw-corpus.sh" });
     corpus_check.step.dependOn(b.getInstallStep());
     corpus_check.has_side_effects = true;

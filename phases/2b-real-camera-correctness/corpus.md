@@ -2,8 +2,9 @@
 
 The developer supplied 27 RAW files under `assets/`. The approximately 813 MB
 originals are intentionally ignored by Git; `corpus.sha256` identifies the exact
-local files. This corpus is an optional compatibility/oracle corpus until its
-licence is recorded and distributable DNG derivatives are produced.
+local files and `corpus.tsv` records their per-file capture and render metadata.
+This corpus is an optional compatibility/oracle corpus until its licence is
+recorded and distributable DNG derivatives are produced.
 
 ## Camera groups
 
@@ -31,8 +32,10 @@ camera-RGB-to-XYZ matrix, Banksia's Bradford/D50 transform, linear Rec.2020
 working space, and final sRGB encoding.
 
 The CR3 filenames provide three scene/wardrobe groups: black strip, olive, and
-emerald. The CR2 scene content, lens, ISO, orientation, and licensing terms still
-need to be entered from a trusted metadata tool or capture notes.
+emerald. The committed inventory records lens, ISO, capture time, sensor geometry,
+crop, orientation, relevant format features, and the known scene categories from
+LibRaw 0.22.1 and the filenames. CR2 scene content and licensing terms still need
+capture notes or confirmation from the rights holder; unknowns remain explicit.
 
 ## Role in Phase 2B
 
@@ -46,15 +49,17 @@ need to be entered from a trusted metadata tool or capture notes.
   licensed DNG corpus is still required for mandatory CI.
 
 Run `zig build corpus` on a machine containing the local assets. It verifies all
-27 SHA-256 hashes, unpacks and copies the 18 LibRaw sensor mosaics, checks all 9
-LinearRaw files fail by their expected name, and decodes every file to a
-temporary 1024px PNG through ImageIO.
+27 SHA-256 hashes, requires the hash and metadata path sets to agree, checks 18
+camera/lens/ISO/geometry records against Banksia's LibRaw boundary, unpacks the
+18 sensor mosaics, checks all 9 LinearRaw files fail by their expected name, and
+decodes every file to a temporary 1024px PNG through ImageIO.
 
 ## Provenance and licence gaps
 
 - Provenance: supplied locally by the developer on 2026-07-11.
 - Copyright/licence: not yet recorded; do not redistribute or commit originals.
-- Capture settings: LibRaw provides timestamp, lens, and ISO; a committed
-  per-file metadata export is still required.
+- Capture settings: the committed `corpus.tsv` records LibRaw's timestamp, lens,
+  ISO, sensor size, orientation, and crop for every file. Scene classification
+  remains incomplete where it cannot be established from capture notes.
 - Oracle settings: current ImageIO output uses its default RAW development and
   Display P3 profile; exact neutral oracle settings remain to be produced.
