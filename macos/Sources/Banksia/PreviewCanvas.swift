@@ -1,3 +1,4 @@
+import CoreGraphics
 import SwiftUI
 
 /// The viewer. The image letterboxes via `scaledToFit` (no manual measuring, so
@@ -14,9 +15,18 @@ struct PreviewCanvas: View {
     @State private var splitEnabled = false
     @State private var splitFraction: CGFloat = 0.5
     @State private var isDropTargeted = false
+    @State private var showClipping = false
+    @State private var clipOverlay: CGImage?
+    @State private var hoverPoint: CGPoint?
+    @State private var commandHeld = false
+    @State private var cropEnabled = false
+    @State private var cropRect = CGRect(x: 0.12, y: 0.12, width: 0.76, height: 0.76)
+    @State private var cropAngle: Double = 0
 
     private static let rawExtensions: Set<String> = ["dng", "cr2", "cr3"]
-    private static let maxScale: CGFloat = 8
+    // 1 = fit; below 1 pulls back for breathing room, above 1 pixel-peeps.
+    private static let minScale: CGFloat = 0.33
+    private static let maxScale: CGFloat = 10
 
     var body: some View {
         ZStack {
@@ -26,8 +36,10 @@ struct PreviewCanvas: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
         .background(sizeReader)
+        .background(zoomShortcuts)
         .contentShape(Rectangle())
         .overlay(alignment: .topLeading) { renderingPill }
+        .overlay { loupeOverlay }
         .overlay(alignment: .bottom) { toolbar }
         .dropDestination(for: URL.self) { urls, _ in
             openDropped(urls)
@@ -36,6 +48,22 @@ struct PreviewCanvas: View {
         .onChange(of: controller.pixelWidth) {
             viewer.imageSize = CGSize(width: controller.pixelWidth, height: controller.pixelHeight)
         }
+        .onChange(of: viewer.viewSize) { snapFitIfNeeded() }
+        .onChange(of: viewer.insetLeading) { snapFitIfNeeded() }
+        .task(id: ClipKey(on: showClipping, render: controller.renderID)) {
+            guard showClipping, let image = controller.image else {
+                clipOverlay = nil
+                return
+            }
+            clipOverlay = await Task.detached(priority: .utility) {
+                makeClippingOverlay(from: image)
+            }.value
+        }
+    }
+
+    private struct ClipKey: Hashable {
+        let on: Bool
+        let render: UInt
     }
 
     private var sizeReader: some View {
@@ -74,21 +102,30 @@ struct PreviewCanvas: View {
                             )
                         }
                     }
+            }
+            if showClipping, let overlay = clipOverlay {
+                transformed(overlay).allowsHitTesting(false)
+            }
+            if splitEnabled, controller.baselineImage != nil {
                 splitControls
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
-        .overlay { interaction }
+        .overlay { if !cropEnabled { interaction } }
+        .overlay { if cropEnabled { CropOverlay(rect: $cropRect, angle: $cropAngle) { cropEnabled = false } } }
         .shadow(color: .black.opacity(0.5), radius: 18, y: 6)
         .animation(.interactiveSpring(response: 0.26, dampingFraction: 0.85), value: viewer.scale)
     }
 
     private func transformed(_ cg: CGImage) -> some View {
-        Image(decorative: cg, scale: 1)
+        // Size to the inset-aware fitted size (not scaledToFit on the whole
+        // frame), so Fit lands in the clear region between the panels.
+        let fitted = viewer.fittedSize()
+        return Image(decorative: cg, scale: 1)
             .resizable()
             .interpolation(viewer.scale > 3 ? .none : .high)
-            .scaledToFit()
+            .frame(width: fitted.width, height: fitted.height)
             .scaleEffect(viewer.scale)
             .offset(viewer.offset)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -106,8 +143,79 @@ struct PreviewCanvas: View {
                 settledOffset = viewer.offset
             },
             onDoubleClick: { toggleZoom() },
-            onSplit: { fraction in splitFraction = min(max(fraction, 0.04), 0.96) }
+            onSplit: { fraction in splitFraction = min(max(fraction, 0.04), 0.96) },
+            onPointer: { location, command in
+                hoverPoint = location
+                commandHeld = command
+            }
         )
+    }
+
+    // MARK: Pixel loupe (hold ⌘)
+
+    @ViewBuilder
+    private var loupeOverlay: some View {
+        if commandHeld, let point = hoverPoint, let image = controller.displayImage,
+           let coord = imageCoord(at: point, image: image) {
+            loupe(image: image, at: point, coord: coord)
+        }
+    }
+
+    private func loupe(image: CGImage, at point: CGPoint, coord: CGPoint) -> some View {
+        let size: CGFloat = 132
+        let region = 18
+        let px = Int(coord.x)
+        let py = Int(coord.y)
+        let rgb = pixelRGB(image, px, py)
+        let cropX = max(0, min(image.width - region, px - region / 2))
+        let cropY = max(0, min(image.height - region, py - region / 2))
+        let crop = image.cropping(to: CGRect(x: cropX, y: cropY, width: region, height: region))
+        return VStack(spacing: 5) {
+            ZStack {
+                if let crop {
+                    Image(decorative: crop, scale: 1).resizable().interpolation(.none)
+                }
+                Rectangle().fill(.white.opacity(0.6)).frame(width: 1)
+                Rectangle().fill(.white.opacity(0.6)).frame(height: 1)
+            }
+            .frame(width: size, height: size)
+            .clipShape(Circle())
+            .overlay(Circle().strokeBorder(.white.opacity(0.4), lineWidth: 1))
+            .shadow(color: .black.opacity(0.5), radius: 6)
+            if let rgb {
+                Text("R \(rgb.0)   G \(rgb.1)   B \(rgb.2)")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(.black.opacity(0.55), in: Capsule())
+            }
+        }
+        .position(
+            x: min(max(point.x, size / 2), max(size / 2, viewer.viewSize.width - size / 2)),
+            y: max(point.y - size / 2 - 34, size / 2 + 8)
+        )
+        .allowsHitTesting(false)
+    }
+
+    /// Map a viewer point to the pixel under it, or nil if off the image.
+    private func imageCoord(at point: CGPoint, image: CGImage) -> CGPoint? {
+        let size = viewer.viewSize
+        guard size.width > 0, viewer.imageSize.width > 0 else { return nil }
+        let fitted = viewer.fittedSize()
+        let displayWidth = fitted.width * viewer.scale
+        let displayHeight = fitted.height * viewer.scale
+        let u = 0.5 + (point.x - (size.width / 2 + viewer.offset.width)) / displayWidth
+        let v = 0.5 + (point.y - (size.height / 2 + viewer.offset.height)) / displayHeight
+        guard u >= 0, u <= 1, v >= 0, v <= 1 else { return nil }
+        return CGPoint(x: u * CGFloat(image.width), y: v * CGFloat(image.height))
+    }
+
+    private func pixelRGB(_ image: CGImage, _ x: Int, _ y: Int) -> (Int, Int, Int)? {
+        guard x >= 0, y >= 0, x < image.width, y < image.height,
+              let data = image.dataProvider?.data,
+              let src = CFDataGetBytePtr(data) else { return nil }
+        let p = y * image.bytesPerRow + x * 4
+        return (Int(src[p]), Int(src[p + 1]), Int(src[p + 2]))
     }
 
     // MARK: Split
@@ -232,6 +340,8 @@ struct PreviewCanvas: View {
                 divider
                 compareButton
                 splitButton
+                clippingButton
+                cropButton
             }
             .padding(.horizontal, 14).padding(.vertical, 9)
             .glassCard(cornerRadius: 22)
@@ -271,11 +381,11 @@ struct PreviewCanvas: View {
                 Image(systemName: "plus.magnifyingglass")
             }
             Button { toggleZoom() } label: {
-                Image(systemName: viewer.isZoomed
-                    ? "arrow.down.right.and.arrow.up.left"
-                    : "arrow.up.left.and.arrow.down.right")
+                Image(systemName: viewer.isFit
+                    ? "arrow.up.left.and.arrow.down.right"
+                    : "arrow.down.right.and.arrow.up.left")
             }
-            .help(viewer.isZoomed ? "Fit" : "Zoom in")
+            .help(viewer.isFit ? "Zoom in" : "Fit")
         }
         .buttonStyle(.borderless)
         .foregroundStyle(Theme.textPrimary)
@@ -312,6 +422,43 @@ struct PreviewCanvas: View {
         .foregroundStyle(splitEnabled ? Theme.accent : Theme.textPrimary)
         .disabled(controller.baselineImage == nil)
         .help("Before / after split")
+    }
+
+    private var clippingButton: some View {
+        Button { showClipping.toggle() } label: {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.caption)
+                .frame(width: 24, height: 20)
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(showClipping ? Theme.accent : Theme.textPrimary)
+        .help("Clipping warnings — highlights red, shadows blue")
+    }
+
+    private var cropButton: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) { cropEnabled.toggle() }
+        } label: {
+            Image(systemName: "crop").font(.caption).frame(width: 24, height: 20)
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(cropEnabled ? Theme.accent : Theme.textPrimary)
+        .help("Crop & straighten — mock, not wired to the engine")
+    }
+
+    /// Invisible buttons that register the zoom keyboard shortcuts on the window.
+    private var zoomShortcuts: some View {
+        ZStack {
+            Button("") { setScale(viewer.scale * 1.5) }
+                .keyboardShortcut("=", modifiers: .command)
+            Button("") { setScale(viewer.scale / 1.5) }
+                .keyboardShortcut("-", modifiers: .command)
+            Button("") { fitZoom() }
+                .keyboardShortcut("0", modifiers: .command)
+            Button("") { actualPixels() }
+                .keyboardShortcut("1", modifiers: .command)
+        }
+        .opacity(0)
     }
 
     // MARK: Zoom & pan
@@ -360,27 +507,46 @@ struct PreviewCanvas: View {
 
     private func toggleZoom() {
         withAnimation(.spring(response: 0.34, dampingFraction: 0.82)) {
-            if viewer.isZoomed {
-                viewer.scale = 1; viewer.offset = .zero
-            } else {
-                viewer.scale = 2
-            }
-            viewer.offset = clampOffset(viewer.offset)
+            viewer.scale = viewer.isFit ? 2 : 1
+            viewer.offset = clampOffset(viewer.fitOffset)
             settledScale = viewer.scale
             settledOffset = viewer.offset
         }
     }
 
+    private func fitZoom() {
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+            viewer.scale = 1
+            viewer.offset = viewer.fitOffset
+            settledScale = 1
+            settledOffset = viewer.fitOffset
+        }
+    }
+
+    /// Keep Fit centred in the clear region as the window or panels change.
+    private func snapFitIfNeeded() {
+        guard viewer.isFit else { return }
+        viewer.offset = viewer.fitOffset
+        settledOffset = viewer.fitOffset
+    }
+
+    /// Zoom to true 1:1 — one image pixel per screen point.
+    private func actualPixels() {
+        let fitted = viewer.fittedSize()
+        guard fitted.width > 0 else { return }
+        setScale(viewer.imageSize.width / fitted.width)
+    }
+
     private func resetView() {
         viewer.reset()
         settledScale = 1
-        settledOffset = .zero
+        settledOffset = viewer.fitOffset
         splitEnabled = false
         splitFraction = 0.5
     }
 
     private func clampScale(_ value: CGFloat) -> CGFloat {
-        min(max(value, 1), Self.maxScale)
+        min(max(value, Self.minScale), Self.maxScale)
     }
 
     /// Clamp pan so a zoomed image can't be dragged past its edges, while still

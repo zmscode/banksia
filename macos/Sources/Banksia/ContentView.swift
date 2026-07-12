@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -6,8 +7,7 @@ struct ContentView: View {
     @State private var viewer = ViewerState()
     @State private var thumbs = ThumbnailStore()
     @State private var importing = false
-    @State private var leftWidth: CGFloat = 268
-    @State private var rightWidth: CGFloat = 322
+    @State private var solo = false
 
     private static let rawTypes = ["dng", "cr2", "cr3"].compactMap {
         UTType(filenameExtension: $0, conformingTo: .image)
@@ -15,26 +15,30 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                NavigatorPanel(controller: controller, viewer: viewer)
-                    .frame(width: leftWidth)
-                    .padding(.leading, 10).padding(.vertical, 10)
-                PanelDivider(width: $leftWidth, range: 210...440, sign: 1)
+            // The viewer fills the whole area; the panels are floating card
+            // columns over it, so the frame reads full-bleed and clipped behind
+            // the glass. One base colour everywhere, no divider.
+            ZStack {
                 PreviewCanvas(controller: controller, viewer: viewer) { importing = true }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                PanelDivider(width: $rightWidth, range: 250...460, sign: -1)
-                ToolsColumn(controller: controller)
-                    .frame(width: rightWidth)
-                    .padding(.trailing, 10).padding(.vertical, 10)
+                if !solo {
+                    HStack(spacing: 0) {
+                        NavigatorPanel(controller: controller, viewer: viewer)
+                            .frame(width: 268)
+                            .transition(.move(edge: .leading).combined(with: .opacity))
+                        Spacer(minLength: 0)
+                        ToolsColumn(controller: controller)
+                            .frame(width: 322)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                    }
+                    .padding(10)
+                }
             }
-            if controller.folderFiles.count > 1 {
+            if !solo, controller.folderFiles.count > 1 {
                 Filmstrip(controller: controller, store: thumbs)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        // Backdrop as a background, never a sibling: a background is sized to the
-        // content, so the blurred frame can't inflate the layout and shove the
-        // fixed-width panels off-screen when an image loads.
-        .background(backdrop)
+        .background(Color(white: 0.10).ignoresSafeArea())
         .preferredColorScheme(.dark)
         .tint(Theme.accent)
         .toolbar { toolbar }
@@ -50,7 +54,9 @@ struct ContentView: View {
         }
         .frame(minWidth: 1240, minHeight: 720)
         .onOpenURL { controller.open(url: $0) }
+        .onChange(of: solo) { updateInsets() }
         .onAppear {
+            updateInsets()
             // Dev loop: `Banksia <shot.raw>` skips the picker entirely; ignore
             // any leading flags.
             if let path = CommandLine.arguments.dropFirst().first,
@@ -60,27 +66,11 @@ struct ContentView: View {
         }
     }
 
-    /// A heavily blurred, darkened copy of the current frame fills the window so
-    /// the Liquid Glass tool cards refract the photograph's own colour. Falls
-    /// back to flat near-black before anything is loaded.
-    private var backdrop: some View {
-        ZStack {
-            Theme.base
-            if let image = controller.image {
-                Image(decorative: image, scale: 1)
-                    .resizable()
-                    .scaledToFill()
-                    .blur(radius: 90, opaque: true)
-                    .opacity(0.38)
-            }
-            LinearGradient(
-                colors: [.black.opacity(0.5), .black.opacity(0.32)],
-                startPoint: .top, endPoint: .bottom
-            )
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .clipped()
-        .ignoresSafeArea()
+    /// Tell the viewer how much room the floating panels take, so Fit stays
+    /// clear of them (panel width + padding + a small gap; nothing when solo).
+    private func updateInsets() {
+        viewer.insetLeading = solo ? 0 : 268 + 10 + 14
+        viewer.insetTrailing = solo ? 0 : 322 + 10 + 14
     }
 
     private var subtitle: String {
@@ -107,6 +97,21 @@ struct ContentView: View {
             }
             .disabled(!controller.develop.hasEdits)
             .help("Reset all adjustments")
+        }
+        ToolbarItemGroup {
+            Button {
+                withAnimation(.easeInOut(duration: 0.22)) { solo.toggle() }
+            } label: {
+                Label("Solo", systemImage: solo ? "rectangle.split.3x1" : "rectangle.inset.filled")
+            }
+            .help(solo ? "Show panels" : "Solo — hide the panels")
+            .keyboardShortcut("\\", modifiers: .command)
+
+            Button { NSApp.keyWindow?.toggleFullScreen(nil) } label: {
+                Label("Full screen", systemImage: "arrow.up.left.and.arrow.down.right")
+            }
+            .help("Toggle full screen")
+            .keyboardShortcut("f", modifiers: [.command, .control])
         }
     }
 }

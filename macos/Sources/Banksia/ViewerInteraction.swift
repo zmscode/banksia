@@ -18,6 +18,7 @@ struct ViewerInteraction: NSViewRepresentable {
     var onMagnifyEnded: () -> Void
     var onDoubleClick: () -> Void
     var onSplit: (_ fraction: CGFloat) -> Void = { _ in }
+    var onPointer: (_ location: CGPoint?, _ commandKey: Bool) -> Void = { _, _ in }
 
     func makeNSView(context: Context) -> Catcher {
         let view = Catcher()
@@ -32,10 +33,39 @@ struct ViewerInteraction: NSViewRepresentable {
     final class Catcher: NSView {
         var host: ViewerInteraction?
         private var dragOrigin: NSPoint?
+        private var lastMoved: NSPoint?
 
         // Top-left origin, y down — matches SwiftUI's coordinate space.
         override var isFlipped: Bool { true }
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        // A tracking area drives the pixel loupe: hover position + ⌘ state.
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            trackingAreas.forEach(removeTrackingArea)
+            addTrackingArea(NSTrackingArea(
+                rect: bounds,
+                options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                owner: self
+            ))
+        }
+
+        override func mouseMoved(with event: NSEvent) {
+            let location = convert(event.locationInWindow, from: nil)
+            lastMoved = location
+            host?.onPointer(location, event.modifierFlags.contains(.command))
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            lastMoved = nil
+            host?.onPointer(nil, false)
+        }
+
+        override func flagsChanged(with event: NSEvent) {
+            if let location = lastMoved {
+                host?.onPointer(location, event.modifierFlags.contains(.command))
+            }
+        }
 
         private var splitting: Bool { host?.splitActive == true }
 

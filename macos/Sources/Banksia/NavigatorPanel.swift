@@ -13,12 +13,15 @@ struct NavigatorPanel: View {
             VStack(spacing: 8) {
                 navigator
                 info
+                RatingMock()
                 recipe
             }
-            .padding(.bottom, 4)
+            .padding(.horizontal, 8)
+            .padding(.bottom, 8)
+            .background(OverlayScrollers())
         }
-        .scrollIndicators(.hidden)
         .scrollBounceBehavior(.basedOnSize)
+        .scrollEdgeFade()
     }
 
     private var navigator: some View {

@@ -10,19 +10,31 @@ final class ViewerState {
     var offset: CGSize = .zero
     var viewSize: CGSize = .zero
     var imageSize: CGSize = .zero
+    /// Horizontal room the floating panels occupy, so Fit keeps the whole frame
+    /// clear of them. The image can still pan behind them once zoomed.
+    var insetLeading: CGFloat = 0
+    var insetTrailing: CGFloat = 0
 
     var isZoomed: Bool { scale > 1.01 }
+    var isFit: Bool { abs(scale - 1) < 0.01 }
+
+    /// The offset that centres the fitted image in the clear region between the
+    /// panels (they're asymmetric, so this isn't zero).
+    var fitOffset: CGSize {
+        CGSize(width: (insetLeading - insetTrailing) / 2, height: 0)
+    }
 
     func reset() {
         scale = 1
-        offset = .zero
+        offset = fitOffset
     }
 
-    /// The fit-scaled image size inside the current viewport.
+    /// The fit-scaled image size inside the viewport, minus the panel insets.
     func fittedSize() -> CGSize {
         guard imageSize.width > 0, imageSize.height > 0,
               viewSize.width > 0, viewSize.height > 0 else { return viewSize }
-        let s = min(viewSize.width / imageSize.width, viewSize.height / imageSize.height)
+        let availableWidth = max(1, viewSize.width - insetLeading - insetTrailing)
+        let s = min(availableWidth / imageSize.width, viewSize.height / imageSize.height)
         return CGSize(width: imageSize.width * s, height: imageSize.height * s)
     }
 

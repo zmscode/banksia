@@ -12,12 +12,16 @@ struct ToolsColumn: View {
                 histogram
                 whiteBalance
                 exposure
+                LightMock()
                 curve
+                DetailMock()
             }
-            .padding(.bottom, 4)
+            .padding(.horizontal, 8)
+            .padding(.bottom, 8)
+            .background(OverlayScrollers())
         }
-        .scrollIndicators(.hidden)
         .scrollBounceBehavior(.basedOnSize)
+        .scrollEdgeFade()
     }
 
     private var histogram: some View {

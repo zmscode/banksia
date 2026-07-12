@@ -5,26 +5,29 @@ import SwiftUI
 struct ToolCard<Content: View>: View {
     let title: String
     let systemImage: String
+    let mock: Bool
     let trailing: AnyView?
     @ViewBuilder let content: () -> Content
 
     init(
-        _ title: String, systemImage: String,
+        _ title: String, systemImage: String, mock: Bool = false,
         @ViewBuilder content: @escaping () -> Content
     ) {
         self.title = title
         self.systemImage = systemImage
+        self.mock = mock
         self.trailing = nil
         self.content = content
     }
 
     init<Trailing: View>(
-        _ title: String, systemImage: String,
+        _ title: String, systemImage: String, mock: Bool = false,
         @ViewBuilder trailing: () -> Trailing,
         @ViewBuilder content: @escaping () -> Content
     ) {
         self.title = title
         self.systemImage = systemImage
+        self.mock = mock
         self.trailing = AnyView(trailing())
         self.content = content
     }
@@ -39,6 +42,7 @@ struct ToolCard<Content: View>: View {
                 Text(title)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(Theme.textPrimary)
+                if mock { mockBadge }
                 Spacer()
                 trailing
             }
@@ -47,6 +51,15 @@ struct ToolCard<Content: View>: View {
         .padding(11)
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard()
+        .opacity(mock ? 0.9 : 1)
+    }
+
+    /// Marks a card whose controls aren't connected to the engine yet.
+    private var mockBadge: some View {
+        Image(systemName: "hammer.fill")
+            .font(.system(size: 8))
+            .foregroundStyle(Theme.textTertiary)
+            .help("Mock-up — these controls aren't wired to the engine yet")
     }
 }
 
