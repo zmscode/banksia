@@ -30,8 +30,8 @@ fauna for the libraries inside):
 - **emu** (`emu/`) — the develop engine: decode, colour, pipeline, render
   cache, thumbnails.
 - **wombat** (`wombat/`) — storage: content-addressed blob vault, chunking,
-  and the durable columnar catalog. GPU/render architecture is Phase 2C;
-  sessions follow in Phase 2D.
+  and the durable columnar catalog. GPU/render architecture is Phase 2C, the
+  calibrated image pipeline is Phase 2D, and sessions follow in Phase 2E.
 - **lyrebird** (`lyrebird/`) — similarity: perceptual hashing, burst
   grouping, sharpness scoring. *(Phase 4 — stub.)*
 

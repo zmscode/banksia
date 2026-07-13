@@ -2,7 +2,7 @@
 use strict;
 use warnings;
 
-use DBI;
+use DBI qw(:sql_types);
 use Digest::SHA qw(sha256_hex);
 use File::Basename qw(basename dirname);
 use File::Find qw(find);
@@ -338,8 +338,11 @@ sub insert_profiles {
             next if $offset + $size > length($data);
             my $payload = substr($data, $offset, $size);
             my $type = length($payload) >= 4 ? substr($payload, 0, 4) : undef;
-            $tag_insert->execute(
-                $profile_id, $ordinal, $signature, $offset, $size, $type, $payload);
+            execute_with_blobs(
+                $tag_insert,
+                [$profile_id, $ordinal, $signature, $offset, $size, $type, $payload],
+                { 7 => 1 },
+            );
             if (defined $type && $type eq 'XYZ ') {
                 parse_xyz($profile_id, $ordinal, $payload, $xyz_insert);
             } elsif (defined $type && $type eq 'curv') {
@@ -388,10 +391,28 @@ sub parse_mft2 {
     my $input = substr($payload, 52, $input_bytes);
     my $clut = substr($payload, 52 + $input_bytes, $clut_bytes);
     my $output = substr($payload, 52 + $input_bytes + $clut_bytes, $output_bytes);
-    $insert->execute(
-        $profile_id, $tag_ordinal, $inputs, $outputs, $grid,
-        substr($payload, 12, 36), $input_entries, $output_entries,
-        $input, $clut, $output);
+    execute_with_blobs(
+        $insert,
+        [
+            $profile_id, $tag_ordinal, $inputs, $outputs, $grid,
+            substr($payload, 12, 36), $input_entries, $output_entries,
+            $input, $clut, $output,
+        ],
+        { 6 => 1, 9 => 1, 10 => 1, 11 => 1 },
+    );
+}
+
+sub execute_with_blobs {
+    my ($statement, $values, $blob_parameters) = @_;
+    for my $index (0 .. $#$values) {
+        my $parameter = $index + 1;
+        if ($blob_parameters->{$parameter}) {
+            $statement->bind_param($parameter, $values->[$index], SQL_BLOB);
+        } else {
+            $statement->bind_param($parameter, $values->[$index]);
+        }
+    }
+    $statement->execute;
 }
 
 sub decode_cdx {

@@ -13,6 +13,7 @@ session without losing edits.
 
 - Phase 3 culling workflow.
 - Phase 2B engine-v2 baseline colour.
+- Phase 2D calibrated reconstruction, camera defaults, and lens/detail profiles.
 - Persistent session and recipe storage.
 
 ## Work items
@@ -28,22 +29,17 @@ session without losing edits.
 - [ ] Define operation order independent of UI panel order.
 - [ ] Give every operation an exact neutral state.
 
-### 4.2 Improve baseline demosaic and highlight handling
+### 4.2 Integrate the calibrated technical baseline
 
-- [ ] Add one measured edge-aware Bayer demosaic, such as RCD, behind a new
-  implementation ID.
-- [ ] Review algorithm licensing before implementation or adoption.
-- [ ] Keep bilinear for v1 and diagnostic comparison.
-- [ ] Add zipper, maze, diagonal, false-colour, fine-grid, odd-size, and border
-  fixtures.
-- [ ] Add clipped-channel highlight reconstruction or compression suitable for
-  the supported DNG corpus.
-  Phase 2B supplies a conservative neutral blend near sensor white; this item
-  remains open for reconstruction of recoverable detail and user-adjustable
-  highlight behavior.
-- [ ] Ensure highlight handling is monotonic and finite.
-- [ ] Record objective and visual improvement before making the new demosaic the
-  default.
+- [ ] Expose the resolved camera profile, film curve, detail calibration, lens
+  profile, graph version, and fallback reason in the develop view.
+- [ ] Let a user select calibrated default, neutral matrix, linear curve, and
+  correction-off diagnostics without conflating those choices with adjustments.
+- [ ] Preserve Phase 2D dependency IDs in stored recipes and render manifests.
+- [ ] Keep highlight/HDR user controls separate from Phase 2D sensor-headroom
+  reconstruction.
+- [ ] Require explicit variant migration when adopting a newer calibration or
+  processing graph.
 
 ### 4.3 Add essential global controls
 
@@ -162,7 +158,7 @@ boundary.
 ## Non-goals
 
 - Targeted hue ranges and skin-tone tools.
-- 3D-LUT camera looks.
+- Additional creative 3D-LUT looks beyond the Phase 2D technical input profile.
 - Adjustment layers and local masks.
 - Brushes, gradients, or subject masks.
 - Clarity, structure, or dehaze unless required by the acceptance shoot.

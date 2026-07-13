@@ -7,8 +7,9 @@ documentation.
 
 ## Decision
 
-Banksia should become camera-, ISO-, and lens-aware, but must keep four
-independent, versioned concepts:
+Banksia should become camera-, ISO-, and lens-aware, bootstrapping from the
+extracted Capture One 16.7.3 calibration values while keeping four independent,
+versioned concepts:
 
 1. a technically neutral camera matrix and as-shot white balance;
 2. an optional nonlinear camera colour profile;
@@ -76,9 +77,10 @@ detail correction represented independently.
 - Define an immutable Banksia camera-profile format: matrix fallback, optional
   one-dimensional shaper curves, optional 3D LUT, supported illuminants,
   profile ID, version, and provenance.
-- Build our own rights-cleared profiles from controlled chart captures. The
-  extracted Capture One profiles are behavioral research evidence, not assets
-  to redistribute or silently embed.
+- Import the extracted Capture One profiles as an explicitly identified
+  bootstrap calibration bundle for this hobby project.
+- Later Banksia-tuned or independently measured profiles create new immutable
+  versions rather than changing bootstrap values in place.
 - Apply the nonlinear profile in a named, versioned renderer operation after
   neutral camera conversion. Keep tone response as a separate operation.
 - Compare the bare matrix and candidate profile using chart ΔE00, neutral-axis
@@ -100,7 +102,7 @@ detail correction represented independently.
 - Define independent, bounded models for distortion, lateral CA, falloff, and
   corner/detail correction. Missing dimensions must disable or degrade a
   correction explicitly rather than guess.
-- Interpolate a small rights-cleared, versioned lens dataset and include its
+- Import the initial extracted, versioned lens dataset and include its
   profile identity in the render/cache key.
 - Apply optical geometry before user crop, falloff in linear light, and detail
   correction only after the noise model exists.
@@ -108,10 +110,12 @@ detail correction represented independently.
 ## Placement
 
 - Phase 2B remains the neutral matrix/white-balance correctness gate.
-- Phase 4.7 may add a small profiled lens minimum when an acceptance shoot
-  demonstrates the need.
-- Branch B1 owns nonlinear camera profiles and their calibration/validation.
-- Branch B4 owns expanded lens, denoise, and capture-sharpen processing.
+- Phase 2D owns the initial calibrated reconstruction, nonlinear profiles, film
+  curves, ISO/detail defaults, and three-lens correction set.
+- Phase 4 consumes those technical defaults while adding user-facing global
+  controls and recipe persistence.
+- Branch B owns later Banksia-tuned profiles, expanded detail/lens support, and
+  advanced colour rather than the initial calibration foundation.
 
 The detailed reverse-engineering evidence remains in
 [`capture-one-quality-techniques.md`](capture-one-quality-techniques.md) and

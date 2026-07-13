@@ -12,7 +12,7 @@
 > This roadmap supersedes the original linear Phase 0–7 plan (removed; its
 > history lives in git). Foundation Phases 0 and 1 landed under that
 > structure and are complete; the next foundation work is split across
-> 2A/2B/2C/2D.
+> 2A/2B/2C/2D/2E.
 
 ---
 
@@ -94,7 +94,7 @@ zero acknowledged loss. The 100,000-asset rating-plus-lens scan measured
 LibRaw-backed Canon CR2/CR3 files render through engine v2 with corrected
 geometry, colour, white balance, and bounded clipped-highlight handling. The
 mandatory corpus contains eight full-resolution DNG derivatives; the optional
-local corpus covers 18 Canon RAWs and nine named unsupported LinearRaw files.
+local corpus covers 18 Canon RAWs and nine supported Apple LinearRaw files.
 
 ### Foundation Phase 2C — performance architecture and Metal proof
 
@@ -115,6 +115,23 @@ and CPU fallback are exit gates; merely using Metal is not completion.
 - [x] Pass the cached late-edit ≤33 ms p95 gate in two clean 31-frame runs.
 - [ ] Pass CPU/Metal perceptual, failure, memory, idle-energy, and latency gates.
 
+### Foundation Phase 2D — calibrated image pipeline
+
+**Planned next.** Banksia will bootstrap a camera-, ISO-, and lens-aware default
+pipeline from the extracted Capture One 16.7.3 calibration corpus, while keeping
+camera colour, film curve, detail defaults, and optical correction as separate,
+versioned dependencies. EOS-1D X Mark II and EOS R3 are the initial supported
+camera profiles; the three Canon corpus lenses form the initial lens set.
+
+The strict matrix renderer and every historical manifest remain available.
+Later Banksia tuning creates new immutable calibration versions instead of
+silently changing bootstrap results.
+
+### Foundation Phase 2E — safe sessions and import
+
+**Planned.** Portable sessions, bounded streaming import, provenance, resumable
+ingest, and verification follow the calibrated renderer foundation.
+
 ---
 
 ## Roadmap
@@ -124,7 +141,8 @@ and CPU fallback are exit gates; merely using Metal is not completion.
 | 2A | Stable storage and catalog contract | [`phases/2a-storage-closure/plan.md`](phases/2a-storage-closure/plan.md) | 1–3 weeks |
 | 2B | Correct real-camera DNG baseline | [`phases/2b-real-camera-correctness/plan.md`](phases/2b-real-camera-correctness/plan.md) | 4–8 weeks |
 | 2C | Performance architecture and Metal proof | [`phases/2c-performance-metal/plan.md`](phases/2c-performance-metal/plan.md) | 2–4 weeks |
-| 2D | Safe portable sessions and import | [`phases/2d-sessions-import/plan.md`](phases/2d-sessions-import/plan.md) | 4–7 weeks |
+| 2D | Capture One–calibrated image pipeline foundation | [`phases/2d-calibrated-image-pipeline/plan.md`](phases/2d-calibrated-image-pipeline/plan.md) | 6–12 weeks |
+| 2E | Safe portable sessions and import | [`phases/2e-sessions-import/plan.md`](phases/2e-sessions-import/plan.md) | 4–7 weeks |
 | 3 | Keyboard-driven culling MVP | [`phases/3-culling-mvp/plan.md`](phases/3-culling-mvp/plan.md) | 5–8 weeks |
 | 4 | Baseline global develop | [`phases/4-global-develop/plan.md`](phases/4-global-develop/plan.md) | 6–10 weeks |
 | 5 | Practical export; first completed shoot | [`phases/5-practical-export/plan.md`](phases/5-practical-export/plan.md) | 4–8 weeks |
@@ -138,8 +156,9 @@ graph TD
     F1[Foundation 1: ABI and shell] --> P2A
     P2A --> P2B[2B: real-camera correctness]
     P2B --> P2C[2C: performance and Metal proof]
-    P2C --> P2D[2D: sessions and import]
-    P2D --> P3[3: culling MVP]
+    P2C --> P2D[2D: calibrated image pipeline]
+    P2D --> P2E[2E: sessions and import]
+    P2E --> P3[3: culling MVP]
     P3 --> P4[4: global develop]
     P4 --> P5[5: practical export]
     P5 --> P6[6: private alpha]
@@ -209,5 +228,6 @@ live in [`phases/README.md`](phases/README.md).
 3. Prove an on-demand Metal surface and GPU-resident late-develop slice.
 4. Compare Metal against strict CPU across the Phase 2B corpus and failure paths.
 5. Record the Phase 2C invest/park decision from end-to-visible evidence.
-6. Implement Phase 2D portable sessions and bounded streaming import.
-7. Build manual culling before smart-culling work.
+6. Implement the Phase 2D calibrated camera/ISO/lens pipeline.
+7. Implement Phase 2E portable sessions and bounded streaming import.
+8. Build manual culling before smart-culling work.

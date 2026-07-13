@@ -11,7 +11,7 @@ and reopen with every decision preserved.
 
 ## Dependencies
 
-- Phase 2D sessions, paging, and durable mutations.
+- Phase 2E sessions, paging, and durable mutations.
 - Phase 2B correct default rendering.
 - Existing Swift actor and SwiftUI shell.
 
@@ -86,7 +86,7 @@ and reopen with every decision preserved.
 - [ ] Survey mode for a small selection.
 - [ ] Multi-selection ratings and rejects as one transaction.
 - [ ] Selection count and active filter summary.
-- [ ] RAW+JPEG pair handling if represented by Phase 2D.
+- [ ] RAW+JPEG pair handling if represented by Phase 2E.
 - [ ] Prefetch the next and previous likely selections.
 
 ### 3.7 Operational hardening

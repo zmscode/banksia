@@ -1,4 +1,4 @@
-# Phase 2D — safe sessions, import, and provenance
+# Phase 2E — safe sessions, import, and provenance
 
 **Objective:** provide a conservative, resumable path from a card or folder into
 a self-contained session. No acknowledged catalog entry may reference missing
@@ -23,7 +23,7 @@ The user can:
 
 ## Work items
 
-### 2D.1 Define the session format
+### 2E.1 Define the session format
 
 - [ ] Define a versioned layout containing `session.json`, `vault/`, catalog,
   WAL, `cache/`, and lock state.
@@ -35,7 +35,7 @@ The user can:
 - [ ] Implement a single-writer lock and documented stale-lock recovery.
 - [ ] Treat `cache/` as disposable and everything else as authoritative.
 
-### 2D.2 Define asset and provenance records
+### 2E.2 Define asset and provenance records
 
 - [ ] Store source blob ID separately from source occurrence/provenance.
 - [ ] Record original filename, source-relative path, size, modification time,
@@ -47,7 +47,7 @@ The user can:
   copying succeeded, with visible status.
 - [ ] Do not let preview or metadata failure discard a safely copied source.
 
-### 2D.3 Discover source files safely
+### 2E.3 Discover source files safely
 
 - [ ] Walk deterministically.
 - [ ] Do not follow symlinks by default.
@@ -60,7 +60,7 @@ The user can:
   that change during import.
 - [ ] Hash the source tree before and after acceptance testing.
 
-### 2D.4 Implement bounded streaming ingest
+### 2E.4 Implement bounded streaming ingest
 
 - [ ] Avoid loading a multi-gigabyte source entirely into memory.
 - [ ] Hash while writing a temporary object.
@@ -78,7 +78,7 @@ The user can:
   object—is impossible.
 - [ ] Continue after per-file decode errors unless storage safety is compromised.
 
-### 2D.5 Add import batches and resumability
+### 2E.5 Add import batches and resumability
 
 - [ ] Record batch ID, source, start time, completion state, counts, and failures.
 - [ ] Make restart detect incomplete batches.
@@ -88,7 +88,7 @@ The user can:
 - [ ] Return nonzero CLI status for incomplete batches while preserving successes.
 - [ ] Keep GC manual and disabled by default.
 
-### 2D.6 Define the thumbnail handoff
+### 2E.6 Define the thumbnail handoff
 
 - [ ] Define keys using source hash, renderer manifest, recipe, edge, and encoded
   thumbnail format.
@@ -97,7 +97,7 @@ The user can:
 - [ ] Allow Phase 3 to regenerate all thumbnails after cache deletion.
 - [ ] Record whether an embedded preview is available.
 
-### 2D.7 Add session verification
+### 2E.7 Add session verification
 
 - [ ] Default verification checks catalog references and object presence.
 - [ ] Full verification rehashes every referenced object.

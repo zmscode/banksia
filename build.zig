@@ -348,6 +348,7 @@ fn emu_module(
     });
     module.linkSystemLibrary("raw_r", .{ .use_pkg_config = .no });
     module.linkSystemLibrary("c++", .{});
+    module.linkSystemLibrary("sqlite3", .{});
     return module;
 }
 

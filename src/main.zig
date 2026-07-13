@@ -7,6 +7,8 @@
 //!       create a deterministic native-DNG corpus derivative
 //!   banksia inspect <raw> [--decode|--render]
 //!       parse metadata; optionally unpack the mosaic or complete a v2 render
+//!   banksia calibration-audit <raw>
+//!       report the immutable camera, ISO, profile, curve, and lens selection
 //!
 //! The CLI reads inputs itself; emu stays a pure function over the bytes
 //! it is handed, and every output byte goes through wombat (which owns
@@ -48,6 +50,11 @@ pub fn main(init: std.process.Init) !void {
         if (args.next() != null) return usage();
         return inspect_file(gpa, io, raw_path, decode_pixels, render_pixels);
     }
+    if (std.mem.eql(u8, command, "calibration-audit")) {
+        const raw_path = args.next() orelse return usage();
+        if (args.next() != null) return usage();
+        return calibration_audit_file(gpa, io, raw_path);
+    }
     if (std.mem.eql(u8, command, "convert-dng")) {
         const raw_path = args.next() orelse return usage();
         const out_path = args.next() orelse return usage();
@@ -71,6 +78,100 @@ pub fn main(init: std.process.Init) !void {
         return synth_file(gpa, io, out_path, width, height);
     }
     return usage();
+}
+
+fn calibration_audit_file(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    raw_path: []const u8,
+) !void {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, raw_path, gpa, file_bytes_max) catch |err| {
+        return fail("cannot read raw '{s}': {s}", .{ raw_path, @errorName(err) });
+    };
+    defer gpa.free(bytes);
+    const metadata = emu.raw.decode_metadata(bytes) catch |err| {
+        return fail("cannot inspect '{s}': {s}", .{ raw_path, @errorName(err) });
+    };
+    var database = emu.calibration.Database.open(
+        emu.calibration.database_path_default,
+    ) catch |err| {
+        return fail("cannot open calibration bundle: {s}", .{@errorName(err)});
+    };
+    defer database.deinit();
+
+    const bundle_id = database.bundleId() catch |err| {
+        return fail("cannot read calibration bundle identity: {s}", .{@errorName(err)});
+    };
+    try status(io, "bundle: {s}\n", .{bundle_id.slice()});
+    const camera = database.cameraDefaults(
+        metadata.make.slice(),
+        metadata.model.slice(),
+    ) catch |err| {
+        try status(io, "camera: fallback ({s}) for {s} {s}\n", .{
+            @errorName(err),
+            metadata.make.slice(),
+            metadata.model.slice(),
+        });
+        return;
+    };
+    try status(io, "camera: {s}\n", .{camera.camera_id.slice()});
+    try status(io, "input profile: {s}\n", .{camera.input_profile_id.slice()});
+    try status(io, "film curve: {s}\n", .{camera.film_curve_id.slice()});
+    try status(io, "base gains: camera={d:.4} sensor-range={d:.4}\n", .{
+        camera.base_gain,
+        camera.sensor_range_gain,
+    });
+
+    if (metadata.iso) |iso| {
+        const defaults = database.isoDefaults(camera.camera_id.slice(), iso) catch |err| {
+            return fail("cannot resolve ISO calibration: {s}", .{@errorName(err)});
+        };
+        try status(io, "ISO: {d:.0}\n", .{iso});
+        try optional_status(io, "noise floor", defaults.noise_floor);
+        try optional_status(io, "noise Poisson", defaults.noise_poisson);
+        try optional_status(io, "anti-colour-alias", defaults.anti_color_aliasing);
+        try optional_status(io, "capture sharpen amount", defaults.sharpen_amount);
+        try optional_status(io, "capture sharpen radius", defaults.sharpen_radius);
+        try optional_status(io, "capture sharpen threshold", defaults.sharpen_threshold);
+        try optional_status(io, "long-exposure cleanup", defaults.long_exposure_cleanup);
+        try optional_status(io, "fine grain", defaults.fine_grain);
+    } else {
+        try status(io, "ISO: unavailable; ISO-dependent records skipped\n", .{});
+    }
+
+    if (metadata.lens.len != 0) {
+        const lens = database.lensSummary(metadata.lens.slice()) catch |err| {
+            try status(io, "lens: correction skipped ({s}) for {s}\n", .{
+                @errorName(err),
+                metadata.lens.slice(),
+            });
+            return;
+        };
+        try status(io, "lens: {s}\n", .{lens.lens_id.slice()});
+        try status(io, "lens records: {d} nodes, {d} attributes\n", .{
+            lens.node_count,
+            lens.attribute_count,
+        });
+    } else {
+        try status(io, "lens: correction skipped (metadata unavailable)\n", .{});
+    }
+}
+
+fn optional_status(
+    io: std.Io,
+    name: []const u8,
+    value: ?emu.calibration.IsoValue,
+) !void {
+    if (value) |resolved| {
+        try status(io, "  {s}: {d:.6} ({s}; node ISO {d:.0})\n", .{
+            name,
+            resolved.value,
+            resolved.iso_record_id.slice(),
+            resolved.node_iso,
+        });
+    } else {
+        try status(io, "  {s}: unavailable\n", .{name});
+    }
 }
 
 const FixtureStorage = enum {
@@ -404,6 +505,7 @@ fn usage() error{Usage} {
         \\       banksia synth <out.dng> [<width> <height>]
         \\       banksia convert-dng <raw> <out.dng> <storage>
         \\       banksia inspect <raw> [--decode|--render]
+        \\       banksia calibration-audit <raw>
         \\
     , .{});
     return error.Usage;

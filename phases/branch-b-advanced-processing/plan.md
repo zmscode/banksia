@@ -2,8 +2,8 @@
 
 ### Hypothesis
 
-Banksia can finish more demanding shoots for a narrow supported camera set
-without attempting broad Capture One parity.
+Banksia can evolve the Phase 2D Capture One bootstrap into a distinctive tuned
+look and finish more demanding shoots for a narrow supported camera set.
 
 ### Discover
 
@@ -15,11 +15,11 @@ without attempting broad Capture One parity.
 
 ### Prove in independent increments
 
-#### B1. Camera profiles
+#### B1. Banksia-tuned camera profiles
 
-- [ ] Immutable matrix + optional curves + optional LUT format.
+- [ ] Tune new immutable profile versions from the Phase 2D bootstrap.
 - [ ] Keep camera colour profile and camera tone curve independently selectable.
-- [ ] Add camera/ISO calibration records with stable IDs and provenance.
+- [ ] Expand camera/ISO calibration records beyond the initial Canon set.
 - [ ] Profile provenance and supported illuminants.
 - [ ] ColorChecker solver.
 - [ ] Dual-illuminant interpolation.
@@ -69,9 +69,8 @@ without attempting broad Capture One parity.
 - [ ] Three demanding shoots completed without another RAW developer.
 
 The [Capture One calibration adoption audit](../../research/capture-one-adoption-audit.md)
-records the evidence behind this split. Capture One extraction artifacts guide
-architecture and comparison only; Banksia profiles require distributable
-provenance.
+records the evidence behind this split. Phase 2D imports the initial extracted
+calibration; this branch creates later Banksia-tuned versions and broader support.
 
 ### Invest gate
 

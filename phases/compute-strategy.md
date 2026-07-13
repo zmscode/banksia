@@ -310,7 +310,17 @@ routine readback, precompile/cache pipelines, and keep at most two viewer frames
 in flight initially. Metal ships only if end-to-visible latency, perceptual
 parity, memory, fallback, and idle-energy gates pass.
 
-### Phase 2D — sessions and import
+### Phase 2D — calibrated image pipeline
+
+Keep one strict CPU implementation for every new semantic stage, then port only
+measured regular kernels to Metal. Camera/ISO/lens selection is control-plane
+work and remains on CPU; normalization, LUT evaluation, film curves, lens warp,
+denoise, sharpening, and display conversion are good GPU candidates. Edge-aware
+demosaic stays CPU-reference-first until artefact fixtures and tile halos are
+stable. Calibration tables are immutable shared dependencies, never copied per
+frame, and their memory enters admission and cache identity.
+
+### Phase 2E — sessions and import
 
 Use a bounded pipeline:
 
@@ -594,13 +604,14 @@ race detection and soak behavior.
 3. Add a small cancellation token and generation-based stale-result suppression
    for the shell.
 4. Instrument and run the Phase 2C Metal vertical-slice proof.
-5. Add bounded asset jobs for Phase 2D import.
-6. Introduce one session-owned scheduler for Phase 3 thumbnails.
-7. Add priorities, deduplication, and memory admission as real workloads require.
-8. Profile and fuse remaining CPU passes.
-9. Add deterministic tiled CPU execution only if budgets are still missed.
-10. Parallelize export through the same scheduler.
-11. Run deeper Branch C work only after the Phase 2C invest decision identifies
+5. Implement Phase 2D strict CPU calibration stages and measured Metal ports.
+6. Add bounded asset jobs for Phase 2E import.
+7. Introduce one session-owned scheduler for Phase 3 thumbnails.
+8. Add priorities, deduplication, and memory admission as real workloads require.
+9. Profile and fuse remaining CPU passes.
+10. Add deterministic tiled CPU execution only if budgets are still missed.
+11. Parallelize export through the same scheduler.
+12. Run deeper Branch C work only after the Phase 2C invest decision identifies
     a measured next bottleneck.
 
 ---

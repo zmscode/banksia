@@ -5,7 +5,7 @@
 A reliable one-camera tethered ingest workflow provides enough studio value to
 justify ongoing hardware-specific support.
 
-This branch depends on Phase 2D sessions and may be explored before Phase 8, but
+This branch depends on Phase 2E sessions and may be explored before Phase 8, but
 it must not derail the completed-shoot path.
 
 ### Discover

@@ -9,13 +9,14 @@ been removed; its history lives in git.
 1. [`2a-storage-closure/plan.md`](2a-storage-closure/plan.md)
 2. [`2b-real-camera-correctness/plan.md`](2b-real-camera-correctness/plan.md)
 3. [`2c-performance-metal/plan.md`](2c-performance-metal/plan.md)
-4. [`2d-sessions-import/plan.md`](2d-sessions-import/plan.md)
-5. [`3-culling-mvp/plan.md`](3-culling-mvp/plan.md)
-6. [`4-global-develop/plan.md`](4-global-develop/plan.md)
-7. [`5-practical-export/plan.md`](5-practical-export/plan.md)
-8. [`6-private-alpha/plan.md`](6-private-alpha/plan.md)
-9. [`7-interoperability-public-beta/plan.md`](7-interoperability-public-beta/plan.md)
-10. [`8-history-variants/plan.md`](8-history-variants/plan.md)
+4. [`2d-calibrated-image-pipeline/plan.md`](2d-calibrated-image-pipeline/plan.md)
+5. [`2e-sessions-import/plan.md`](2e-sessions-import/plan.md)
+6. [`3-culling-mvp/plan.md`](3-culling-mvp/plan.md)
+7. [`4-global-develop/plan.md`](4-global-develop/plan.md)
+8. [`5-practical-export/plan.md`](5-practical-export/plan.md)
+9. [`6-private-alpha/plan.md`](6-private-alpha/plan.md)
+10. [`7-interoperability-public-beta/plan.md`](7-interoperability-public-beta/plan.md)
+11. [`8-history-variants/plan.md`](8-history-variants/plan.md)
 
 ## Evidence-gated branches
 
