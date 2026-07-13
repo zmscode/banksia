@@ -468,39 +468,166 @@ private struct MetalLinearImageView: NSViewRepresentable {
         )
     }
 
-    func makeNSView(context: Context) -> OnDemandMTKView {
-        let view = OnDemandMTKView(frame: .zero, device: resources.device)
-        view.delegate = context.coordinator
-        view.colorPixelFormat = .bgra8Unorm_srgb
-        view.depthStencilPixelFormat = .invalid
-        view.framebufferOnly = true
-        view.autoResizeDrawable = true
-        view.preferredFramesPerSecond = 0
-        view.isPaused = true
-        view.enableSetNeedsDisplay = false
-        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        view.layer?.isOpaque = true
-        view.layer?.magnificationFilter = nearestSampling ? .nearest : .linear
-        if let layer = view.layer as? CAMetalLayer {
-            layer.maximumDrawableCount = 2
-            layer.displaySyncEnabled = MetalPresentationTuning.displaySyncEnabled
-            layer.allowsNextDrawableTimeout = true
-            layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
-            layer.presentsWithTransaction = false
-        }
+    func makeNSView(context: Context) -> DisplayLinkedMetalView {
+        let view = DisplayLinkedMetalView(
+            frame: .zero,
+            device: resources.device,
+            renderer: context.coordinator
+        )
+        view.nearestSampling = nearestSampling
         view.requestFrame()
         return view
     }
 
-    func updateNSView(_ view: OnDemandMTKView, context: Context) {
+    func updateNSView(_ view: DisplayLinkedMetalView, context: Context) {
         context.coordinator.update(
             preview: preview,
             previewGeneration: previewGeneration,
             exposureEV: exposureEV,
             contrast: contrast
         )
-        view.layer?.magnificationFilter = nearestSampling ? .nearest : .linear
+        view.nearestSampling = nearestSampling
         view.requestFrame()
+    }
+}
+
+/// A CAMetalDisplayLink-backed surface for interactive late develops. Unlike
+/// MTKView's on-demand draw scheduling, the display link provides the next
+/// display drawable in time for its target presentation interval. This avoids
+/// the extra-frame tail that an asynchronous main-queue `draw()` can add.
+private final class DisplayLinkedMetalView: NSView, CAMetalDisplayLinkDelegate {
+    private let device: any MTLDevice
+    private let renderer: MetalLinearImageRenderer
+    private var displayLink: CAMetalDisplayLink?
+    private var framePending = true
+    private var drawableSizeNeedsUpdate = true
+
+    var nearestSampling = false
+
+    init(
+        frame: NSRect,
+        device: any MTLDevice,
+        renderer: MetalLinearImageRenderer
+    ) {
+        self.device = device
+        self.renderer = renderer
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func makeBackingLayer() -> CALayer {
+        CAMetalLayer()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window != nil else {
+            displayLink?.invalidate()
+            displayLink = nil
+            return
+        }
+        configureLayer()
+        updateDrawableSize()
+        startDisplayLinkIfNeeded()
+        requestFrame()
+    }
+
+    override func layout() {
+        super.layout()
+        drawableSizeNeedsUpdate = true
+        requestFrame()
+    }
+
+    func requestFrame() {
+        framePending = true
+        guard let window,
+              window.occlusionState.contains(.visible),
+              NSApp.isActive,
+              bounds.width > 0,
+              bounds.height > 0
+        else { return }
+        displayLink?.isPaused = false
+    }
+
+    func metalDisplayLink(
+        _ link: CAMetalDisplayLink,
+        needsUpdate update: CAMetalDisplayLink.Update
+    ) {
+        guard framePending,
+              let window,
+              window.occlusionState.contains(.visible),
+              NSApp.isActive
+        else {
+            link.isPaused = true
+            return
+        }
+        guard metalLayer.drawableSize.width > 0, metalLayer.drawableSize.height > 0 else {
+            link.isPaused = true
+            return
+        }
+        framePending = false
+        link.isPaused = true
+        renderer.draw(
+            drawable: update.drawable,
+            drawableSize: metalLayer.drawableSize,
+            nearestSampling: nearestSampling,
+            requestRetry: { [weak self] in self?.requestFrame() },
+            presentationCompleted: { [weak self] in
+                self?.applyPendingDrawableSizeAfterPresentation()
+            }
+        )
+    }
+
+    private var metalLayer: CAMetalLayer {
+        guard let layer = layer as? CAMetalLayer else {
+            preconditionFailure("DisplayLinkedMetalView must use CAMetalLayer")
+        }
+        return layer
+    }
+
+    private func configureLayer() {
+        let layer = metalLayer
+        layer.device = device
+        layer.pixelFormat = .bgra8Unorm_srgb
+        layer.framebufferOnly = true
+        layer.isOpaque = true
+        layer.maximumDrawableCount = 2
+        layer.displaySyncEnabled = MetalPresentationTuning.displaySyncEnabled
+        layer.allowsNextDrawableTimeout = true
+        layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+        layer.presentsWithTransaction = false
+        layer.magnificationFilter = nearestSampling ? .nearest : .linear
+        drawableSizeNeedsUpdate = true
+    }
+
+    private func startDisplayLinkIfNeeded() {
+        guard displayLink == nil else { return }
+        let link = CAMetalDisplayLink(metalLayer: metalLayer)
+        link.delegate = self
+        link.preferredFrameLatency = 1
+        link.isPaused = true
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    private func updateDrawableSize() {
+        let backingScale = window?.backingScaleFactor ?? 1
+        metalLayer.drawableSize = MetalDrawableSizing.pixels(
+            points: bounds.size,
+            backingScale: backingScale
+        )
+        drawableSizeNeedsUpdate = false
+    }
+
+    private func applyPendingDrawableSizeAfterPresentation() {
+        guard drawableSizeNeedsUpdate else { return }
+        updateDrawableSize()
+        requestFrame()
     }
 }
 
@@ -798,7 +925,7 @@ private final class MetalImageRenderer: NSObject, MTKViewDelegate {
     }
 }
 
-private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
+private final class MetalLinearImageRenderer: NSObject {
     private static let log = Logger(
         subsystem: "codes.zms.banksia",
         category: "metal-linear-develop"
@@ -861,16 +988,17 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
         self.contrast = contrast
     }
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-        guard size.width > 0, size.height > 0 else { return }
-        (view as? OnDemandMTKView)?.requestFrame()
-    }
-
-    func draw(in view: MTKView) {
+    func draw(
+        drawable: any CAMetalDrawable,
+        drawableSize: CGSize,
+        nearestSampling: Bool,
+        requestRetry: @escaping @MainActor () -> Void,
+        presentationCompleted: @escaping @MainActor () -> Void
+    ) {
         let encodeStartedAt = CACurrentMediaTime()
         guard let texture,
-              view.drawableSize.width > 0,
-              view.drawableSize.height > 0
+              drawableSize.width > 0,
+              drawableSize.height > 0
         else { return }
         guard admitFrame(generation: frameGeneration) else { return }
         if MetalFailureInjection.requested(.drawable) {
@@ -879,21 +1007,6 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
                 stage: .drawable,
                 message: "injected Metal drawable failure"
             ))
-            return
-        }
-        guard let drawable = view.currentDrawable else {
-            _ = releaseFrame()
-            consecutiveNilDrawables += 1
-            if consecutiveNilDrawables >= 3 {
-                reportFailure(MetalFailure(
-                    stage: .drawable,
-                    message: "Metal drawable acquisition repeatedly failed"
-                ))
-            } else {
-                Task { @MainActor [weak view] in
-                    (view as? OnDemandMTKView)?.requestFrame()
-                }
-            }
             return
         }
         consecutiveNilDrawables = 0
@@ -934,7 +1047,7 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
             commandBuffer: commandBuffer,
             exposureEV: exposureEV,
             contrast: contrast,
-            nearestSampling: view.layer?.magnificationFilter == .nearest
+            nearestSampling: nearestSampling
         ) else {
             _ = releaseFrame()
             reportFailure(MetalFailure(
@@ -954,8 +1067,8 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
         let requestAt = requestedAt
         let uploadMS = pendingUploadMS
         pendingUploadMS = 0
-        let drawableWidth = Int(view.drawableSize.width)
-        let drawableHeight = Int(view.drawableSize.height)
+        let drawableWidth = Int(drawableSize.width)
+        let drawableHeight = Int(drawableSize.height)
         let submittedGeneration = frameGeneration
         let timingCollector = MetalFrameTimingCollector(
             uploadMS: uploadMS,
@@ -971,6 +1084,7 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
         )
         drawable.addPresentedHandler {
             timingCollector.drawablePresented(at: $0.presentedTime)
+            Task { @MainActor in presentationCompleted() }
         }
         commandBuffer.addCompletedHandler { buffer in
             timingCollector.commandCompleted(buffer)
@@ -982,9 +1096,7 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
             )
             let retry = self.releaseFrame()
             if retry {
-                Task { @MainActor [weak view] in
-                    (view as? OnDemandMTKView)?.requestFrame()
-                }
+                Task { @MainActor in requestRetry() }
             }
             if MetalFailureInjection.requested(.completion) {
                 self.reportFailure(MetalFailure(

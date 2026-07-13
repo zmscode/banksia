@@ -1,5 +1,6 @@
 import CoreGraphics
 import SwiftUI
+import os.signpost
 
 /// The viewer. The image letterboxes via `scaledToFit` (no manual measuring, so
 /// it can't blow up); zoom/pan live in a shared `ViewerState` so the Navigator
@@ -27,6 +28,10 @@ struct PreviewCanvas: View {
     // 1 = fit; below 1 pulls back for breathing room, above 1 pixel-peeps.
     private static let minScale: CGFloat = 0.33
     private static let maxScale: CGFloat = 10
+    private static let performanceLog = OSLog(
+        subsystem: "codes.zms.banksia",
+        category: .pointsOfInterest
+    )
 
     var body: some View {
         ZStack {
@@ -55,9 +60,22 @@ struct PreviewCanvas: View {
                 clipOverlay = nil
                 return
             }
+            let signpostID = OSSignpostID(log: Self.performanceLog)
+            os_signpost(
+                .begin,
+                log: Self.performanceLog,
+                name: "Clipping overlay analysis",
+                signpostID: signpostID
+            )
             clipOverlay = await Task.detached(priority: .utility) {
                 makeClippingOverlay(from: image)
             }.value
+            os_signpost(
+                .end,
+                log: Self.performanceLog,
+                name: "Clipping overlay analysis",
+                signpostID: signpostID
+            )
         }
     }
 

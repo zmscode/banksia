@@ -1,7 +1,8 @@
 //! ReleaseFast real-camera timing harness.
 //!
-//! Measures metadata parse, sensor decode, warm edge-1024 render, and warm
-//! full render independently. Files are read before timing.
+//! Measures metadata parse, sensor decode, warm thumbnail/preview/full renders,
+//! CPU late-release fallback, and the retained linear base independently. Files
+//! are read before timing.
 
 const std = @import("std");
 const emu = @import("emu");
@@ -61,6 +62,12 @@ const Samples = struct {
             },
         );
     }
+};
+
+const TimedRender = struct {
+    total_ns: u64,
+    output_packing_ns: u64,
+    loupe_backing_ns: u64,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -128,15 +135,56 @@ fn bench_file(
         .engine_version = 2,
         .ops = &emu.recipe.default_ops,
     };
+    const late_ops = [_]emu.pipeline.Op{
+        .{ .black_point = .{} },
+        .{ .white_balance = .{} },
+        .{ .demosaic = .{} },
+        .{ .exposure = .{ .ev = 0.75 } },
+        .{ .tone_curve = .{ .contrast = 0.35 } },
+        .{ .srgb_encode = .{} },
+    };
+    const late_recipe = emu.pipeline.Recipe{
+        .engine_version = 2,
+        .ops = &late_ops,
+    };
+    var thumbnail_samples = Samples{};
+    var uncached_thumbnail_samples = Samples{};
     var preview_samples = Samples{};
+    var edge_1440_samples = Samples{};
     var linear_preview_samples = Samples{};
+    var late_release_samples = Samples{};
+    var late_release_packing_samples = Samples{};
+    var late_release_loupe_samples = Samples{};
     var full_samples = Samples{};
+    try render_warm(gpa, &raw, recipe, 220);
     try render_warm(gpa, &raw, recipe, 1024);
+    try render_warm(gpa, &raw, recipe, 1440);
     try render_linear_warm(gpa, &raw, recipe, 1440);
+    try render_warm(gpa, &raw, late_recipe, 1440);
     try render_warm(gpa, &raw, recipe, 0);
     iteration = 0;
     while (iteration < iterations) : (iteration += 1) {
-        preview_samples.append(try render_timed(gpa, io, &raw, recipe, 1024));
+        thumbnail_samples.append((try render_timed(gpa, io, &raw, recipe, 220, false)).total_ns);
+    }
+    iteration = 0;
+    while (iteration < iterations) : (iteration += 1) {
+        uncached_thumbnail_samples.append(try uncached_thumbnail_timed(
+            gpa,
+            io,
+            bytes,
+            recipe,
+        ));
+    }
+    iteration = 0;
+    while (iteration < iterations) : (iteration += 1) {
+        preview_samples.append((try render_timed(gpa, io, &raw, recipe, 1024, false)).total_ns);
+    }
+    iteration = 0;
+    while (iteration < iterations) : (iteration += 1) {
+        edge_1440_samples.append((try render_timed(gpa, io, &raw, recipe, 1440, false)).total_ns);
+    }
+    iteration = 0;
+    while (iteration < iterations) : (iteration += 1) {
         linear_preview_samples.append(try render_linear_timed(
             gpa,
             io,
@@ -144,7 +192,17 @@ fn bench_file(
             recipe,
             1440,
         ));
-        full_samples.append(try render_timed(gpa, io, &raw, recipe, 0));
+    }
+    iteration = 0;
+    while (iteration < iterations) : (iteration += 1) {
+        const late = try render_timed(gpa, io, &raw, late_recipe, 1440, true);
+        late_release_samples.append(late.total_ns);
+        late_release_packing_samples.append(late.output_packing_ns);
+        late_release_loupe_samples.append(late.loupe_backing_ns);
+    }
+    iteration = 0;
+    while (iteration < iterations) : (iteration += 1) {
+        full_samples.append((try render_timed(gpa, io, &raw, recipe, 0, false)).total_ns);
     }
 
     const dimensions = emu.geometry.Transform.init(raw.metadata).output_dimensions();
@@ -154,9 +212,21 @@ fn bench_file(
     );
     metadata_samples.report("metadata parse");
     decode_samples.report("sensor decode");
+    thumbnail_samples.report("warm edge-220 thumbnail render");
+    uncached_thumbnail_samples.report("uncached edge-220 thumbnail decode and render");
     preview_samples.report("warm edge-1024 v2 render");
+    edge_1440_samples.report("warm edge-1440 v2 render");
     linear_preview_samples.report("warm edge-1440 linear base");
+    late_release_samples.report("warm edge-1440 CPU late-release render");
+    late_release_packing_samples.report("late-release sRGB output packing");
+    late_release_loupe_samples.report("late-release loupe backing crop and RGB read");
     full_samples.report("warm full v2 render");
+    std.debug.print(
+        "  linear admission estimate (edge-1440): {d:.2} MiB\n",
+        .{@as(f64, @floatFromInt(
+            emu.pipeline.render_linear_memory_bytes_max(&raw, 1440),
+        )) / (1024 * 1024)},
+    );
 }
 
 fn render_warm(
@@ -180,17 +250,64 @@ fn render_timed(
     raw: *const emu.dng.DecodedRaw,
     recipe: emu.pipeline.Recipe,
     edge_px_max_out: u32,
-) !u64 {
+    measure_loupe: bool,
+) !TimedRender {
     const started = std.Io.Clock.now(.awake, io);
     var rendered = try emu.pipeline.render_decoded(
         gpa,
         raw,
         recipe,
-        .{ .edge_px_max_out = edge_px_max_out },
+        .{
+            .edge_px_max_out = edge_px_max_out,
+            .measure_output_packing = true,
+        },
     );
     const finished = std.Io.Clock.now(.awake, io);
+    const result = TimedRender{
+        .total_ns = elapsed_ns(started, finished),
+        .output_packing_ns = rendered.output_packing_ns,
+        .loupe_backing_ns = if (measure_loupe) loupe_backing_timed(io, &rendered) else 0,
+    };
     rendered.deinit(gpa);
-    return elapsed_ns(started, finished);
+    return result;
+}
+
+fn uncached_thumbnail_timed(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    bytes: []const u8,
+    recipe: emu.pipeline.Recipe,
+) !u64 {
+    const started = std.Io.Clock.now(.awake, io);
+    var decoded = try emu.raw.decode_raw(gpa, bytes);
+    defer decoded.deinit(gpa);
+    var rendered = try emu.pipeline.render_decoded(
+        gpa,
+        &decoded,
+        recipe,
+        .{ .edge_px_max_out = 220 },
+    );
+    rendered.deinit(gpa);
+    return elapsed_ns(started, std.Io.Clock.now(.awake, io));
+}
+
+fn loupe_backing_timed(io: std.Io, rendered: *const emu.pipeline.Rendered) u64 {
+    const started = std.Io.Clock.now(.awake, io);
+    const crop_width = @min(@as(u32, 18), rendered.width);
+    const crop_height = @min(@as(u32, 18), rendered.height);
+    const origin_x = (rendered.width - crop_width) / 2;
+    const origin_y = (rendered.height - crop_height) / 2;
+    var checksum: u64 = 0;
+    for (0..crop_height) |y| {
+        for (0..crop_width) |x| {
+            const offset = (@as(usize, origin_y + y) * rendered.width + origin_x + x) * 4;
+            checksum +%= rendered.rgba[offset];
+            checksum +%= rendered.rgba[offset + 1];
+            checksum +%= rendered.rgba[offset + 2];
+        }
+    }
+    std.mem.doNotOptimizeAway(checksum);
+    return elapsed_ns(started, std.Io.Clock.now(.awake, io));
 }
 
 fn render_linear_warm(

@@ -93,6 +93,9 @@ pub const RenderOptions = struct {
     edge_px_max_out: u32 = 0,
     memory_budget_bytes: u64 = 0,
     cancellation: Cancellation = .never,
+    /// Benchmark-only measurement of the final planar-to-RGBA8 packing pass.
+    /// Disabled for normal renders so the stable renderer pays no timing cost.
+    measure_output_packing: bool = false,
 };
 
 pub const Rendered = struct {
@@ -100,6 +103,7 @@ pub const Rendered = struct {
     height: u32,
     /// Row-major RGBA8, `width * height * 4` bytes.
     rgba: []u8,
+    output_packing_ns: u64 = 0,
 
     pub fn deinit(self: *Rendered, gpa: std.mem.Allocator) void {
         assert(self.rgba.len == @as(usize, self.width) * self.height * 4);
@@ -516,8 +520,19 @@ fn render_linear_source_display(
     try cancellation_check(options.cancellation);
     const rgba = try gpa.alloc(u8, @as(usize, width_out) * height_out * 4);
     errdefer gpa.free(rgba);
-    kernel_srgb_pack(rgba, output.r, output.g, output.b);
-    return .{ .width = width_out, .height = height_out, .rgba = rgba };
+    const packing_ns = pack_srgb_timed(
+        rgba,
+        output.r,
+        output.g,
+        output.b,
+        options.measure_output_packing,
+    );
+    return .{
+        .width = width_out,
+        .height = height_out,
+        .rgba = rgba,
+        .output_packing_ns = packing_ns,
+    };
 }
 
 fn render_linear_source_working(
@@ -678,15 +693,33 @@ fn render_internal(
     const rgba = try gpa.alloc(u8, count_out * 4);
     errdefer gpa.free(rgba);
 
-    if (width_out == output_planes.width and height_out == output_planes.height) {
-        kernel_srgb_pack(rgba, output_planes.r, output_planes.g, output_planes.b);
-    } else {
+    const packing_ns = if (width_out == output_planes.width and
+        height_out == output_planes.height) blk: {
+        break :blk pack_srgb_timed(
+            rgba,
+            output_planes.r,
+            output_planes.g,
+            output_planes.b,
+            options.measure_output_packing,
+        );
+    } else blk: {
         const small = try planes_downsample(arena, &output_planes, width_out, height_out);
-        kernel_srgb_pack(rgba, small.r, small.g, small.b);
-    }
+        break :blk pack_srgb_timed(
+            rgba,
+            small.r,
+            small.g,
+            small.b,
+            options.measure_output_packing,
+        );
+    };
 
     assert(rgba.len == count_out * 4);
-    return .{ .width = width_out, .height = height_out, .rgba = rgba };
+    return .{
+        .width = width_out,
+        .height = height_out,
+        .rgba = rgba,
+        .output_packing_ns = packing_ns,
+    };
 }
 
 fn render_linear_internal(
@@ -1285,6 +1318,30 @@ fn kernel_srgb_pack(rgba: []u8, r: []const f32, g: []const f32, b: []const f32) 
         rgba[i * 4 + 2] = srgb_encode_scalar(blue);
         rgba[i * 4 + 3] = 255;
     }
+}
+
+fn pack_srgb_timed(
+    rgba: []u8,
+    r: []const f32,
+    g: []const f32,
+    b: []const f32,
+    enabled: bool,
+) u64 {
+    if (!enabled) {
+        kernel_srgb_pack(rgba, r, g, b);
+        return 0;
+    }
+    const started = monotonic_ns();
+    kernel_srgb_pack(rgba, r, g, b);
+    return monotonic_ns() - started;
+}
+
+fn monotonic_ns() u64 {
+    var timestamp: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &timestamp);
+    return @intCast(
+        @as(i128, timestamp.sec) * std.time.ns_per_s + timestamp.nsec,
+    );
 }
 
 fn kernel_linear_pack(rgba: []f32, r: []const f32, g: []const f32, b: []const f32) void {

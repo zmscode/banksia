@@ -1,5 +1,6 @@
 import CoreGraphics
 import SwiftUI
+import os.signpost
 
 /// A 256-bin count per channel, read straight off a rendered frame. This is the
 /// shell earning its keep: a picture is easy to eyeball, but clipping and colour
@@ -55,6 +56,10 @@ struct HistogramView: View {
     let renderID: UInt
 
     @State private var histogram = Histogram()
+    private static let performanceLog = OSLog(
+        subsystem: "codes.zms.banksia",
+        category: .pointsOfInterest
+    )
 
     var body: some View {
         ZStack {
@@ -84,9 +89,22 @@ struct HistogramView: View {
         .task(id: renderID) {
             guard let image else { return }
             // Off the main actor: the sample loop shouldn't touch UI cadence.
+            let signpostID = OSSignpostID(log: Self.performanceLog)
+            os_signpost(
+                .begin,
+                log: Self.performanceLog,
+                name: "Histogram analysis",
+                signpostID: signpostID
+            )
             let next = await Task.detached(priority: .utility) {
                 Histogram.make(from: image)
             }.value
+            os_signpost(
+                .end,
+                log: Self.performanceLog,
+                name: "Histogram analysis",
+                signpostID: signpostID
+            )
             withAnimation(.easeOut(duration: 0.12)) { histogram = next }
         }
     }

@@ -1,6 +1,6 @@
 # Phase 2C — performance architecture and Metal proof
 
-**Status:** complete with recorded latency deviations
+**Status:** in progress — exit gates remain open
 **Objective:** establish a measured, backend-independent render architecture and
 prove whether a GPU-resident Metal preview materially improves Banksia's
 input-to-visible latency without weakening colour correctness, bounded memory,
@@ -42,16 +42,17 @@ available for canonical verification and fallback.
 
 ### 2C.1 Freeze the performance contract and current baseline
 
-- [ ] Instrument cold load/decode, recipe update, core render, output packing,
+- [x] Instrument load/decode, recipe update, core render, output packing,
   engine-buffer copy, image/surface construction, histogram/overlay work, and
   input-to-visible presentation separately.
-- [ ] Emit Instruments-compatible signposts for the same intervals.
+- [x] Emit Instruments-compatible signposts for the shell intervals; benchmark
+  the engine-internal output pack separately without perturbing normal renders.
 - [x] Record p50/p95/p99 rather than one warm sample.
 - [ ] Name hardware, OS, build mode, corpus revision, dimensions, cache state,
   peak memory, and thermal test duration.
-- [ ] Benchmark CR2 and CR3 cold open, edge-1024/1440 preview, full render, late
-  slider edit, slider release, loupe, and cached/uncached thumbnail workloads.
-- [ ] Count full-frame traversals and CPU copies per workload.
+- [ ] Benchmark CR2 and CR3 cold open, edge-220/1024/1440 preview, full render,
+  late-slider release, CPU-fallback loupe, and cached/uncached thumbnails.
+- [x] Count full-frame traversals and CPU copies per workload.
 - [x] Add a repeatable shell benchmark or trace-capture command.
 
 Implementation started 2026-07-12. The inspection shell now separates RAW
@@ -161,6 +162,9 @@ filter suppresses high-frequency false colour before the working-space matrix.
   deep-shadow, saturated-colour, and highlight evidence.
 - [x] Record upload, encoding, queue, GPU, presentation, and any readback time
   separately from total latency.
+- [x] Drive late-develop frames from `CAMetalDisplayLink` rather than an
+  asynchronous on-demand `MTKView` draw, while preserving idle behavior and the
+  two-drawable bound.
 
 The inspection shell exposes every late-edit interval above and includes a
 repeatable 31-presented-frame exposure benchmark. The earlier Core Image proof
@@ -175,6 +179,10 @@ one pass. Histogram stays outside Metal because the GPU viewer has no extra CPU
 histogram pass to remove. Precision, adversarial, mandatory-corpus, validation,
 and sustained-trace evidence are recorded in
 [the conformance report](conformance.md). Presentation remains the open gate.
+The late-develop surface now takes its drawable from `CAMetalDisplayLink`, which
+removes the main-queue draw hop. It applies drawable-size changes after the
+current frame is presented. The 31-frame end-to-visible gate remains unchecked
+until it is measured on this presenter.
 
 ### 2C.6 Build CPU/GPU conformance and failure coverage
 
@@ -227,7 +235,7 @@ and sustained-trace evidence are recorded in
 - [ ] Cached or embedded first-visible culling preview remains ≤ 250 ms p95.
 - [ ] The accelerated late-develop slice is at least 2× faster at p95 than the
   equivalent optimized CPU-to-`CGImage` path, including presentation overhead.
-- [ ] GPU mean ΔE00 is ≤ 0.5 against strict CPU, with p95 and maximum reported;
+- [x] GPU mean ΔE00 is ≤ 0.5 against strict CPU, with p95 and maximum reported;
   no visible gradient, highlight, clipping, or geometry regression is accepted.
 - [x] Viewer presentation performs no routine GPU-to-CPU readback.
 - [x] Static-view GPU utilization returns to idle and no obsolete frame is

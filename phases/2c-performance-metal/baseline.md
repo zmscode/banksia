@@ -147,3 +147,65 @@ the normal viewer because its work and timing are explicit. See
 Fresh 31-run ReleaseFast post-decode measurements closed the edge-1440 preview
 gate: CR2 recorded 88.936/89.989/91.697 ms p50/p95/p99 and CR3 recorded
 40.582/55.703/64.663 ms. Both are below 100 ms p95.
+
+## 2C.1 complete workload matrix
+
+Recorded 2026-07-13 after extending `raw-bench` with explicit thumbnail,
+edge-1440 display, CPU late-release, output-packing, and linear-admission
+measurements. The command is intentionally ReleaseFast and runs each named
+workload 31 times with decoded RAW retained in memory. Metadata/decode is
+repeated from the source bytes; filesystem cache state is therefore **warm**
+and recorded rather than implied to be cold.
+
+```sh
+zig build raw-bench -- --iterations 31 \
+  assets/CR2/AM4I0028.CR2 \
+  'assets/CR3/S1-NU26643BlackStrip-25992-Nude Lucy-0101.CR3'
+```
+
+| Workload | CR2 p50 / p95 / p99 | CR3 p50 / p95 / p99 |
+|---|---:|---:|
+| metadata parse | 239.025 / 248.204 / 280.168 ms | 58.009 / 61.053 / 64.124 ms |
+| sensor decode | 241.449 / 244.603 / 296.714 ms | 59.707 / 62.935 / 64.291 ms |
+| cached edge-220 thumbnail | 3.110 / 4.497 / 4.903 ms | 3.996 / 19.061 / 29.500 ms |
+| uncached edge-220 thumbnail decode and render | 247.063 / 261.985 / 285.656 ms | 61.159 / 102.041 / 160.941 ms |
+| warm edge-1024 display render | 37.154 / 39.582 / 39.661 ms | 51.273 / 85.208 / 98.348 ms |
+| warm edge-1440 display render | 122.513 / 136.493 / 139.473 ms | 59.129 / 89.586 / 102.755 ms |
+| retained edge-1440 linear base | 97.455 / 102.505 / 102.709 ms | 41.327 / 67.368 / 75.857 ms |
+| CPU late-slider release, edge 1440 | 123.625 / 127.753 / 128.725 ms | 56.952 / 69.805 / 82.641 ms |
+| final sRGB packing within that CPU late render | 15.574 / 16.773 / 16.816 ms | 13.998 / 18.189 / 19.780 ms |
+| CPU-fallback loupe backing crop and RGB read | 0.001 / 0.002 / 0.002 ms | 0.001 / 0.003 / 0.003 ms |
+| warm full display render | 751.034 / 794.544 / 818.412 ms | 1185.032 / 1843.782 / 1988.485 ms |
+
+The direct MSL cached late-edit result remains 47.557 / 47.758 / 66.254 ms
+p50/p95/p99. It eliminates the CPU's repeat traversal, RGBA8 engine copy,
+`CGImage` construction, and final sRGB pack from that interaction, while its
+presentation tail remains the recorded Branch C issue.
+
+The engine now exposes final output-packing time only when the benchmark asks
+for it; normal rendering preserves its previous timing and output contract.
+Swift signposts now cover load/decode, recipe, core render, engine copy,
+`CGImage`, texture upload, Metal encode/queue/GPU/present, histogram analysis,
+and clipping-overlay analysis. Histogram and clipping work is dormant on the
+normal GPU-only viewer; it is only scheduled for a strict-CPU fallback frame.
+
+The harness now executes each workload in its own warmed series instead of
+interleaving it with a full-resolution render. The table above remains the
+pre-isolation baseline; the final Phase 2C report must be regenerated with the
+isolated harness and the `CAMetalDisplayLink` late-edit presenter before the
+remaining exit gates are checked.
+
+### Traversal, copy, and memory accounting
+
+| Workload | Full-frame CPU traversal | CPU copies | GPU uploads/readback |
+|---|---:|---:|---:|
+| edge-220 filmstrip thumbnail | 1 | engine RGBA8 → Swift `Data`: 1 | none |
+| strict CPU edge/full display | 1 | engine RGBA8 → Swift `Data`: 1 | none |
+| retained linear-base update | 1 early-stage traversal | engine RGBA32F → Swift `Data`: 1 | one RGBA32F upload; no readback |
+| cached Metal late edit | 0 | 0 | 0 upload/readback; one drawable pass |
+
+The renderer admits at most 1.5 GiB of linear-base work while reserving 1 GiB
+of system/application headroom on the 8 GB reference machine. The measured
+edge-1440 admission estimates are 277.66 MiB (CR2) and 184.80 MiB (CR3), before
+the small retained texture and two SDR drawables. Repeated allocation testing
+keeps retained Metal growth below 64 MiB after 256 texture cycles.
