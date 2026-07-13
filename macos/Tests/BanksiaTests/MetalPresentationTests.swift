@@ -4,6 +4,39 @@ import XCTest
 @testable import Banksia
 
 final class MetalPresentationTests: XCTestCase {
+    func testMetalTimingUsesDeterministicTimestamps() {
+        let timing = MetalTimingTimestamps(
+            submittedAt: 10.010,
+            gpuStartedAt: 10.012,
+            gpuEndedAt: 10.015,
+            presentedAt: 10.025,
+            requestedAt: 10.000
+        ).timing(
+            uploadMS: 1.25,
+            encodeMS: 0.75,
+            drawableWidth: 2880,
+            drawableHeight: 1800
+        )
+        XCTAssertEqual(timing.queueMS, 2, accuracy: 0.0001)
+        XCTAssertEqual(timing.gpuMS, 3, accuracy: 0.0001)
+        XCTAssertEqual(timing.presentWaitMS, 10, accuracy: 0.0001)
+        XCTAssertEqual(timing.inputToPresentedMS, 25, accuracy: 0.0001)
+        XCTAssertEqual(timing.uploadMS, 1.25)
+        XCTAssertEqual(timing.encodeMS, 0.75)
+    }
+
+    func testDrawableSizingTracksNonRetinaAndRetinaBackingScale() {
+        let points = CGSize(width: 1_003, height: 677)
+        XCTAssertEqual(
+            MetalDrawableSizing.pixels(points: points, backingScale: 1),
+            CGSize(width: 1_003, height: 677)
+        )
+        XCTAssertEqual(
+            MetalDrawableSizing.pixels(points: points, backingScale: 2),
+            CGSize(width: 2_006, height: 1_354)
+        )
+    }
+
     func testMetalTimingSummaryUsesNearestRankPercentiles() throws {
         let samples = (1...20).map { value in
             MetalDevelopTiming(
@@ -141,6 +174,59 @@ final class MetalPresentationTests: XCTestCase {
         }
         XCTAssertEqual(MetalFailureInjection.injectedStage(value: "1"), .initialization)
         XCTAssertNil(MetalFailureInjection.injectedStage(value: "unknown"))
+    }
+
+    @MainActor
+    func testEveryMetalFailureStageCompletesStrictCPUFallback() async throws {
+        let file = repositoryRoot.appendingPathComponent(
+            "tests/corpus/phase2b/canon-r3-black-fabric.dng"
+        )
+        for stage in MetalFailureStage.allCases {
+            let controller = DevelopController()
+            controller.open(url: file)
+            try await waitUntil(timeoutSeconds: 10) {
+                controller.linearPreview != nil
+            }
+            controller.handleMetalFailure(MetalFailure(
+                stage: stage,
+                message: "injected integration test"
+            ))
+            try await waitUntil(timeoutSeconds: 10) {
+                controller.useCPUFallback && controller.image != nil
+            }
+            XCTAssertTrue(controller.useCPUFallback, stage.rawValue)
+            XCTAssertNotNil(controller.image, stage.rawValue)
+            let firstRenderID = controller.renderID
+            controller.develop.ev = Double(MetalFailureStage.allCases.firstIndex(of: stage) ?? 0) * 0.1
+            controller.parameterChanged(.late)
+            try await waitUntil(timeoutSeconds: 10) {
+                controller.renderID > firstRenderID
+            }
+        }
+    }
+
+    func testRepeatedTextureAllocationAndMemoryPressureReleaseIsBounded() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal is unavailable")
+        }
+        let baseline = device.currentAllocatedSize
+        for iteration in 0..<256 {
+            autoreleasepool {
+                let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                    pixelFormat: .rgba32Float,
+                    width: 257 + iteration % 11,
+                    height: 193 + iteration % 7,
+                    mipmapped: false
+                )
+                descriptor.storageMode = .shared
+                descriptor.usage = [.shaderRead]
+                XCTAssertNotNil(device.makeTexture(descriptor: descriptor))
+            }
+        }
+        let growth = device.currentAllocatedSize > baseline
+            ? device.currentAllocatedSize - baseline
+            : 0
+        XCTAssertLessThan(growth, 64 * 1_024 * 1_024)
     }
 
     func testAdversarialOddImageMatchesCPUReferenceAndRemainsFinite() throws {
@@ -561,6 +647,23 @@ final class MetalPresentationTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+    }
+
+    @MainActor
+    private func waitUntil(
+        timeoutSeconds: Double,
+        condition: @escaping @MainActor () -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeoutSeconds))
+        while !condition() {
+            if ContinuousClock.now >= deadline {
+                throw NSError(
+                    domain: "BanksiaTests.AsyncRenderTimeout",
+                    code: 1
+                )
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
     }
 
     private func rgbaBytes(_ image: CGImage) throws -> [UInt8] {

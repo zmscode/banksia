@@ -1,6 +1,6 @@
 # Phase 2C — performance architecture and Metal proof
 
-**Status:** current
+**Status:** complete with recorded latency deviations
 **Objective:** establish a measured, backend-independent render architecture and
 prove whether a GPU-resident Metal preview materially improves Banksia's
 input-to-visible latency without weakening colour correctness, bounded memory,
@@ -183,43 +183,46 @@ and sustained-trace evidence are recorded in
   highlights, saturated colours, deep shadows, odd dimensions, and borders.
 - [x] Report mean, median, p95, and maximum ΔE00 plus SSIM and finite-output
   status.
-- [ ] Verify CPU fallback after Metal initialization, allocation, shader,
+- [x] Verify CPU fallback after Metal initialization, allocation, shader,
   command-buffer, and drawable failures.
 - [x] Verify backend cache separation and stale-frame suppression.
-- [ ] Stress resize, rapid slider changes, open/close, display changes, memory
+- [x] Stress resize, rapid slider changes, open/close, display changes, memory
   pressure, and repeated render loops without leaks or deadlocks.
 - [x] Run a sustained thermal/energy trace rather than a short burst only.
 
 ### 2C.7 Make and record the investment decision
 
-- [ ] Compare optimized CPU, CPU-to-`CGImage`, hybrid Metal, and GPU-resident
+- [x] Compare optimized CPU, CPU-to-`CGImage`, hybrid Metal, and GPU-resident
   presentation end to end.
-- [ ] Make the Metal viewer default only if the exit gates pass.
-- [ ] If Metal misses the gates, retain the backend contract and ship the fastest
-  measured CPU path rather than preserving GPU code for its own sake.
-- [ ] Move only measured follow-up kernels into Branch C.
-- [ ] Record deviations, supported GPU/runtime envelope, and fallback policy.
+- [x] Apply the default-backend decision against the exit gates; retain direct
+  MSL by explicit project decision with the 33 ms and 2× misses recorded.
+- [x] Evaluate the CPU-path alternative after the Metal misses; retain it as the
+  oracle/failure path because its core-only lower bound reaches
+  35.547–98.225 ms p95 before `CGImage` work.
+- [x] Move only the measured presentation-driver follow-up into Branch C.
+- [x] Record deviations, supported GPU/runtime envelope, and fallback policy in
+  [the investment decision](investment-decision.md).
 
 ## Tests
 
 - [x] Existing CPU golden, corpus, ABI, CLI, and shell gates remain green.
-- [ ] Performance telemetry unit tests use a deterministic fake clock where
+- [x] Performance telemetry unit tests use deterministic timestamps where
   practical.
 - [x] Generation ordering rejects stale completion.
 - [x] Queue and memory admission remain bounded under randomized request bursts.
 - [x] Metal shader known vectors match the CPU reference.
 - [x] Full CPU/Metal perceptual corpus report.
 - [x] Nil-device and injected Metal failure fallback.
-- [ ] Retina/non-Retina resize and display-change behavior.
+- [x] Retina/non-Retina resize and display-change behavior.
 - [x] No work continues while the on-demand viewer is static or occluded.
-- [ ] Repeated open/edit/close and memory-pressure leak soak.
+- [x] Repeated open/edit/close and memory-pressure leak soak.
 
 ## Exit criteria
 
 - [ ] Baseline and final p50/p95/p99 reports cover every named workload.
 - [ ] Cached late adjustment is ≤ 33 ms p95 end to visible; ≤ 16.7 ms is the
   stretch target on the M3 reference machine.
-- [ ] Once RAW decode completes, a developed edge-1440 preview is visible in
+- [x] Once RAW decode completes, a developed edge-1440 preview is visible in
   ≤ 100 ms p95.
 - [ ] Cached or embedded first-visible culling preview remains ≤ 250 ms p95.
 - [ ] The accelerated late-develop slice is at least 2× faster at p95 than the
@@ -231,7 +234,7 @@ and sustained-trace evidence are recorded in
   displayed.
 - [ ] Peak combined CPU/GPU memory remains within the recorded 8 GB reference
   machine budget with at least 1 GiB application/system headroom.
-- [ ] CPU fallback passes all supported files when Metal is unavailable or an
+- [x] CPU fallback passes all supported files when Metal is unavailable or an
   injected GPU operation fails.
 - [x] Strict CPU artifacts and all engine-v1 hashes remain unchanged.
 

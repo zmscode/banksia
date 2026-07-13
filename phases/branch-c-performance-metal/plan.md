@@ -13,7 +13,11 @@ interaction or throughput bottleneck enough to justify its maintenance cost.
 
 ### Entry gate
 
-- [ ] Phase 2C invest decision identifies the next dominant workload or kernel.
+- [x] Phase 2C invest decision identifies synchronized drawable presentation,
+  rather than the 1.5 ms late-develop shader, as the next dominant workload.
+- [ ] Compare the current on-demand `MTKView` driver with a measured
+  `CAMetalDisplayLink`/direct-`CAMetalLayer` presentation proof while preserving
+  static idle and newest-generation-only publication.
 - [ ] Record p50/p95/p99 for cold render, late slider edit, loupe, export, and
   thumbnails.
 - [ ] Attribute time to decode, demosaic, kernels, allocation, cache, transfer,

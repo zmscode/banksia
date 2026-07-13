@@ -133,3 +133,17 @@ rejected. The final path keeps two synchronized drawables. The compiled shader,
 corpus parity, precision, and sustained trace evidence are complete; a different
 presentation driver or an explicit product-gate decision is needed to close the
 33 ms p95 requirement. See [the conformance report](conformance.md).
+
+## 2C.7 hybrid re-check
+
+The Metal-backed Core Image hybrid was restored temporarily and re-run through
+the same 31-frame synchronized CR2 sweep. It recorded 47.132 ms p50,
+47.589 ms p95, and 54.665 ms p99. That is statistically tied with the direct
+MSL result, not the ~31 ms observed earlier in the phase. It also reported no
+usable command-buffer GPU duration. The direct compiled path therefore remains
+the normal viewer because its work and timing are explicit. See
+[the investment decision](investment-decision.md).
+
+Fresh 31-run ReleaseFast post-decode measurements closed the edge-1440 preview
+gate: CR2 recorded 88.936/89.989/91.697 ms p50/p95/p99 and CR3 recorded
+40.582/55.703/64.663 ms. Both are below 100 ms p95.

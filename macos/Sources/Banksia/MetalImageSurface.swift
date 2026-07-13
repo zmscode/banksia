@@ -204,6 +204,41 @@ struct MetalDevelopTiming: Sendable {
     let drawableHeight: Int
 }
 
+struct MetalTimingTimestamps: Sendable {
+    let submittedAt: CFTimeInterval
+    let gpuStartedAt: CFTimeInterval
+    let gpuEndedAt: CFTimeInterval
+    let presentedAt: CFTimeInterval
+    let requestedAt: CFTimeInterval
+
+    func timing(
+        uploadMS: Double,
+        encodeMS: Double,
+        drawableWidth: Int,
+        drawableHeight: Int
+    ) -> MetalDevelopTiming {
+        MetalDevelopTiming(
+            uploadMS: uploadMS,
+            encodeMS: encodeMS,
+            queueMS: max(0, gpuStartedAt - submittedAt) * 1_000,
+            gpuMS: max(0, gpuEndedAt - gpuStartedAt) * 1_000,
+            presentWaitMS: max(0, presentedAt - gpuEndedAt) * 1_000,
+            inputToPresentedMS: max(0, presentedAt - requestedAt) * 1_000,
+            drawableWidth: drawableWidth,
+            drawableHeight: drawableHeight
+        )
+    }
+}
+
+enum MetalDrawableSizing {
+    static func pixels(points: CGSize, backingScale: CGFloat) -> CGSize {
+        CGSize(
+            width: max(0, points.width * backingScale).rounded(.toNearestOrAwayFromZero),
+            height: max(0, points.height * backingScale).rounded(.toNearestOrAwayFromZero)
+        )
+    }
+}
+
 struct MetalTimingSummary: Sendable, Equatable {
     let sampleCount: Int
     let inputToPresentedP50MS: Double
@@ -285,13 +320,15 @@ private final class MetalFrameTimingCollector: @unchecked Sendable {
     private func makeTimingIfReady() -> MetalDevelopTiming? {
         guard !reported, let gpuTimes, let presentedAt else { return nil }
         reported = true
-        return MetalDevelopTiming(
+        return MetalTimingTimestamps(
+            submittedAt: submittedAt,
+            gpuStartedAt: gpuTimes.start,
+            gpuEndedAt: gpuTimes.end,
+            presentedAt: presentedAt,
+            requestedAt: requestedAt
+        ).timing(
             uploadMS: uploadMS,
             encodeMS: encodeMS,
-            queueMS: max(0, gpuTimes.start - submittedAt) * 1_000,
-            gpuMS: max(0, gpuTimes.end - gpuTimes.start) * 1_000,
-            presentWaitMS: max(0, presentedAt - gpuTimes.end) * 1_000,
-            inputToPresentedMS: max(0, presentedAt - requestedAt) * 1_000,
             drawableWidth: drawableWidth,
             drawableHeight: drawableHeight
         )
@@ -539,7 +576,7 @@ private struct MetalImageView: NSViewRepresentable {
     }
 }
 
-private final class OnDemandMTKView: MTKView {
+final class OnDemandMTKView: MTKView {
     private var framePending = true
     private var drawScheduled = false
 
@@ -563,6 +600,12 @@ private final class OnDemandMTKView: MTKView {
                 name: NSWindow.didChangeOcclusionStateNotification,
                 object: window
             )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(displayConfigurationDidChange),
+                name: NSWindow.didChangeBackingPropertiesNotification,
+                object: window
+            )
         }
         NotificationCenter.default.addObserver(
             self,
@@ -576,7 +619,23 @@ private final class OnDemandMTKView: MTKView {
             name: NSApplication.didResignActiveNotification,
             object: NSApp
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(displayConfigurationDidChange),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: NSApp
+        )
         scheduleDrawIfReady()
+    }
+
+    @objc private func displayConfigurationDidChange() {
+        if let window {
+            drawableSize = MetalDrawableSizing.pixels(
+                points: bounds.size,
+                backingScale: window.backingScaleFactor
+            )
+        }
+        requestFrame()
     }
 
     @objc private func windowOcclusionDidChange() {
