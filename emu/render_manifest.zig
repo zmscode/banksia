@@ -8,15 +8,19 @@ const std = @import("std");
 const assert = std.debug.assert;
 const calibration = @import("calibration.zig");
 const dng = @import("dng.zig");
+const film_curve = @import("film_curve.zig");
 
-pub const recipe_schema_id_current = "recipe.banksia.global.v2";
+pub const recipe_schema_id_v2 = "recipe.banksia.global.v2";
+pub const recipe_schema_id_current = "recipe.banksia.global.v3";
 pub const graph_id_legacy_v2 = "graph.banksia.matrix.v2";
 pub const graph_id_reconstruction_v3 = "graph.banksia.reconstruction.v3";
 pub const graph_id_profiled_v4 = "graph.banksia.profiled.v4";
+pub const graph_id_film_default_v5 = "graph.banksia.film-default.v5";
 pub const graph_id_calibrated_v1 = "graph.banksia.calibrated.v1";
 pub const renderer_id_strict_cpu_v2 = "banksia.cpu.strict-f32.v2";
 pub const renderer_id_strict_cpu_v3 = "banksia.cpu.strict-f32.v3";
 pub const renderer_id_strict_cpu_v4 = "banksia.cpu.strict-f32.v4";
+pub const renderer_id_strict_cpu_v5 = "banksia.cpu.strict-f32.v5";
 pub const renderer_id_metal_late_v1 = "banksia.metal.late-develop-f32.v1";
 pub const demosaic_id_bilinear_v1 = "banksia.demosaic.bilinear.v1";
 pub const demosaic_id_bilinear_chroma_safe_v2 =
@@ -30,6 +34,7 @@ comptime {
     assert(calibrated_stages.len > legacy_stages.len);
     assert(reconstruction_stages.len > legacy_stages.len);
     assert(profiled_stages.len == reconstruction_stages.len);
+    assert(profiled_film_stages.len == profiled_stages.len + 1);
 }
 
 pub const Domain = enum {
@@ -195,6 +200,39 @@ pub const profiled_stages = [_]Stage{
     reconstruction_stages[7],
 };
 
+pub const profiled_film_stages = [_]Stage{
+    profiled_stages[0],
+    .{
+        .stage_id = "sensor-cleanup",
+        .implementation_id = "banksia.sensor-cleanup.isolated-symmetric.v2",
+        .input = .sensor_cfa,
+        .output = .sensor_cfa,
+        .neutral = .always_on_technical,
+        .status = .active,
+    },
+    profiled_stages[2],
+    .{
+        .stage_id = "anti-color-alias",
+        .implementation_id = "banksia.chroma.camera-alternation-safe.v2",
+        .input = .camera_rgb,
+        .output = .camera_rgb,
+        .neutral = .calibration_default,
+        .status = .active,
+    },
+    profiled_stages[4],
+    profiled_stages[5],
+    .{
+        .stage_id = "camera-film-curve",
+        .implementation_id = film_curve.implementation_id,
+        .input = .profiled_working_rgb,
+        .output = .profiled_working_rgb,
+        .neutral = .calibration_default,
+        .status = .active,
+    },
+    profiled_stages[6],
+    profiled_stages[7],
+};
+
 pub const calibrated_stages = [_]Stage{
     .{
         .stage_id = "normalize",
@@ -288,20 +326,26 @@ pub const calibrated_stages = [_]Stage{
 
 pub const graph_legacy_v2 = Graph{
     .graph_id = graph_id_legacy_v2,
-    .recipe_schema_id = recipe_schema_id_current,
+    .recipe_schema_id = recipe_schema_id_v2,
     .stages = &legacy_stages,
 };
 
 pub const graph_reconstruction_v3 = Graph{
     .graph_id = graph_id_reconstruction_v3,
-    .recipe_schema_id = recipe_schema_id_current,
+    .recipe_schema_id = recipe_schema_id_v2,
     .stages = &reconstruction_stages,
 };
 
 pub const graph_profiled_v4 = Graph{
     .graph_id = graph_id_profiled_v4,
-    .recipe_schema_id = recipe_schema_id_current,
+    .recipe_schema_id = recipe_schema_id_v2,
     .stages = &profiled_stages,
+};
+
+pub const graph_film_default_v5 = Graph{
+    .graph_id = graph_id_film_default_v5,
+    .recipe_schema_id = recipe_schema_id_current,
+    .stages = &profiled_film_stages,
 };
 
 pub const graph_calibrated_v1 = Graph{
@@ -513,6 +557,21 @@ test "profiled graph forms a legal chain with colour before creative develop" {
         Domain.display_output_rgb,
         profiled_stages[profiled_stages.len - 1].output,
     );
+}
+
+test "film-default graph keeps camera curve before user develop" {
+    var curve_index: ?usize = null;
+    var develop_index: ?usize = null;
+    for (profiled_film_stages, 0..) |stage, index| {
+        if (index > 0) {
+            try std.testing.expectEqual(profiled_film_stages[index - 1].output, stage.input);
+        }
+        if (std.mem.eql(u8, stage.stage_id, "camera-film-curve")) curve_index = index;
+        if (std.mem.eql(u8, stage.stage_id, "global-develop")) develop_index = index;
+    }
+    try std.testing.expect(curve_index != null);
+    try std.testing.expect(develop_index != null);
+    try std.testing.expect(curve_index.? < develop_index.?);
 }
 
 test "graph migration requires explicit numerical-change acceptance" {

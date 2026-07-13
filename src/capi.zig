@@ -58,6 +58,8 @@ const Engine = struct {
     linear_rendered: ?emu.pipeline.LinearRendered = null,
     resolved_calibration: ?emu.calibration.ResolvedCalibration = null,
     input_profile: ?emu.calibration.Mft2 = null,
+    camera_film_curve: ?emu.calibration.FilmCurve = null,
+    film_curve_profile: ?emu.film_curve.Profile = null,
     /// Always NUL-terminated; index error_message_bytes_max is the fence.
     last_error: [error_message_bytes_max + 1]u8,
     manifest_json: [manifest_json_bytes_max + 1]u8,
@@ -145,6 +147,8 @@ fn load_raw(engine: *Engine, path: []const u8) i32 {
     engine.resolved_calibration = null;
     if (engine.input_profile) |*profile| profile.deinit(engine.gpa);
     engine.input_profile = null;
+    engine.camera_film_curve = null;
+    engine.film_curve_profile = null;
     return succeed(engine);
 }
 
@@ -173,6 +177,9 @@ const PipelineManifestJSON = struct {
     iso_record_ids: []const []const u8,
     input_profile_id: ?[]const u8,
     film_curve_id: ?[]const u8,
+    film_curve_selection: []const u8,
+    camera_base_gain: ?f32,
+    sensor_range_gain: ?f32,
     lens_profile_id: ?[]const u8,
     first_affected_stage_id: []const u8,
     stages: []const PipelineStageJSON,
@@ -200,29 +207,50 @@ pub export fn bk_pipeline_manifest_json(
         _ = fail(engine, err_render, "cannot resolve calibration: {s}", .{@errorName(err)});
         return null;
     };
-    const input_profile = loadInputProfile(&database, engine.gpa, &resolved) catch |err| {
+    var input_profile = loadInputProfile(&database, engine.gpa, &resolved) catch |err| {
         _ = fail(engine, err_render, "cannot load input profile: {s}", .{@errorName(err)});
+        return null;
+    };
+    const camera_film_curve = loadFilmCurve(&database, &resolved) catch |err| {
+        if (input_profile) |*profile| profile.deinit(engine.gpa);
+        _ = fail(engine, err_render, "cannot load film curve: {s}", .{@errorName(err)});
         return null;
     };
     if (engine.input_profile) |*old| old.deinit(engine.gpa);
     engine.input_profile = input_profile;
+    engine.film_curve_profile = null;
+    engine.camera_film_curve = camera_film_curve;
+    if (engine.camera_film_curve) |*curve| {
+        engine.film_curve_profile = emu.film_curve.Profile.init(curve) catch |err| {
+            _ = fail(engine, err_render, "invalid film curve: {s}", .{@errorName(err)});
+            return null;
+        };
+    }
     engine.resolved_calibration = resolved;
+    const selected_recipe = renderRecipe(engine);
     const dependencies = emu.render_manifest.DependencyManifest.init(&resolved);
     const profile_active = input_profile != null;
-    const active_stages = if (profile_active)
-        emu.render_manifest.profiled_stages
+    const curve_active = engine.film_curve_profile != null;
+    const active_stages: []const emu.render_manifest.Stage = if (profile_active and curve_active)
+        &emu.render_manifest.profiled_film_stages
+    else if (profile_active)
+        &emu.render_manifest.profiled_stages
     else
-        emu.render_manifest.reconstruction_stages;
+        &emu.render_manifest.reconstruction_stages;
 
     var iso_record_ids: [20][]const u8 = @splat("");
     for (dependencies.isoRecordIds(), 0..) |*record_id, index| {
         iso_record_ids[index] = record_id.slice();
     }
-    var stages: [emu.render_manifest.profiled_stages.len]PipelineStageJSON = undefined;
-    for (&stages, active_stages) |*target, stage| {
+    var stages: [emu.render_manifest.profiled_film_stages.len]PipelineStageJSON = undefined;
+    for (stages[0..active_stages.len], active_stages) |*target, stage| {
         target.* = .{
             .stage_id = stage.stage_id,
-            .implementation_id = stage.implementation_id,
+            .implementation_id = if (std.mem.eql(u8, stage.stage_id, "camera-film-curve") and
+                selected_recipe.film_curve == .linear)
+                emu.film_curve.implementation_id_linear
+            else
+                stage.implementation_id,
             .input_domain = @tagName(stage.input),
             .output_domain = @tagName(stage.output),
             .neutral_behavior = @tagName(stage.neutral),
@@ -230,13 +258,20 @@ pub export fn bk_pipeline_manifest_json(
         };
     }
     const view = PipelineManifestJSON{
-        .recipe_schema_id = emu.render_manifest.recipe_schema_id_current,
-        .active_graph_id = if (profile_active)
+        .recipe_schema_id = if (curve_active)
+            emu.render_manifest.recipe_schema_id_current
+        else
+            emu.render_manifest.recipe_schema_id_v2,
+        .active_graph_id = if (profile_active and curve_active)
+            emu.render_manifest.graph_id_film_default_v5
+        else if (profile_active)
             emu.render_manifest.graph_id_profiled_v4
         else
             emu.render_manifest.graph_id_reconstruction_v3,
         .target_graph_id = resolved.processing_graph_id.slice(),
-        .renderer_id = if (profile_active)
+        .renderer_id = if (profile_active and curve_active)
+            emu.render_manifest.renderer_id_strict_cpu_v5
+        else if (profile_active)
             emu.render_manifest.renderer_id_strict_cpu_v4
         else
             emu.render_manifest.renderer_id_strict_cpu_v3,
@@ -251,9 +286,12 @@ pub export fn bk_pipeline_manifest_json(
         .iso_record_ids = iso_record_ids[0..dependencies.iso_record_count],
         .input_profile_id = optionalTextSlice(&dependencies.input_profile_id),
         .film_curve_id = optionalTextSlice(&dependencies.film_curve_id),
+        .film_curve_selection = @tagName(selected_recipe.film_curve),
+        .camera_base_gain = resolvedBaseGain(&resolved),
+        .sensor_range_gain = resolvedSensorRangeGain(&resolved),
         .lens_profile_id = optionalTextSlice(&dependencies.lens_profile_id),
         .first_affected_stage_id = active_stages[0].stage_id,
-        .stages = &stages,
+        .stages = stages[0..active_stages.len],
     };
 
     var writer: std.Io.Writer = .fixed(engine.manifest_json[0..manifest_json_bytes_max]);
@@ -331,10 +369,15 @@ pub export fn bk_render(
         _ = fail(engine, err_render, "invalid nonlinear camera profile", .{});
         return null;
     };
+    const film_curve_rendering = filmCurve(engine, recipe) orelse {
+        _ = fail(engine, err_render, "invalid camera film curve", .{});
+        return null;
+    };
     const rendered = emu.pipeline.render_decoded(engine.gpa, &engine.raw.?, recipe, .{
         .edge_px_max_out = edge_px_max,
         .reconstruction = reconstruction,
         .camera_profile = camera_profile,
+        .film_curve = film_curve_rendering,
     }) catch |err| {
         const code = switch (err) {
             error.OutOfMemory => err_out_of_memory,
@@ -421,6 +464,10 @@ fn render_linear_with_admission(
         _ = fail(engine, err_render, "invalid nonlinear camera profile", .{});
         return null;
     };
+    const film_curve_rendering = filmCurve(engine, recipe) orelse {
+        _ = fail(engine, err_render, "invalid camera film curve", .{});
+        return null;
+    };
     const rendered = emu.pipeline.render_linear_decoded(
         engine.gpa,
         &engine.raw.?,
@@ -434,6 +481,7 @@ fn render_linear_with_admission(
             },
             .reconstruction = reconstruction,
             .camera_profile = camera_profile,
+            .film_curve = film_curve_rendering,
         },
     ) catch |err| {
         const code = switch (err) {
@@ -479,23 +527,75 @@ fn loadInputProfile(
     return mft2;
 }
 
+fn loadFilmCurve(
+    database: *emu.calibration.Database,
+    resolved: *const emu.calibration.ResolvedCalibration,
+) !?emu.calibration.FilmCurve {
+    const curve_id = switch (resolved.camera) {
+        .resolved => |camera| camera.film_curve_id.slice(),
+        .generic_fallback => return null,
+    };
+    return try database.loadFilmCurve(curve_id);
+}
+
 fn cameraProfile(
     engine: *const Engine,
     recipe: emu.pipeline.Recipe,
 ) ?emu.pipeline.CameraProfile {
     if (recipe.camera_profile == .technical_matrix) return .technical_matrix;
-    if (recipe.engine_version != 4) return null;
+    if (recipe.engine_version < 4) return null;
+    if (recipe.engine_version > 5) return null;
     const mft2 = &(engine.input_profile orelse return null);
     const profile = emu.icc_profile.Profile.init(mft2) catch return null;
     return .{ .nonlinear = profile };
 }
 
+fn filmCurve(
+    engine: *const Engine,
+    recipe: emu.pipeline.Recipe,
+) ?emu.film_curve.Rendering {
+    if (recipe.film_curve == .linear) return .linear;
+    if (recipe.engine_version != 5) return null;
+    const profile = if (engine.film_curve_profile) |*value| value else return null;
+    const resolved = if (engine.resolved_calibration) |*value| value else return null;
+    const base_gain = resolvedBaseGain(resolved) orelse return null;
+    const sensor_range_gain = resolvedSensorRangeGain(resolved) orelse return null;
+    return .{ .capture_one_auto = .{
+        .profile = profile,
+        .base_gain = base_gain,
+        .sensor_range_gain = sensor_range_gain,
+    } };
+}
+
+fn resolvedBaseGain(resolved: *const emu.calibration.ResolvedCalibration) ?f32 {
+    const camera_gain = switch (resolved.camera) {
+        .resolved => |camera| camera.base_gain,
+        .generic_fallback => return null,
+    };
+    return switch (resolved.iso) {
+        .resolved => |iso| if (iso.base_gain) |value| value.value else camera_gain,
+        .skipped => camera_gain,
+    };
+}
+
+fn resolvedSensorRangeGain(resolved: *const emu.calibration.ResolvedCalibration) ?f32 {
+    const camera_gain = switch (resolved.camera) {
+        .resolved => |camera| camera.sensor_range_gain,
+        .generic_fallback => return null,
+    };
+    return switch (resolved.iso) {
+        .resolved => |iso| if (iso.sensor_range_gain) |value| value.value else camera_gain,
+        .skipped => camera_gain,
+    };
+}
+
 fn renderRecipe(engine: *const Engine) emu.pipeline.Recipe {
     if (engine.recipe) |parsed| return parsed.value;
-    if (engine.input_profile != null) {
+    if (engine.input_profile != null and engine.film_curve_profile != null) {
         return .{
-            .engine_version = 4,
+            .engine_version = 5,
             .camera_profile = .resolved_nonlinear,
+            .film_curve = .linear,
             .ops = &emu.recipe.default_ops,
         };
     }
@@ -782,6 +882,26 @@ test "resolved engine v4 selects nonlinear profile while retaining matrix choice
         manifest,
         "banksia.color.icc-mft2-local-chroma.v1",
     ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        manifest,
+        "\"active_graph_id\":\"graph.banksia.film-default.v5\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        manifest,
+        "banksia.film-curve.linear.v1",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        manifest,
+        "\"film_curve_selection\":\"linear\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        manifest,
+        "\"camera_base_gain\":1.07",
+    ) != null);
 
     var width: u32 = 0;
     var height: u32 = 0;
@@ -799,6 +919,22 @@ test "resolved engine v4 selects nonlinear profile while retaining matrix choice
     };
     try std.testing.expectEqual(byte_count, @as(usize, width) * height * 4);
     try std.testing.expect(!std.mem.eql(u8, matrix, profile_pointer[0..byte_count]));
+
+    try std.testing.expectEqual(ok, bk_set_recipe_json(engine, test_recipe_profile_linear_v5));
+    const profile_linear_pointer = bk_render(engine, 96, &width, &height) orelse {
+        return error.TestUnexpectedResult;
+    };
+    const profile_linear = try gpa.dupe(u8, profile_linear_pointer[0..byte_count]);
+    defer gpa.free(profile_linear);
+    try std.testing.expectEqual(ok, bk_set_recipe_json(engine, test_recipe_profile_auto_v5));
+    const profile_auto_pointer = bk_render(engine, 96, &width, &height) orelse {
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        profile_linear,
+        profile_auto_pointer[0..byte_count],
+    ));
 }
 
 const test_recipe_ops =
@@ -812,6 +948,12 @@ const test_recipe_matrix_v4 =
 const test_recipe_profile_v4 =
     "{\"engine_version\":4,\"camera_profile\":\"resolved_nonlinear\",\"ops\":" ++
     test_recipe_ops ++ "}";
+const test_recipe_profile_linear_v5 =
+    "{\"engine_version\":5,\"camera_profile\":\"resolved_nonlinear\"," ++
+    "\"film_curve\":\"linear\",\"ops\":" ++ test_recipe_ops ++ "}";
+const test_recipe_profile_auto_v5 =
+    "{\"engine_version\":5,\"camera_profile\":\"resolved_nonlinear\"," ++
+    "\"film_curve\":\"capture_one_auto\",\"ops\":" ++ test_recipe_ops ++ "}";
 
 fn test_should_cancel(context: ?*anyopaque) callconv(.c) i32 {
     assert(context == null);

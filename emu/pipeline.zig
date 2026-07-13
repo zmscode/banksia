@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const calibration = @import("calibration.zig");
 const color = @import("color.zig");
 const dng = @import("dng.zig");
+const film_curve = @import("film_curve.zig");
 const geometry = @import("geometry.zig");
 const icc_profile = @import("icc_profile.zig");
 const image = @import("image.zig");
@@ -30,7 +31,7 @@ const image = @import("image.zig");
 const verify = builtin.mode == .Debug;
 
 pub const engine_version_current: u32 = 1;
-pub const engine_version_latest: u32 = 4;
+pub const engine_version_latest: u32 = 5;
 /// Recovered Capture One 16.7.3 clipping-recovery safety point, expressed as a
 /// fraction of the per-channel sensor clip after CFA-site normalization.
 pub const highlight_recovery_start_bootstrap: f32 = 0.9659363;
@@ -76,6 +77,7 @@ pub const SrgbEncode = struct {};
 pub const Recipe = struct {
     engine_version: u32 = engine_version_current,
     camera_profile: CameraProfileSelection = .technical_matrix,
+    film_curve: film_curve.Selection = .linear,
     ops: []const Op,
 };
 
@@ -109,6 +111,7 @@ pub const RenderOptions = struct {
     measure_output_packing: bool = false,
     reconstruction: ReconstructionDefaults = .legacy,
     camera_profile: CameraProfile = .technical_matrix,
+    film_curve: film_curve.Rendering = .linear,
 };
 
 /// The nonlinear profile replaces, rather than mutates, the independently
@@ -204,7 +207,7 @@ pub fn render_decoded(
             render(gpa, &raw.sensor, recipe, options)
         else
             error.UnsupportedSensor,
-        2, 3, 4 => {
+        2, 3, 4, 5 => {
             const dimensions = geometry.Transform.init(raw.metadata).output_dimensions();
             const longest = @max(dimensions.width, dimensions.height);
             const ratio = if (options.edge_px_max_out == 0)
@@ -235,6 +238,7 @@ pub fn render_linear_decoded(
         return error.UnsupportedEngineVersion;
     }
     options.reconstruction.assertValid();
+    options.film_curve.assertValid();
     if (recipe.engine_version == 2) assert(!options.reconstruction.enabled);
     try cancellation_check(options.cancellation);
     const memory_bytes_max = render_linear_memory_bytes_max_internal(
@@ -732,6 +736,7 @@ fn render_internal(
         assert(recipe.engine_version >= 4);
         assert(recipe.camera_profile == .resolved_nonlinear);
     }
+    assertFilmCurveSelection(recipe, options.film_curve);
 
     // The op stack is struct-of-arrays: validation walks the tag column
     // without touching a single payload.
@@ -764,6 +769,7 @@ fn render_internal(
             &applied_wb_gains,
             options.reconstruction,
             options.camera_profile,
+            options.film_curve,
         );
     }
     if (color_transform != null) color.working_to_linear_srgb(&planes);
@@ -822,6 +828,7 @@ fn render_linear_internal(
     assert(sensor.bayer.len == @as(usize, sensor.width) * sensor.height);
     assert(sensor.white_level > sensor.black_level);
     options.reconstruction.assertValid();
+    options.film_curve.assertValid();
     if (recipe.engine_version < 3) assert(!options.reconstruction.enabled);
     if (recipe.engine_version < 3) {
         assert(std.meta.activeTag(options.camera_profile) == .technical_matrix);
@@ -830,6 +837,7 @@ fn render_linear_internal(
         assert(recipe.engine_version >= 4);
         assert(recipe.camera_profile == .resolved_nonlinear);
     }
+    assertFilmCurveSelection(recipe, options.film_curve);
 
     var ops: std.MultiArrayList(Op) = .empty;
     defer ops.deinit(gpa);
@@ -862,6 +870,7 @@ fn render_linear_internal(
                 &applied_wb_gains,
                 options.reconstruction,
                 options.camera_profile,
+                options.film_curve,
             ),
         }
     }
@@ -1021,6 +1030,7 @@ fn op_apply(
     applied_wb_gains: *?[3]f32,
     reconstruction: ReconstructionDefaults,
     camera_profile: CameraProfile,
+    curve_rendering: film_curve.Rendering,
 ) RenderError!void {
     switch (op) {
         .black_point => {
@@ -1043,13 +1053,23 @@ fn op_apply(
                 if (reconstruction.adaptive_green_enabled) {
                     kernel_green_equalize(mosaic, sensor.width, sensor.height, sensor.cfa);
                 }
-                try kernel_hot_pixel_cleanup(
-                    scratch_gpa,
-                    mosaic,
-                    sensor.width,
-                    sensor.height,
-                    reconstruction.hot_pixel_cleanup_amount,
-                );
+                if (engine_version >= 5) {
+                    try kernel_isolated_pixel_cleanup_v2(
+                        scratch_gpa,
+                        mosaic,
+                        sensor.width,
+                        sensor.height,
+                        reconstruction.hot_pixel_cleanup_amount,
+                    );
+                } else {
+                    try kernel_hot_pixel_cleanup(
+                        scratch_gpa,
+                        mosaic,
+                        sensor.width,
+                        sensor.height,
+                        reconstruction.hot_pixel_cleanup_amount,
+                    );
+                }
             }
         },
         .white_balance => {
@@ -1089,6 +1109,7 @@ fn op_apply(
                             planes,
                             reconstruction.anti_color_aliasing_strength,
                             neutral_ratios,
+                            engine_version < 5,
                         );
                     } else {
                         try kernel_chroma_lowpass_legacy(scratch_gpa, planes);
@@ -1116,6 +1137,7 @@ fn op_apply(
                         applied_wb_gains.*,
                     ),
                 }
+                curve_rendering.apply(planes);
             }
         },
         .exposure => {
@@ -1136,6 +1158,18 @@ fn op_apply(
             }
         },
         .srgb_encode => {}, // packing runs once, after the stack
+    }
+}
+
+fn assertFilmCurveSelection(recipe: Recipe, rendering: film_curve.Rendering) void {
+    if (recipe.engine_version < 5) {
+        assert(recipe.film_curve == .linear);
+        assert(std.meta.activeTag(rendering) == .linear);
+        return;
+    }
+    switch (recipe.film_curve) {
+        .linear => assert(std.meta.activeTag(rendering) == .linear),
+        .capture_one_auto => assert(std.meta.activeTag(rendering) == .capture_one_auto),
     }
 }
 
@@ -1331,6 +1365,54 @@ fn kernel_hot_pixel_cleanup(
     }
 }
 
+/// Remove isolated positive and negative sensor defects without mixing CFA
+/// channels. Unlike the historical calibrated cleanup, the conservative
+/// defect gate is always active: calibration only tightens its threshold.
+/// Engine versions before v5 continue to use `kernel_hot_pixel_cleanup`.
+fn kernel_isolated_pixel_cleanup_v2(
+    scratch_gpa: std.mem.Allocator,
+    mosaic: []f32,
+    width: u32,
+    height: u32,
+    calibrated_amount: f32,
+) RenderError!void {
+    assert(mosaic.len == @as(usize, width) * height);
+    assert(std.math.isFinite(calibrated_amount));
+    assert(calibrated_amount >= 0);
+    assert(calibrated_amount <= 100);
+    if (width < 5 or height < 5) return;
+
+    const source = try scratch_gpa.dupe(f32, mosaic);
+    defer scratch_gpa.free(source);
+    const threshold = 0.08 - 0.03 * (calibrated_amount / 100);
+
+    var y: u32 = 2;
+    while (y < height - 2) : (y += 1) {
+        var x: u32 = 2;
+        while (x < width - 2) : (x += 1) {
+            var neighbors = [8]f32{
+                source[pixel_index(width, x - 2, y - 2)],
+                source[pixel_index(width, x, y - 2)],
+                source[pixel_index(width, x + 2, y - 2)],
+                source[pixel_index(width, x - 2, y)],
+                source[pixel_index(width, x + 2, y)],
+                source[pixel_index(width, x - 2, y + 2)],
+                source[pixel_index(width, x, y + 2)],
+                source[pixel_index(width, x + 2, y + 2)],
+            };
+            std.sort.insertion(f32, &neighbors, {}, std.sort.asc(f32));
+            const local = 0.5 * (neighbors[3] + neighbors[4]);
+            const index = pixel_index(width, x, y);
+            const center = source[index];
+            if (center < neighbors[1] - threshold or
+                center > neighbors[6] + threshold)
+            {
+                mosaic[index] = local;
+            }
+        }
+    }
+}
+
 fn kernel_wb(
     mosaic: []f32,
     width: u32,
@@ -1476,6 +1558,7 @@ fn kernel_chroma_lowpass_calibrated(
     planes: *image.Planes,
     strength: f32,
     neutral_ratios: [3]f32,
+    classify_neutral_texture: bool,
 ) RenderError!void {
     assert(planes.r.len == planes.g.len);
     assert(planes.r.len == planes.b.len);
@@ -1584,7 +1667,8 @@ fn kernel_chroma_lowpass_calibrated(
                     horizontal_green_product > 0.000025 or
                     vertical_green_product > 0.000025;
                 const zero_mean_chroma = @abs(local) <= 0.12;
-                const neutral_texture = luminance_oscillation and zero_mean_chroma;
+                const neutral_texture = classify_neutral_texture and
+                    luminance_oscillation and zero_mean_chroma;
                 if (horizontal_alternation or vertical_alternation or neutral_texture) {
                     horizontal[index] = 1;
                 }
@@ -2717,6 +2801,31 @@ test "calibrated sensor cleanup is CFA-local bounded and has an exact off state"
     try std.testing.expectEqual(before_off[hot_index - 1], mosaic[hot_index - 1]);
 }
 
+test "v5 isolated sensor cleanup repairs bright and dark defects" {
+    const gpa = std.testing.allocator;
+    const width: u32 = 10;
+    const height: u32 = 10;
+    var mosaic: [width * height]f32 = @splat(0.35);
+    const bright_index = pixel_index(width, 4, 4);
+    const dark_index = pixel_index(width, 5, 5);
+    mosaic[bright_index] = 0.95;
+    mosaic[dark_index] = 0.01;
+
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    try kernel_isolated_pixel_cleanup_v2(
+        scratch.allocator(),
+        &mosaic,
+        width,
+        height,
+        0,
+    );
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.35), mosaic[bright_index], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.35), mosaic[dark_index], 1e-6);
+    try std.testing.expectEqual(@as(f32, 0.35), mosaic[bright_index - 1]);
+}
+
 test "anti-color-alias strength zero is identity and one suppresses chroma" {
     const gpa = std.testing.allocator;
     const width: u32 = 17;
@@ -2732,12 +2841,24 @@ test "anti-color-alias strength zero is identity and one suppresses chroma" {
     defer gpa.free(original);
     var scratch_off = std.heap.ArenaAllocator.init(gpa);
     defer scratch_off.deinit();
-    try kernel_chroma_lowpass_calibrated(scratch_off.allocator(), &planes, 0, @splat(1));
+    try kernel_chroma_lowpass_calibrated(
+        scratch_off.allocator(),
+        &planes,
+        0,
+        @splat(1),
+        true,
+    );
     try std.testing.expectEqualSlices(f32, original, planes.r);
 
     var scratch_on = std.heap.ArenaAllocator.init(gpa);
     defer scratch_on.deinit();
-    try kernel_chroma_lowpass_calibrated(scratch_on.allocator(), &planes, 1, @splat(1));
+    try kernel_chroma_lowpass_calibrated(
+        scratch_on.allocator(),
+        &planes,
+        1,
+        @splat(1),
+        true,
+    );
     var residual_before: f64 = 0;
     var residual_after: f64 = 0;
     for (original, planes.r) |before, after| {
@@ -2753,8 +2874,23 @@ test "anti-color-alias strength zero is identity and one suppresses chroma" {
     }
     const color_edge = try gpa.dupe(f32, planes.r);
     defer gpa.free(color_edge);
-    try kernel_chroma_lowpass_calibrated(gpa, &planes, 1, @splat(1));
+    try kernel_chroma_lowpass_calibrated(gpa, &planes, 1, @splat(1), false);
     try std.testing.expectEqualSlices(f32, color_edge, planes.r);
+
+    // Coherent low-amplitude colour over luminance texture is subject colour,
+    // not neutral moire. The v5 classifier must preserve it exactly.
+    for (planes.g, planes.r, planes.b, 0..) |*green, *red, *blue, index| {
+        green.* = if (index & 1 == 0) 0.42 else 0.58;
+        red.* = green.* + 0.08;
+        blue.* = green.* - 0.04;
+    }
+    const coherent_red = try gpa.dupe(f32, planes.r);
+    defer gpa.free(coherent_red);
+    const coherent_blue = try gpa.dupe(f32, planes.b);
+    defer gpa.free(coherent_blue);
+    try kernel_chroma_lowpass_calibrated(gpa, &planes, 1, @splat(1), false);
+    try std.testing.expectEqualSlices(f32, coherent_red, planes.r);
+    try std.testing.expectEqualSlices(f32, coherent_blue, planes.b);
 }
 
 test "render is deterministic: two runs, identical bytes" {
@@ -3145,7 +3281,7 @@ test "stack validation rejects malformed recipes (negative space)" {
         render_decoded(
             gpa,
             &raw,
-            .{ .engine_version = 5, .ops = &test_ops_default },
+            .{ .engine_version = 6, .ops = &test_ops_default },
             .{},
         ),
     );
@@ -3237,4 +3373,89 @@ test "engine v4 profile is selectable and precedes creative late develop" {
     });
     defer neutral.deinit(gpa);
     try std.testing.expect(!std.mem.eql(u8, developed.rgba, neutral.rgba));
+}
+
+test "engine v5 film default is selectable and precedes user develop" {
+    const gpa = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tests/corpus/phase2b/canon-r3-emerald-fabric.dng",
+        gpa,
+        std.Io.Limit.limited(64 * 1024 * 1024),
+    );
+    defer gpa.free(bytes);
+    var raw = try dng.decode_raw(gpa, bytes);
+    defer raw.deinit(gpa);
+    var database = try calibration.Database.open(calibration.database_path_default);
+    defer database.deinit();
+    var mft2 = try database.loadMft2(
+        gpa,
+        "profile.capture-one.CanonEOSR3-ProStandard.v1",
+    );
+    defer mft2.deinit(gpa);
+    const camera_profile = try icc_profile.Profile.init(&mft2);
+    const curve_record = try database.loadFilmCurve(
+        "curve.capture-one.CanonEOSR3-Auto.v1",
+    );
+    const curve_profile = try film_curve.Profile.init(&curve_record);
+    const reconstruction = ReconstructionDefaults{
+        .enabled = true,
+        .adaptive_green_enabled = true,
+        .hot_pixel_cleanup_amount = 0,
+        .anti_color_aliasing_strength = 1,
+        .highlight_recovery_start = highlight_recovery_start_bootstrap,
+    };
+    const auto_rendering = film_curve.Rendering{ .capture_one_auto = .{
+        .profile = &curve_profile,
+        .base_gain = 1.07,
+        .sensor_range_gain = 1,
+    } };
+    const auto_recipe = Recipe{
+        .engine_version = 5,
+        .camera_profile = .resolved_nonlinear,
+        .film_curve = .capture_one_auto,
+        .ops = &test_ops_default,
+    };
+    var auto = try render_linear_decoded(gpa, &raw, auto_recipe, .{
+        .edge_px_max_out = 64,
+        .reconstruction = reconstruction,
+        .camera_profile = .{ .nonlinear = camera_profile },
+        .film_curve = auto_rendering,
+    });
+    defer auto.deinit(gpa);
+    var linear = try render_linear_decoded(gpa, &raw, .{
+        .engine_version = 5,
+        .camera_profile = .resolved_nonlinear,
+        .film_curve = .linear,
+        .ops = &test_ops_default,
+    }, .{
+        .edge_px_max_out = 64,
+        .reconstruction = reconstruction,
+        .camera_profile = .{ .nonlinear = camera_profile },
+        .film_curve = .linear,
+    });
+    defer linear.deinit(gpa);
+    try std.testing.expect(!std.mem.eql(f32, auto.rgba, linear.rgba));
+
+    const late_ops = [_]Op{
+        .{ .black_point = .{} },
+        .{ .white_balance = .{} },
+        .{ .demosaic = .{} },
+        .{ .exposure = .{ .ev = 1.25 } },
+        .{ .tone_curve = .{ .contrast = 0.75 } },
+        .{ .srgb_encode = .{} },
+    };
+    var retained_after_edit = try render_linear_decoded(gpa, &raw, .{
+        .engine_version = 5,
+        .camera_profile = .resolved_nonlinear,
+        .film_curve = .capture_one_auto,
+        .ops = &late_ops,
+    }, .{
+        .edge_px_max_out = 64,
+        .reconstruction = reconstruction,
+        .camera_profile = .{ .nonlinear = camera_profile },
+        .film_curve = auto_rendering,
+    });
+    defer retained_after_edit.deinit(gpa);
+    try std.testing.expectEqualSlices(f32, auto.rgba, retained_after_edit.rgba);
 }

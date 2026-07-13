@@ -111,6 +111,9 @@ struct PipelineManifest: Codable, Hashable, Sendable {
     let isoRecordIDs: [String]
     let inputProfileID: String?
     let filmCurveID: String?
+    let filmCurveSelection: String
+    let cameraBaseGain: Float?
+    let sensorRangeGain: Float?
     let lensProfileID: String?
     let firstAffectedStageID: String
     let stages: [PipelineStageManifest]
@@ -131,6 +134,9 @@ struct PipelineManifest: Codable, Hashable, Sendable {
         case isoRecordIDs = "iso_record_ids"
         case inputProfileID = "input_profile_id"
         case filmCurveID = "film_curve_id"
+        case filmCurveSelection = "film_curve_selection"
+        case cameraBaseGain = "camera_base_gain"
+        case sensorRangeGain = "sensor_range_gain"
         case lensProfileID = "lens_profile_id"
         case firstAffectedStageID = "first_affected_stage_id"
         case stages
@@ -152,6 +158,9 @@ struct PipelineManifest: Codable, Hashable, Sendable {
         isoRecordIDs: [],
         inputProfileID: nil,
         filmCurveID: nil,
+        filmCurveSelection: "linear",
+        cameraBaseGain: nil,
+        sensorRangeGain: nil,
         lensProfileID: nil,
         firstAffectedStageID: "normalize",
         stages: []
@@ -166,16 +175,16 @@ struct RendererManifest: Hashable, Sendable {
     let backend: RenderBackend
     let precision: RenderPrecision
 
-    static let strictCPUV4 = RendererManifest(
-        implementationID: "banksia.cpu.strict-f32.v4",
-        engineVersion: 4,
+    static let strictCPUV5 = RendererManifest(
+        implementationID: "banksia.cpu.strict-f32.v5",
+        engineVersion: 5,
         backend: .strictCPU,
         precision: .float32
     )
 
     static let metalLateDevelopV1 = RendererManifest(
         implementationID: "banksia.metal.late-develop-f32.v1",
-        engineVersion: 4,
+        engineVersion: 5,
         backend: .metalCandidate,
         precision: .float32
     )
@@ -186,12 +195,12 @@ struct RenderExecutionContract: Hashable, Sendable {
     let output: RenderOutputKind
 
     static let strictCPUDisplay = RenderExecutionContract(
-        renderer: .strictCPUV4,
+        renderer: .strictCPUV5,
         output: .cpuRGBA8SRGB
     )
 
     static let strictCPULinearWorking = RenderExecutionContract(
-        renderer: .strictCPUV4,
+        renderer: .strictCPUV5,
         output: .cpuRGBA32FloatLinearWorking
     )
 

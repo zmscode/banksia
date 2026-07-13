@@ -256,6 +256,28 @@ pub fn build(b: *std.Build) void {
     );
     profile_compare_step.dependOn(&run_profile_compare.step);
 
+    const run_film_compare = b.addRunArtifact(reconstruction_compare);
+    run_film_compare.setCwd(b.path("."));
+    run_film_compare.has_side_effects = true;
+    run_film_compare.addArg("film");
+    if (b.args) |args| run_film_compare.addArgs(args);
+    const film_compare_step = b.step(
+        "compare-2d6",
+        "Write linear/Auto film-curve Phase 2D.6 visual comparison PNGs",
+    );
+    film_compare_step.dependOn(&run_film_compare.step);
+
+    const run_safety_compare = b.addRunArtifact(reconstruction_compare);
+    run_safety_compare.setCwd(b.path("."));
+    run_safety_compare.has_side_effects = true;
+    run_safety_compare.addArg("safety");
+    if (b.args) |args| run_safety_compare.addArgs(args);
+    const safety_compare_step = b.step(
+        "compare-default-safety",
+        "Write safe/calibrated default regression comparison PNGs",
+    );
+    safety_compare_step.dependOn(&run_safety_compare.step);
+
     // ---- `raw-swarm`: deterministic DNG truncation/mutation parser swarm ----------
     const raw_swarm_emu = emu_module(b, target, .ReleaseSafe, libraw_prefix);
     const raw_swarm = b.addExecutable(.{

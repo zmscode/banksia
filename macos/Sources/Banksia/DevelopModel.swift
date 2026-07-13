@@ -76,14 +76,17 @@ final class DevelopModel {
         contrast = 0
     }
 
-    /// Two white_balance ops compose multiplicatively in the bayer domain:
+    /// The camera profile is safe after the coherent-colour regression gate,
+    /// while the brighter Auto curve remains an explicit selection until its
+    /// highlight preference gate passes. Two white_balance ops compose multiplicatively:
     /// the camera's as-shot neutral first, the user's temperature/tint on
     /// top. That keeps "sliders at zero" looking like the camera intended.
     var recipeJSON: String {
         let gainR = format(exp2(temperature))
         let gainG = format(exp2(-tint))
         let gainB = format(exp2(-temperature))
-        return "{\"engine_version\":4,\"camera_profile\":\"resolved_nonlinear\",\"ops\":["
+        return "{\"engine_version\":5,\"camera_profile\":\"resolved_nonlinear\""
+            + ",\"film_curve\":\"linear\",\"ops\":["
             + "{\"black_point\":{}},"
             + "{\"white_balance\":{\"as_shot\":true,\"gain_r\":1,\"gain_g\":1,\"gain_b\":1}},"
             + "{\"white_balance\":{\"as_shot\":false"

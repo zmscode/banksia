@@ -159,8 +159,15 @@ retain the immutable v3 reconstruction IDs. Engine v4 now adds separately
 selectable EOS-1D X Mark II/EOS R3 ProStandard nonlinear camera profiles before
 creative develop, with a strict tetrahedral ICC reference, explicit matrix
 fallback, immutable graph/renderer IDs, and eight reviewed matrix/profile corpus
-pairs. The macOS app and C manifest select v4; Phase 2D continues with separate
-camera film curves and baseline defaults.
+pairs. Engine v5 now adds an independently selectable Capture One Auto film
+curve with deterministic monotonic interpolation, camera/ISO base and
+sensor-range gains, explicit Linear fallback, and eight reviewed Linear/Auto
+corpus pairs. Exact CR2/CR3 regression renders additionally forced v5-only
+sensor-defect cleanup and a coherent-colour-safe anti-alias classifier; the app
+uses the camera profile with Linear tone while Auto remains explicit. The macOS
+app and C manifest select the immutable v5 graph while historical v1-v4
+artifacts remain addressable. Phase 2D continues with the camera/ISO detail
+model.
 
 ### Foundation Phase 2E — safe sessions and import
 

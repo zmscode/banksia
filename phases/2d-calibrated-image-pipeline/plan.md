@@ -160,16 +160,16 @@ semantic stages even when they fuse kernels or use different execution plans.
 
 ### 2D.6 Implement camera film curves and baseline defaults
 
-- [ ] Import the separate main, CCD/pre-, and contrast curve components with
+- [x] Import the separate main, CCD/pre-, and contrast curve components with
   exact fixed-point control points and flags.
-- [ ] Implement deterministic monotonic interpolation matching recovered curve
+- [x] Implement deterministic monotonic interpolation matching recovered curve
   semantics closely enough for the oracle corpus.
-- [ ] Apply camera base gain and sensor-range gain as named, inspectable
+- [x] Apply camera base gain and sensor-range gain as named, inspectable
   technical defaults.
-- [ ] Provide `Linear`, `Capture One Auto bootstrap`, and future Banksia curve
+- [x] Provide `Linear`, `Capture One Auto bootstrap`, and future Banksia curve
   selections without changing the camera colour profile.
-- [ ] Define highlight rolloff, negative-input, above-one, and clipping behavior.
-- [ ] Ensure exposure and user tone controls remain separate recipe operations.
+- [x] Define highlight rolloff, negative-input, above-one, and clipping behavior.
+- [x] Ensure exposure and user tone controls remain separate recipe operations.
 
 ### 2D.7 Add a coherent camera/ISO detail model
 
@@ -232,7 +232,7 @@ semantic stages even when they fuse kernels or use different execution plans.
 - [x] Calibration import is deterministic and canonical.
 - [x] Camera/ISO/lens selection and fallback tables are exhaustive.
 - [x] Extracted ICC shaper/CLUT known vectors match the source profile evaluator.
-- [ ] Film-curve control points and interpolation known vectors match extraction.
+- [x] Film-curve control points and interpolation known vectors match extraction.
 - [x] Noise interpolation preserves recorded discontinuities.
 - [ ] Lens-node interpolation hits exact stored nodes and remains bounded between
   them.
@@ -348,6 +348,27 @@ semantic stages even when they fuse kernels or use different execution plans.
   requires a new implementation ID. Generic calibration fallback continues to
   publish the v3 reconstruction/matrix graph, and an explicit nonlinear request
   without a resolved profile fails rather than silently rendering the matrix.
+- Engine v5 adds an independent `film_curve` recipe selection and immutable
+  `graph.banksia.film-default.v5` / `banksia.cpu.strict-f32.v5` identities.
+  The exact version-6 Auto records retain flags `0x23` and separate main,
+  CCD/pre-, and contrast components. A bounded PCHIP reference reproduces
+  every control point and known interpolation vectors; only the main response
+  drives the explicit Auto selection, while the auxiliary components remain
+  separately inspectable. The luma-preserving application resolves camera/ISO base and
+  sensor-range gains into the manifest, passes negative values without early
+  channel clipping, caps above-one technical luminance through the curve's
+  endpoint, and leaves final gamut clipping to display output. Linear and Auto
+  selections share either camera-profile choice, and user exposure/tone remain
+  late recipe operations. Eight profile+Linear/profile+Auto edge-1440 pairs
+  passed visual review for highlight rolloff, skin, fine fabric, saturated
+  green, odd content, and finite output. Four exact local CR2/CR3 regression
+  pairs then exposed a v3/v4 neutral-texture classifier that removed coherent
+  skin colour in square neighbourhoods. Engine v5 now publishes separately
+  versioned symmetric isolated-site cleanup and an alternation-only anti-colour
+  classifier; historical renderer bytes remain unchanged. Exact rerenders have
+  continuous R3 skin and no broad 1D X Mark II cyan/magenta islands. The app
+  selects the camera profile with Linear tone; Auto remains available for
+  explicit comparison until its highlight-preference gate passes.
 - Reference machine, OS, build modes, and Capture One oracle version.
 - Corpus and oracle hashes.
 - CPU/GPU conformance report.

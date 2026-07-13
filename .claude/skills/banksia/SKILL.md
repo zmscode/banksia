@@ -16,12 +16,17 @@ simulation runs, ΔE, precision/recall) and the number only goes up.
 
 ## Current status
 
-Foundation Phases 0 (engine bootstrap) and 1 (C ABI + SwiftUI shell) are
-**complete**. Storage is re-cut into 2A/2B/2C; the project is in **Phase 2A**
-(storage-closure) — vault, crash simulator, chunker, and columnar catalog are
-in and `zig build test` is green, with catalog crash-coverage, failure-atomic
-acknowledgement, and vault directory durability still open. The compute /
-threading / Metal doctrine is [`phases/compute-strategy.md`](../../../phases/compute-strategy.md);
+Foundation Phases 0, 1, 2A, 2B, and 2C are **complete**. The project is in
+**Phase 2D** (calibrated image pipeline): calibration identities/resolution,
+the versioned graph and Swift render contract, calibrated RCD reconstruction,
+nonlinear camera colour profiles, and camera film curves/default gains through
+2D.6 are complete. Engine v5 selects provisional EOS-1D X Mark II/EOS R3
+ProStandard profiles with a Linear app default; Capture One Auto, the technical
+matrix, and historical v1-v4 renderers remain selectable. Its v5-only sensor
+cleanup and coherent-colour gate preserve historical bytes while preventing
+the exact-RAW false-colour regression. The next unchecked work is **2D.7
+camera/ISO detail calibration**. The compute/threading/Metal
+doctrine is [`phases/compute-strategy.md`](../../../phases/compute-strategy.md);
 shared durability, cache-identity, and scoreboard contracts are
 [`phases/README.md`](../../../phases/README.md).
 

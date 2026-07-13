@@ -35,6 +35,9 @@ pub fn parse(
     {
         return error.InvalidCameraProfileSelection;
     }
+    if (parsed.value.engine_version < 5 and parsed.value.film_curve != .linear) {
+        return error.InvalidFilmCurveSelection;
+    }
     assert(parsed.value.ops.len <= pipeline.ops_max or true); // length gated in render
     return parsed;
 }
@@ -43,6 +46,7 @@ pub fn parse(
 /// — the roundtrip test below is the pair assertion for this property.
 pub fn serialize_canonical(gpa: std.mem.Allocator, recipe: pipeline.Recipe) ![]u8 {
     if (recipe.engine_version < 4) assert(recipe.camera_profile == .technical_matrix);
+    if (recipe.engine_version < 5) assert(recipe.film_curve == .linear);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
 
@@ -51,6 +55,11 @@ pub fn serialize_canonical(gpa: std.mem.Allocator, recipe: pipeline.Recipe) ![]u
     if (recipe.engine_version >= 4) {
         try out.appendSlice(gpa, ",\"camera_profile\":\"");
         try out.appendSlice(gpa, @tagName(recipe.camera_profile));
+        try out.append(gpa, '"');
+    }
+    if (recipe.engine_version >= 5) {
+        try out.appendSlice(gpa, ",\"film_curve\":\"");
+        try out.appendSlice(gpa, @tagName(recipe.film_curve));
         try out.append(gpa, '"');
     }
     try out.appendSlice(gpa, ",\"ops\":[");
@@ -171,6 +180,42 @@ test "nonlinear profile selection is rejected before engine v4" {
         "{\"engine_version\":3,\"camera_profile\":\"resolved_nonlinear\",\"ops\":[]}";
     try std.testing.expectError(
         error.InvalidCameraProfileSelection,
+        parse(std.testing.allocator, text),
+    );
+}
+
+test "engine v5 canonical recipe preserves an independent film curve selection" {
+    const gpa = std.testing.allocator;
+    const selected = pipeline.Recipe{
+        .engine_version = 5,
+        .camera_profile = .technical_matrix,
+        .film_curve = .capture_one_auto,
+        .ops = &default_ops,
+    };
+    const first = try serialize_canonical(gpa, selected);
+    defer gpa.free(first);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        first,
+        "\"camera_profile\":\"technical_matrix\",\"film_curve\":\"capture_one_auto\"",
+    ) != null);
+    var parsed = try parse(gpa, first);
+    defer parsed.deinit();
+    try std.testing.expectEqual(
+        pipeline.CameraProfileSelection.technical_matrix,
+        parsed.value.camera_profile,
+    );
+    try std.testing.expectEqual(
+        @as(@TypeOf(parsed.value.film_curve), .capture_one_auto),
+        parsed.value.film_curve,
+    );
+}
+
+test "camera film curve selection is rejected before engine v5" {
+    const text =
+        "{\"engine_version\":4,\"film_curve\":\"capture_one_auto\",\"ops\":[]}";
+    try std.testing.expectError(
+        error.InvalidFilmCurveSelection,
         parse(std.testing.allocator, text),
     );
 }

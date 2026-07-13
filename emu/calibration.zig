@@ -16,7 +16,7 @@ pub const database_path_default = "data/calibration/banksia-calibration-v1.sqlit
 
 const text_bytes_max: u32 = 160;
 const profile_blob_bytes_max: u32 = 2 * 1024 * 1024;
-const curve_points_max: u32 = 64;
+pub const curve_points_max: u32 = 64;
 
 comptime {
     assert(text_bytes_max <= 255);
@@ -172,6 +172,7 @@ pub const Point = struct {
 
 pub const FilmCurve = struct {
     curve_id: Text,
+    format_version: u32,
     flags: u32,
     film: [curve_points_max]Point = @splat(.{ .x = 0, .y = 0 }),
     ccd: [curve_points_max]Point = @splat(.{ .x = 0, .y = 0 }),
@@ -448,14 +449,15 @@ pub const Database = struct {
 
     pub fn loadFilmCurve(database: *Database, curve_id: []const u8) Error!FilmCurve {
         var header = try database.prepare(
-            "SELECT curve_id, flags FROM film_curve WHERE curve_id = ?1",
+            "SELECT curve_id, format_version, flags FROM film_curve WHERE curve_id = ?1",
         );
         defer header.deinit();
         try header.bindText(1, curve_id);
         if (try header.step() != .row) return error.NotFound;
         var curve = FilmCurve{
             .curve_id = try Text.init(try header.columnText(0)),
-            .flags = try header.columnU32(1),
+            .format_version = try header.columnU32(1),
+            .flags = try header.columnU32(2),
         };
         if (try header.step() != .done) return error.Ambiguous;
 

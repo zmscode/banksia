@@ -53,11 +53,12 @@ final class RenderContractTests: XCTestCase {
         XCTAssertFalse(model.hasEdits)
     }
 
-    func testDevelopModelSelectsImmutableEngineV4NonlinearProfile() {
+    func testDevelopModelUsesSafeEngineV5Defaults() {
         let recipe = DevelopModel().recipeJSON
 
-        XCTAssertTrue(recipe.contains("\"engine_version\":4"))
+        XCTAssertTrue(recipe.contains("\"engine_version\":5"))
         XCTAssertTrue(recipe.contains("\"camera_profile\":\"resolved_nonlinear\""))
+        XCTAssertTrue(recipe.contains("\"film_curve\":\"linear\""))
     }
 
     func testPreviewResolutionPolicyProgressesWithoutExceedingSource() {
@@ -165,8 +166,8 @@ final class RenderContractTests: XCTestCase {
             precision: .float32
         )
 
-        XCTAssertNotEqual(metal, .strictCPUV4)
-        XCTAssertNotEqual(metal.implementationID, RendererManifest.strictCPUV4.implementationID)
+        XCTAssertNotEqual(metal, .strictCPUV5)
+        XCTAssertNotEqual(metal.implementationID, RendererManifest.strictCPUV5.implementationID)
     }
 
     func testLinearWorkingOutputHasItsOwnExecutionContract() {
@@ -180,7 +181,7 @@ final class RenderContractTests: XCTestCase {
         )
         XCTAssertEqual(
             RenderExecutionContract.strictCPULinearWorking.renderer,
-            .strictCPUV4
+            .strictCPUV5
         )
     }
 
@@ -299,6 +300,9 @@ final class RenderContractTests: XCTestCase {
             isoRecordIDs: ["camera.canon.r3.iso.100.v1"],
             inputProfileID: "profile.canon.r3.v1",
             filmCurveID: "curve.canon.r3.auto.v1",
+            filmCurveSelection: "capture_one_auto",
+            cameraBaseGain: 1.07,
+            sensorRangeGain: 1.0,
             lensProfileID: "lens.canon.24-70.v1",
             firstAffectedStageID: "normalize",
             stages: []

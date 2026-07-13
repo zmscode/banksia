@@ -9,6 +9,7 @@ pub const dng = @import("dng.zig");
 pub const dng_write = @import("dng_write.zig");
 pub const color = @import("color.zig");
 pub const calibration = @import("calibration.zig");
+pub const film_curve = @import("film_curve.zig");
 pub const icc_profile = @import("icc_profile.zig");
 pub const reconstruction = @import("reconstruction.zig");
 pub const render_manifest = @import("render_manifest.zig");
@@ -26,6 +27,7 @@ test {
     _ = dng_write;
     _ = color;
     _ = calibration;
+    _ = film_curve;
     _ = icc_profile;
     _ = reconstruction;
     _ = render_manifest;
