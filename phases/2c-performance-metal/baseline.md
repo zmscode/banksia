@@ -115,3 +115,21 @@ input-to-visible gate because drawable/presentation scheduling dominates the
 tail. Phase 2C.4 is complete as an architecture and failure-handling proof; the
 compiled path must regain the latency gate during 2C.5 before the Metal
 investment decision can pass.
+
+## 2C.5 fused-path closure measurements
+
+Recorded 2026-07-13 after enabling framebuffer-only opaque drawables, wiring
+nearest/linear shader sampling, and adding full conformance/failure coverage.
+The release build remained presentation-bound:
+
+| Mode | Visible p50 | p95 | p99 | Queue p50 | GPU p50 | Present p50 |
+|---|---:|---:|---:|---:|---:|---:|
+| synchronized, two drawables | 47.557 ms | 47.758 ms | 66.254 ms | 2.655 ms | 1.496 ms | 38.315 ms |
+| unsynchronized experiment | 30.569 ms | 62.840 ms | 85.575 ms | 0.214 ms | 0.673 ms | 21.973 ms |
+
+Three synchronized drawables also missed at 47.675 ms p95. The unsynchronized
+mode improves its median while materially worsening its tail, so it remains
+rejected. The final path keeps two synchronized drawables. The compiled shader,
+corpus parity, precision, and sustained trace evidence are complete; a different
+presentation driver or an explicit product-gate decision is needed to close the
+33 ms p95 requirement. See [the conformance report](conformance.md).

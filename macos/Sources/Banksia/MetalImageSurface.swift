@@ -4,6 +4,45 @@ import SwiftUI
 import os
 import os.signpost
 
+enum MetalFailureStage: String, CaseIterable, Sendable {
+    case initialization
+    case allocation
+    case shader
+    case commandBuffer
+    case drawable
+    case completion
+}
+
+struct MetalFailure: Error, Equatable, Sendable {
+    let stage: MetalFailureStage
+    let message: String
+
+    var fallbackExecution: RenderExecutionContract { .strictCPUDisplay }
+}
+
+private enum MetalPresentationResourcesState {
+    case ready(MetalPresentationResources)
+    case failed(MetalFailure)
+}
+
+private enum MetalPresentationTuning {
+    static let displaySyncEnabled =
+        ProcessInfo.processInfo.environment["BANKSIA_METAL_DISPLAY_SYNC"] != "0"
+}
+
+enum MetalFailureInjection {
+    static func requested(_ stage: MetalFailureStage) -> Bool {
+        let value = ProcessInfo.processInfo.environment["BANKSIA_INJECT_METAL_FAILURE"]
+        return injectedStage(value: value) == stage
+    }
+
+    static func injectedStage(value: String?) -> MetalFailureStage? {
+        if value == "1" { return .initialization }
+        guard let value else { return nil }
+        return MetalFailureStage(rawValue: value)
+    }
+}
+
 private struct MetalPresentationResources {
     let device: any MTLDevice
     let commandQueue: any MTLCommandQueue
@@ -14,15 +53,30 @@ private struct MetalPresentationResources {
         name: CGColorSpace.extendedLinearITUR_2020
     )!
 
-    static let shared: MetalPresentationResources? = {
-        guard ProcessInfo.processInfo.environment["BANKSIA_INJECT_METAL_FAILURE"] != "1"
-        else { return nil }
+    static let shared: MetalPresentationResourcesState = {
+        guard !MetalFailureInjection.requested(.initialization) else {
+            return .failed(MetalFailure(
+                stage: .initialization,
+                message: "injected Metal initialization failure"
+            ))
+        }
         guard let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue()
-        else { return nil }
+        else {
+            return .failed(MetalFailure(
+                stage: .initialization,
+                message: "Metal device or command queue is unavailable"
+            ))
+        }
         commandQueue.label = "Banksia viewer queue"
         do {
-            return MetalPresentationResources(
+            if MetalFailureInjection.requested(.shader) {
+                throw MetalFailure(
+                    stage: .shader,
+                    message: "injected Metal shader failure"
+                )
+            }
+            return .ready(MetalPresentationResources(
                 device: device,
                 commandQueue: commandQueue,
                 displayContext: CIContext(
@@ -30,9 +84,14 @@ private struct MetalPresentationResources {
                     options: [.cacheIntermediates: false]
                 ),
                 lateDevelopPipeline: try MetalLateDevelopPipeline(device: device)
-            )
+            ))
+        } catch let failure as MetalFailure {
+            return .failed(failure)
         } catch {
-            return nil
+            return .failed(MetalFailure(
+                stage: .shader,
+                message: "Metal shader pipeline failed: \(error.localizedDescription)"
+            ))
         }
     }()
 }
@@ -44,9 +103,19 @@ struct LateDevelopUniforms {
 
 final class MetalLateDevelopPipeline {
     static let implementationID = "banksia.metal.late-develop-f32.msl1"
+    static let passCount = 1
+    static let fusedOperations = [
+        "scaling",
+        "exposure",
+        "tone",
+        "working-to-output-matrix",
+        "clipping",
+        "display-encoding",
+    ]
 
     let pipelineState: any MTLRenderPipelineState
-    let samplerState: any MTLSamplerState
+    let linearSamplerState: any MTLSamplerState
+    let nearestSamplerState: any MTLSamplerState
 
     init(device: any MTLDevice) throws {
         guard let libraryURL = Bundle.module.url(
@@ -68,15 +137,23 @@ final class MetalLateDevelopPipeline {
         descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
         pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
 
-        let samplerDescriptor = MTLSamplerDescriptor()
-        samplerDescriptor.minFilter = .linear
-        samplerDescriptor.magFilter = .linear
-        samplerDescriptor.sAddressMode = .clampToEdge
-        samplerDescriptor.tAddressMode = .clampToEdge
-        guard let sampler = device.makeSamplerState(descriptor: samplerDescriptor) else {
+        let linearDescriptor = MTLSamplerDescriptor()
+        linearDescriptor.minFilter = .linear
+        linearDescriptor.magFilter = .linear
+        linearDescriptor.sAddressMode = .clampToEdge
+        linearDescriptor.tAddressMode = .clampToEdge
+        let nearestDescriptor = MTLSamplerDescriptor()
+        nearestDescriptor.minFilter = .nearest
+        nearestDescriptor.magFilter = .nearest
+        nearestDescriptor.sAddressMode = .clampToEdge
+        nearestDescriptor.tAddressMode = .clampToEdge
+        guard let linearSampler = device.makeSamplerState(descriptor: linearDescriptor),
+              let nearestSampler = device.makeSamplerState(descriptor: nearestDescriptor)
+        else {
             throw EngineError(code: -7, message: "Metal sampler allocation failed")
         }
-        samplerState = sampler
+        linearSamplerState = linearSampler
+        nearestSamplerState = nearestSampler
     }
 
     func encode(
@@ -84,7 +161,8 @@ final class MetalLateDevelopPipeline {
         destination: any MTLTexture,
         commandBuffer: any MTLCommandBuffer,
         exposureEV: Double,
-        contrast: Double
+        contrast: Double,
+        nearestSampling: Bool = false
     ) -> Bool {
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = destination
@@ -96,7 +174,10 @@ final class MetalLateDevelopPipeline {
         encoder.label = Self.implementationID
         encoder.setRenderPipelineState(pipelineState)
         encoder.setFragmentTexture(source, index: 0)
-        encoder.setFragmentSamplerState(samplerState, index: 0)
+        encoder.setFragmentSamplerState(
+            nearestSampling ? nearestSamplerState : linearSamplerState,
+            index: 0
+        )
         var uniforms = LateDevelopUniforms(
             exposureEV: Float(exposureEV),
             contrast: Float(contrast)
@@ -295,13 +376,13 @@ struct MetalLinearImageSurface: View {
     let contrast: Double
     let nearestSampling: Bool
     let onTiming: @MainActor (MetalDevelopTiming) -> Void
-    let onFailure: @MainActor (String) -> Void
+    let onFailure: @MainActor (MetalFailure) -> Void
 
     @State private var metalFailed = false
 
     @ViewBuilder
     var body: some View {
-        if let resources = MetalPresentationResources.shared, !metalFailed {
+        if case .ready(let resources) = MetalPresentationResources.shared, !metalFailed {
             MetalLinearImageView(
                 preview: preview,
                 previewGeneration: previewGeneration,
@@ -310,16 +391,20 @@ struct MetalLinearImageSurface: View {
                 nearestSampling: nearestSampling,
                 resources: resources,
                 onTiming: onTiming,
-                onFailure: { message in
+                onFailure: { failure in
                     metalFailed = true
-                    onFailure(message)
+                    onFailure(failure)
                 }
             )
         } else {
             MetalUnavailableView(
                 message: "Preparing CPU fallback…"
             )
-            .task { onFailure("Metal device, queue, or shader pipeline is unavailable") }
+            .task {
+                if case .failed(let failure) = MetalPresentationResources.shared {
+                    onFailure(failure)
+                }
+            }
         }
     }
 }
@@ -332,7 +417,7 @@ private struct MetalLinearImageView: NSViewRepresentable {
     let nearestSampling: Bool
     let resources: MetalPresentationResources
     let onTiming: @MainActor (MetalDevelopTiming) -> Void
-    let onFailure: @MainActor (String) -> Void
+    let onFailure: @MainActor (MetalFailure) -> Void
 
     func makeCoordinator() -> MetalLinearImageRenderer {
         MetalLinearImageRenderer(
@@ -351,17 +436,20 @@ private struct MetalLinearImageView: NSViewRepresentable {
         view.delegate = context.coordinator
         view.colorPixelFormat = .bgra8Unorm_srgb
         view.depthStencilPixelFormat = .invalid
-        view.framebufferOnly = false
+        view.framebufferOnly = true
         view.autoResizeDrawable = true
+        view.preferredFramesPerSecond = 0
         view.isPaused = true
         view.enableSetNeedsDisplay = false
-        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-        view.layer?.isOpaque = false
+        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        view.layer?.isOpaque = true
         view.layer?.magnificationFilter = nearestSampling ? .nearest : .linear
         if let layer = view.layer as? CAMetalLayer {
             layer.maximumDrawableCount = 2
-            layer.displaySyncEnabled = true
+            layer.displaySyncEnabled = MetalPresentationTuning.displaySyncEnabled
             layer.allowsNextDrawableTimeout = true
+            layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+            layer.presentsWithTransaction = false
         }
         view.requestFrame()
         return view
@@ -391,7 +479,7 @@ struct MetalImageSurface: View {
     @State private var metalFailed = false
 
     var body: some View {
-        if let resources = MetalPresentationResources.shared, !metalFailed {
+        if case .ready(let resources) = MetalPresentationResources.shared, !metalFailed {
             MetalImageView(
                 image: image,
                 nearestSampling: nearestSampling,
@@ -425,17 +513,20 @@ private struct MetalImageView: NSViewRepresentable {
         view.delegate = context.coordinator
         view.colorPixelFormat = .bgra8Unorm_srgb
         view.depthStencilPixelFormat = .invalid
-        view.framebufferOnly = false
+        view.framebufferOnly = true
         view.autoResizeDrawable = true
+        view.preferredFramesPerSecond = 0
         view.isPaused = true
         view.enableSetNeedsDisplay = false
-        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-        view.layer?.isOpaque = false
+        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        view.layer?.isOpaque = true
         view.layer?.magnificationFilter = nearestSampling ? .nearest : .linear
         if let layer = view.layer as? CAMetalLayer {
             layer.maximumDrawableCount = 2
-            layer.displaySyncEnabled = true
+            layer.displaySyncEnabled = MetalPresentationTuning.displaySyncEnabled
             layer.allowsNextDrawableTimeout = true
+            layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+            layer.presentsWithTransaction = false
         }
         view.requestFrame()
         return view
@@ -659,10 +750,9 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
     )
     private let resources: MetalPresentationResources
     private let onTiming: @MainActor (MetalDevelopTiming) -> Void
-    private let onFailure: @MainActor (String) -> Void
+    private let onFailure: @MainActor (MetalFailure) -> Void
     private let inFlightLock = NSLock()
-    private var inFlightCount = 0
-    private var retryNewestFrame = false
+    private var admission = MetalFrameAdmissionState()
     private var previewGeneration: UInt64
     private var texture: (any MTLTexture)?
     private var exposureEV: Double
@@ -670,6 +760,7 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
     private var requestedAt = CACurrentMediaTime()
     private var pendingUploadMS = 0.0
     private var consecutiveNilDrawables = 0
+    private var frameGeneration: UInt64 = 1
 
     init(
         preview: LinearPreview,
@@ -678,7 +769,7 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
         contrast: Double,
         resources: MetalPresentationResources,
         onTiming: @escaping @MainActor (MetalDevelopTiming) -> Void,
-        onFailure: @escaping @MainActor (String) -> Void
+        onFailure: @escaping @MainActor (MetalFailure) -> Void
     ) {
         self.previewGeneration = previewGeneration
         self.exposureEV = exposureEV
@@ -699,7 +790,10 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
         let changed = previewGeneration != self.previewGeneration
             || exposureEV != self.exposureEV
             || contrast != self.contrast
-        if changed { requestedAt = CACurrentMediaTime() }
+        if changed {
+            requestedAt = CACurrentMediaTime()
+            frameGeneration &+= 1
+        }
         if previewGeneration != self.previewGeneration {
             self.previewGeneration = previewGeneration
             upload(preview)
@@ -719,12 +813,23 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
               view.drawableSize.width > 0,
               view.drawableSize.height > 0
         else { return }
-        guard admitFrame() else { return }
+        guard admitFrame(generation: frameGeneration) else { return }
+        if MetalFailureInjection.requested(.drawable) {
+            _ = releaseFrame()
+            reportFailure(MetalFailure(
+                stage: .drawable,
+                message: "injected Metal drawable failure"
+            ))
+            return
+        }
         guard let drawable = view.currentDrawable else {
             _ = releaseFrame()
             consecutiveNilDrawables += 1
             if consecutiveNilDrawables >= 3 {
-                reportFailure("Metal drawable acquisition repeatedly failed")
+                reportFailure(MetalFailure(
+                    stage: .drawable,
+                    message: "Metal drawable acquisition repeatedly failed"
+                ))
             } else {
                 Task { @MainActor [weak view] in
                     (view as? OnDemandMTKView)?.requestFrame()
@@ -733,9 +838,20 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
             return
         }
         consecutiveNilDrawables = 0
+        if MetalFailureInjection.requested(.commandBuffer) {
+            _ = releaseFrame()
+            reportFailure(MetalFailure(
+                stage: .commandBuffer,
+                message: "injected Metal command-buffer failure"
+            ))
+            return
+        }
         guard let commandBuffer = resources.commandQueue.makeCommandBuffer() else {
             _ = releaseFrame()
-            reportFailure("Metal command-buffer creation failed")
+            reportFailure(MetalFailure(
+                stage: .commandBuffer,
+                message: "Metal command-buffer creation failed"
+            ))
             return
         }
 
@@ -758,10 +874,14 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
             destination: drawable.texture,
             commandBuffer: commandBuffer,
             exposureEV: exposureEV,
-            contrast: contrast
+            contrast: contrast,
+            nearestSampling: view.layer?.magnificationFilter == .nearest
         ) else {
             _ = releaseFrame()
-            reportFailure("Metal late-develop command encoding failed")
+            reportFailure(MetalFailure(
+                stage: .commandBuffer,
+                message: "Metal late-develop command encoding failed"
+            ))
             return
         }
         commandBuffer.present(drawable)
@@ -777,6 +897,7 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
         pendingUploadMS = 0
         let drawableWidth = Int(view.drawableSize.width)
         let drawableHeight = Int(view.drawableSize.height)
+        let submittedGeneration = frameGeneration
         let timingCollector = MetalFrameTimingCollector(
             uploadMS: uploadMS,
             encodeMS: max(0, encodedAt - encodeStartedAt) * 1_000,
@@ -784,7 +905,10 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
             requestedAt: requestAt,
             drawableWidth: drawableWidth,
             drawableHeight: drawableHeight,
-            onTiming: onTiming
+            onTiming: { [weak self] timing in
+                guard let self, self.frameGeneration == submittedGeneration else { return }
+                self.onTiming(timing)
+            }
         )
         drawable.addPresentedHandler {
             timingCollector.drawablePresented(at: $0.presentedTime)
@@ -803,8 +927,16 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
                     (view as? OnDemandMTKView)?.requestFrame()
                 }
             }
-            if let error = buffer.error {
-                self.reportFailure("Metal late develop failed: \(error.localizedDescription)")
+            if MetalFailureInjection.requested(.completion) {
+                self.reportFailure(MetalFailure(
+                    stage: .completion,
+                    message: "injected Metal command completion failure"
+                ))
+            } else if let error = buffer.error {
+                self.reportFailure(MetalFailure(
+                    stage: .completion,
+                    message: "Metal late develop failed: \(error.localizedDescription)"
+                ))
             }
         }
         commandBuffer.commit()
@@ -820,8 +952,18 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
         )
         descriptor.storageMode = .shared
         descriptor.usage = [.shaderRead]
+        if MetalFailureInjection.requested(.allocation) {
+            reportFailure(MetalFailure(
+                stage: .allocation,
+                message: "injected Metal texture allocation failure"
+            ))
+            return
+        }
         guard let texture = resources.device.makeTexture(descriptor: descriptor) else {
-            reportFailure("RGBA32F linear preview texture allocation failed")
+            reportFailure(MetalFailure(
+                stage: .allocation,
+                message: "RGBA32F linear preview texture allocation failed"
+            ))
             return
         }
         texture.label = "Banksia linear Rec.2020 preview"
@@ -842,28 +984,20 @@ private final class MetalLinearImageRenderer: NSObject, MTKViewDelegate {
         self.texture = texture
     }
 
-    private func admitFrame() -> Bool {
+    private func admitFrame(generation: UInt64) -> Bool {
         inFlightLock.lock()
         defer { inFlightLock.unlock() }
-        guard inFlightCount < 2 else {
-            retryNewestFrame = true
-            return false
-        }
-        inFlightCount += 1
-        return true
+        return admission.request(generation: generation) == .admitted
     }
 
     private func releaseFrame() -> Bool {
         inFlightLock.lock()
         defer { inFlightLock.unlock() }
-        inFlightCount -= 1
-        let retry = retryNewestFrame
-        retryNewestFrame = false
-        return retry
+        return admission.complete() != nil
     }
 
-    private func reportFailure(_ message: String) {
-        Self.log.error("\(message, privacy: .public)")
-        Task { @MainActor in onFailure(message) }
+    private func reportFailure(_ failure: MetalFailure) {
+        Self.log.error("\(failure.message, privacy: .public)")
+        Task { @MainActor in onFailure(failure) }
     }
 }

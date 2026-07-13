@@ -83,6 +83,15 @@ final class MetalPresentationTests: XCTestCase {
             MetalLateDevelopPipeline.implementationID,
             "banksia.metal.late-develop-f32.msl1"
         )
+        XCTAssertEqual(MetalLateDevelopPipeline.passCount, 1)
+        XCTAssertEqual(MetalLateDevelopPipeline.fusedOperations, [
+            "scaling",
+            "exposure",
+            "tone",
+            "working-to-output-matrix",
+            "clipping",
+            "display-encoding",
+        ])
     }
 
     func testCompiledLateDevelopPresentsDirectTextureKnownVector() throws {
@@ -119,6 +128,183 @@ final class MetalPresentationTests: XCTestCase {
         XCTAssertLessThan(pixels[0], 16, "top row not blue")
         XCTAssertGreaterThan(pixels[4], 240, "bottom row blue")
         XCTAssertLessThan(pixels[6], 16, "bottom row not red")
+    }
+
+    func testEveryMetalFailureStageSelectsStrictCPUFallback() {
+        for stage in MetalFailureStage.allCases {
+            let failure = MetalFailure(stage: stage, message: "injected")
+            XCTAssertEqual(failure.fallbackExecution, .strictCPUDisplay, stage.rawValue)
+            XCTAssertEqual(
+                MetalFailureInjection.injectedStage(value: stage.rawValue),
+                stage
+            )
+        }
+        XCTAssertEqual(MetalFailureInjection.injectedStage(value: "1"), .initialization)
+        XCTAssertNil(MetalFailureInjection.injectedStage(value: "unknown"))
+    }
+
+    func testAdversarialOddImageMatchesCPUReferenceAndRemainsFinite() throws {
+        let width = 17
+        let height = 13
+        let source = adversarialLinearPixels(width: width, height: height)
+        let actualBGRA = try renderCompiledLateDevelop(
+            width: width,
+            height: height,
+            sourcePixels: source,
+            exposureEV: 0.75,
+            contrast: 0.65
+        )
+        let actual = bgraToRGBA(actualBGRA)
+        let reference = cpuLateDevelop(
+            sourcePixels: source,
+            exposureEV: 0.75,
+            contrast: 0.65
+        )
+        let metrics = try XCTUnwrap(PerceptualMetrics.compare(
+            actualRGBA: actual,
+            referenceRGBA: reference
+        ))
+        XCTAssertTrue(metrics.finiteOutput)
+        XCTAssertLessThanOrEqual(metrics.deltaE00Mean, 0.20)
+        XCTAssertLessThanOrEqual(metrics.deltaE00P95, 0.60)
+        XCTAssertLessThanOrEqual(metrics.deltaE00Maximum, 1.0)
+        XCTAssertGreaterThanOrEqual(metrics.ssim, 0.9999)
+    }
+
+    func testRGBA16FloatCandidateAgainstRGBA32FloatEvidence() throws {
+        let width = 257
+        let height = 5
+        let source = adversarialLinearPixels(width: width, height: height)
+        let output32 = bgraToRGBA(try renderCompiledLateDevelop(
+            width: width,
+            height: height,
+            sourcePixels: source,
+            exposureEV: -1.25,
+            contrast: 0.4,
+            sourceFormat: .rgba32Float
+        ))
+        let output16 = bgraToRGBA(try renderCompiledLateDevelop(
+            width: width,
+            height: height,
+            sourcePixels: source,
+            exposureEV: -1.25,
+            contrast: 0.4,
+            sourceFormat: .rgba16Float
+        ))
+        let metrics = try XCTUnwrap(PerceptualMetrics.compare(
+            actualRGBA: output16,
+            referenceRGBA: output32
+        ))
+        XCTAssertTrue(metrics.finiteOutput)
+        XCTAssertLessThanOrEqual(metrics.deltaE00Mean, 0.10)
+        XCTAssertLessThanOrEqual(metrics.deltaE00P95, 0.35)
+        XCTAssertLessThanOrEqual(metrics.deltaE00Maximum, 1.0)
+        XCTAssertGreaterThanOrEqual(metrics.ssim, 0.9999)
+        print(String(format:
+            "metal-precision rgba16-vs-rgba32 de_mean=%.4f de_median=%.4f "
+                + "de_p95=%.4f de_max=%.4f ssim=%.7f finite=%@",
+            metrics.deltaE00Mean,
+            metrics.deltaE00Median,
+            metrics.deltaE00P95,
+            metrics.deltaE00Maximum,
+            metrics.ssim,
+            metrics.finiteOutput.description
+        ))
+    }
+
+    func testRepeatedOddResizeRenderLoopCompletesWithoutDeadlock() throws {
+        let sourceWidth = 17
+        let sourceHeight = 13
+        let source = adversarialLinearPixels(width: sourceWidth, height: sourceHeight)
+        for iteration in 0..<64 {
+            let outputWidth = 19 + (iteration % 11) * 2
+            let outputHeight = 15 + (iteration % 7) * 2
+            let pixels = try renderCompiledLateDevelop(
+                width: sourceWidth,
+                height: sourceHeight,
+                outputWidth: outputWidth,
+                outputHeight: outputHeight,
+                sourcePixels: source,
+                exposureEV: Double(iteration % 5) * 0.1,
+                contrast: Double(iteration % 7) * 0.1,
+                nearestSampling: iteration.isMultiple(of: 2)
+            )
+            XCTAssertEqual(pixels.count, outputWidth * outputHeight * 4)
+        }
+    }
+
+    func testMandatoryPhase2BCorpusCPUAndMetalConformance() async throws {
+        let corpus = repositoryRoot
+            .appendingPathComponent("tests/corpus/phase2b", isDirectory: true)
+        let files = try FileManager.default.contentsOfDirectory(
+            at: corpus,
+            includingPropertiesForKeys: nil
+        )
+            .filter { $0.pathExtension.lowercased() == "dng" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        XCTAssertEqual(files.count, 8)
+
+        let renderer = Renderer()
+        var aggregateDeltas: [Double] = []
+        var minimumSSIM = 1.0
+        for (index, file) in files.enumerated() {
+            try await renderer.load(path: file.path)
+            let model = DevelopModel()
+            model.ev = 0.5
+            model.contrast = 0.35
+            let cpuRequest = RenderRequest(
+                generation: UInt64(index * 2 + 1),
+                recipeJSON: model.recipeJSON,
+                edgeMax: 512,
+                intent: .compatibility,
+                execution: .strictCPUDisplay
+            )
+            let linearRequest = RenderRequest(
+                generation: UInt64(index * 2 + 2),
+                recipeJSON: model.recipeJSON,
+                edgeMax: 512,
+                intent: .compatibility,
+                execution: .strictCPULinearWorking
+            )
+            let cpu = try await renderer.render(request: cpuRequest)
+            let linear = try await renderer.renderLinearPreview(request: linearRequest)
+            XCTAssertEqual(cpu.image.width, linear.preview.width)
+            XCTAssertEqual(cpu.image.height, linear.preview.height)
+            let source = linear.preview.rgba32Float.withUnsafeBytes {
+                Array($0.bindMemory(to: Float.self))
+            }
+            let metal = bgraToRGBA(try renderCompiledLateDevelop(
+                width: linear.preview.width,
+                height: linear.preview.height,
+                sourcePixels: source,
+                exposureEV: model.ev,
+                contrast: model.contrast
+            ))
+            let reference = try rgbaBytes(cpu.image)
+            let metrics = try XCTUnwrap(PerceptualMetrics.compare(
+                actualRGBA: metal,
+                referenceRGBA: reference
+            ))
+            print(String(format:
+                "metal-conformance file=%@ samples=%d de_mean=%.4f de_median=%.4f "
+                    + "de_p95=%.4f de_max=%.4f ssim=%.7f finite=%@",
+                file.lastPathComponent,
+                metrics.sampleCount,
+                metrics.deltaE00Mean,
+                metrics.deltaE00Median,
+                metrics.deltaE00P95,
+                metrics.deltaE00Maximum,
+                metrics.ssim,
+                metrics.finiteOutput.description
+            ))
+            aggregateDeltas.append(metrics.deltaE00Mean)
+            minimumSSIM = min(minimumSSIM, metrics.ssim)
+            XCTAssertTrue(metrics.finiteOutput, file.lastPathComponent)
+            XCTAssertLessThanOrEqual(metrics.deltaE00Mean, 0.5, file.lastPathComponent)
+            XCTAssertGreaterThanOrEqual(metrics.ssim, 0.995, file.lastPathComponent)
+        }
+        XCTAssertLessThanOrEqual(aggregateDeltas.reduce(0, +) / 8, 0.5)
+        XCTAssertGreaterThanOrEqual(minimumSSIM, 0.995)
     }
 
     func testLinearLateDevelopMatchesKnownVector() throws {
@@ -286,9 +472,13 @@ final class MetalPresentationTests: XCTestCase {
     private func renderCompiledLateDevelop(
         width: Int,
         height: Int,
+        outputWidth: Int? = nil,
+        outputHeight: Int? = nil,
         sourcePixels: [Float],
         exposureEV: Double,
-        contrast: Double
+        contrast: Double,
+        sourceFormat: MTLPixelFormat = .rgba32Float,
+        nearestSampling: Bool = false
     ) throws -> [UInt8] {
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue(),
@@ -298,7 +488,7 @@ final class MetalPresentationTests: XCTestCase {
         }
 
         let sourceDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba32Float,
+            pixelFormat: sourceFormat,
             width: width,
             height: height,
             mipmapped: false
@@ -307,8 +497,8 @@ final class MetalPresentationTests: XCTestCase {
         sourceDescriptor.usage = [.shaderRead]
         let outputDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm_srgb,
-            width: width,
-            height: height,
+            width: outputWidth ?? width,
+            height: outputHeight ?? height,
             mipmapped: false
         )
         outputDescriptor.storageMode = .shared
@@ -320,32 +510,131 @@ final class MetalPresentationTests: XCTestCase {
             return []
         }
 
-        var mutableSource = sourcePixels
-        source.replace(
-            region: MTLRegionMake2D(0, 0, width, height),
-            mipmapLevel: 0,
-            withBytes: &mutableSource,
-            bytesPerRow: width * 4 * MemoryLayout<Float>.stride
-        )
+        if sourceFormat == .rgba16Float {
+            var mutableSource = sourcePixels.map(Float16.init)
+            source.replace(
+                region: MTLRegionMake2D(0, 0, width, height),
+                mipmapLevel: 0,
+                withBytes: &mutableSource,
+                bytesPerRow: width * 4 * MemoryLayout<Float16>.stride
+            )
+        } else {
+            var mutableSource = sourcePixels
+            source.replace(
+                region: MTLRegionMake2D(0, 0, width, height),
+                mipmapLevel: 0,
+                withBytes: &mutableSource,
+                bytesPerRow: width * 4 * MemoryLayout<Float>.stride
+            )
+        }
         let pipeline = try MetalLateDevelopPipeline(device: device)
         XCTAssertTrue(pipeline.encode(
             source: source,
             destination: output,
             commandBuffer: commandBuffer,
             exposureEV: exposureEV,
-            contrast: contrast
+            contrast: contrast,
+            nearestSampling: nearestSampling
         ))
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         XCTAssertEqual(commandBuffer.status, .completed)
 
-        var outputPixels = [UInt8](repeating: 0, count: width * height * 4)
+        let resolvedOutputWidth = outputWidth ?? width
+        let resolvedOutputHeight = outputHeight ?? height
+        var outputPixels = [UInt8](
+            repeating: 0,
+            count: resolvedOutputWidth * resolvedOutputHeight * 4
+        )
         output.getBytes(
             &outputPixels,
-            bytesPerRow: width * 4,
-            from: MTLRegionMake2D(0, 0, width, height),
+            bytesPerRow: resolvedOutputWidth * 4,
+            from: MTLRegionMake2D(0, 0, resolvedOutputWidth, resolvedOutputHeight),
             mipmapLevel: 0
         )
         return outputPixels
+    }
+
+    private var repositoryRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    private func rgbaBytes(_ image: CGImage) throws -> [UInt8] {
+        let data = try XCTUnwrap(image.dataProvider?.data)
+        let pointer = try XCTUnwrap(CFDataGetBytePtr(data))
+        return Array(UnsafeBufferPointer(
+            start: pointer,
+            count: image.width * image.height * 4
+        ))
+    }
+
+    private func bgraToRGBA(_ bytes: [UInt8]) -> [UInt8] {
+        var rgba = bytes
+        for offset in stride(from: 0, to: bytes.count, by: 4) {
+            rgba[offset] = bytes[offset + 2]
+            rgba[offset + 2] = bytes[offset]
+        }
+        return rgba
+    }
+
+    private func adversarialLinearPixels(width: Int, height: Int) -> [Float] {
+        var pixels = [Float](repeating: 0, count: width * height * 4)
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = (y * width + x) * 4
+                let gradient = Float(x) / Float(max(1, width - 1))
+                let border = x == 0 || y == 0 || x == width - 1 || y == height - 1
+                pixels[offset] = border ? -0.25 : gradient * 1.5
+                pixels[offset + 1] = Float(y) / Float(max(1, height - 1)) * 0.01
+                pixels[offset + 2] = x.isMultiple(of: 3) ? 2.0 : gradient
+                pixels[offset + 3] = 1
+            }
+        }
+        return pixels
+    }
+
+    private func cpuLateDevelop(
+        sourcePixels: [Float],
+        exposureEV: Double,
+        contrast: Double
+    ) -> [UInt8] {
+        let gain = Float(exp2(exposureEV))
+        var output = [UInt8](repeating: 0, count: sourcePixels.count)
+        for offset in stride(from: 0, to: sourcePixels.count, by: 4) {
+            var red = sourcePixels[offset] * gain
+            var green = sourcePixels[offset + 1] * gain
+            var blue = sourcePixels[offset + 2] * gain
+            if contrast > 0 {
+                red = tone(red, contrast)
+                green = tone(green, contrast)
+                blue = tone(blue, contrast)
+            }
+            let linearRed = 1.660491 * red - 0.587641 * green - 0.072850 * blue
+            let linearGreen = -0.124550 * red + 1.132900 * green - 0.008349 * blue
+            let linearBlue = -0.018151 * red - 0.100579 * green + 1.118730 * blue
+            output[offset] = srgb(linearRed)
+            output[offset + 1] = srgb(linearGreen)
+            output[offset + 2] = srgb(linearBlue)
+            output[offset + 3] = 255
+        }
+        return output
+    }
+
+    private func tone(_ value: Float, _ contrast: Double) -> Float {
+        let clamped = min(1, max(0, value))
+        let smooth = clamped * clamped * (3 - 2 * clamped)
+        return clamped + Float(contrast) * (smooth - clamped)
+    }
+
+    private func srgb(_ value: Float) -> UInt8 {
+        let clamped = min(1, max(0, value))
+        let encoded = clamped <= 0.0031308
+            ? 12.92 * clamped
+            : 1.055 * pow(clamped, 1 / 2.4) - 0.055
+        return UInt8(min(255, max(0, round(encoded * 255))))
     }
 }

@@ -168,13 +168,14 @@ final class DevelopController {
 
     /// Switches to the strict CPU presenter only after the Metal surface has
     /// reported a real capability or execution failure.
-    func handleMetalFailure(_ message: String) {
+    func handleMetalFailure(_ failure: MetalFailure) {
         guard hasRaw, !useCPUFallback else { return }
+        precondition(failure.fallbackExecution == .strictCPUDisplay)
         benchmarkTask?.cancel()
         benchmarkTask = nil
         isMetalBenchmarking = false
         useCPUFallback = true
-        statusText = "Metal unavailable; using CPU fallback (\(message))"
+        statusText = "Metal \(failure.stage.rawValue) failed; using CPU fallback"
         requestCPUFallbackRender()
     }
 
@@ -219,8 +220,12 @@ final class DevelopController {
         metalBenchmarkSamples.removeAll(keepingCapacity: true)
         metalBenchmarkSummary = nil
         isMetalBenchmarking = true
+        let requestedSamples = Int(
+            ProcessInfo.processInfo.environment["BANKSIA_METAL_BENCHMARK_SAMPLES"] ?? "31"
+        ) ?? 31
+        let sampleCount = min(10_000, max(2, requestedSamples))
         benchmarkTask = Task {
-            for index in 0..<31 where !Task.isCancelled {
+            for index in 0..<sampleCount where !Task.isCancelled {
                 var exposure = (index.isMultiple(of: 2) ? -0.75 : 0.75)
                     + Double(index) * 0.001
                 if exposure == develop.ev { exposure += 0.125 }

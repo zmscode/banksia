@@ -150,6 +150,15 @@ pub fn build(b: *std.Build) void {
     const shell_step = b.step("shell", "Build the SwiftUI inspection shell (needs Xcode)");
     shell_step.dependOn(&shell_build.step);
 
+    const swift_tests = b.addSystemCommand(&.{ "swift", "test", "--package-path", "macos" });
+    swift_tests.step.dependOn(&shell_build.step);
+    swift_tests.has_side_effects = true;
+    const metal_test_step = b.step(
+        "test-metal",
+        "Run the compiled Metal surface and CPU/GPU conformance tests",
+    );
+    metal_test_step.dependOn(&swift_tests.step);
+
     const shell_run = b.addSystemCommand(&.{"macos/.build/debug/Banksia"});
     shell_run.step.dependOn(&shell_build.step);
     if (b.args) |args| shell_run.addArgs(args);

@@ -120,8 +120,9 @@ and verify the implementation ID.
 Device/queue/library/allocation/encoding/command failures now activate the
 strict CPU renderer for the current file; normal operation remains GPU-first.
 Nil drawables retry twice before reporting failure, resize/backing changes request
-a fresh drawable-sized frame, and the explicit `BANKSIA_INJECT_METAL_FAILURE=1`
-test hook exercised an upright real-CR2 CPU fallback in the running app. A
+a fresh drawable-sized frame, and the staged `BANKSIA_INJECT_METAL_FAILURE`
+hook keeps every failure boundary reproducible. Its initialization alias (`1`)
+exercised an upright real-CR2 CPU fallback in the running app. A
 separate `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1` launch completed through the
 compiled shader with both validation layers enabled and no reported errors.
 A five-second Metal System Trace taken after the initial frame contained zero
@@ -151,12 +152,12 @@ engine-v1 output is unchanged. A selective camera-domain chroma reconstruction
 filter suppresses high-frequency false colour before the working-space matrix.
 
 - [x] Upload or share one linear working preview and retain it across late edits.
-- [ ] Fuse exposure, camera/working matrix where applicable, tone, output colour,
+- [x] Fuse exposure, camera/working matrix where applicable, tone, output colour,
   clipping policy, and display encoding into the fewest measured passes.
-- [ ] Add GPU scaling and histogram only when they remove an observed CPU pass.
-- [ ] Keep geometry and crop semantics identical to the strict CPU reference.
+- [x] Add GPU scaling and histogram only when they remove an observed CPU pass.
+- [x] Keep geometry and crop semantics identical to the strict CPU reference.
 - [x] Avoid routine GPU-to-CPU readback for viewer display.
-- [ ] Measure `rgba32Float` first; evaluate `rgba16Float` only with ΔE, gradient,
+- [x] Measure `rgba32Float` first; evaluate `rgba16Float` only with ΔE, gradient,
   deep-shadow, saturated-colour, and highlight evidence.
 - [x] Record upload, encoding, queue, GPU, presentation, and any readback time
   separately from total latency.
@@ -168,22 +169,26 @@ After the compiled-MSL transition, two initial runs recorded 52.5 ms and 52.3 ms
 p95 even though shader execution remained only 1.1–1.4 ms p50; synchronized
 drawable presentation dominates the tail. This is now an explicit 2C.5
 optimization gate, not hidden by the completed 2C.4 architecture proof. See
-[the baseline](baseline.md). Histogram, pass fusion, precision comparison, and
-corpus conformance remain open.
+[the baseline](baseline.md). The compiled path now fuses scaling, exposure,
+tone, working-to-output conversion, clipping, and hardware display encoding in
+one pass. Histogram stays outside Metal because the GPU viewer has no extra CPU
+histogram pass to remove. Precision, adversarial, mandatory-corpus, validation,
+and sustained-trace evidence are recorded in
+[the conformance report](conformance.md). Presentation remains the open gate.
 
 ### 2C.6 Build CPU/GPU conformance and failure coverage
 
-- [ ] Compare every mandatory Phase 2B image through CPU and Metal previews.
-- [ ] Add adversarial gradients, negative/out-of-gamut values, clipped
+- [x] Compare every mandatory Phase 2B image through CPU and Metal previews.
+- [x] Add adversarial gradients, negative/out-of-gamut values, clipped
   highlights, saturated colours, deep shadows, odd dimensions, and borders.
-- [ ] Report mean, median, p95, and maximum ΔE00 plus SSIM and finite-output
+- [x] Report mean, median, p95, and maximum ΔE00 plus SSIM and finite-output
   status.
 - [ ] Verify CPU fallback after Metal initialization, allocation, shader,
   command-buffer, and drawable failures.
-- [ ] Verify backend cache separation and stale-frame suppression.
+- [x] Verify backend cache separation and stale-frame suppression.
 - [ ] Stress resize, rapid slider changes, open/close, display changes, memory
   pressure, and repeated render loops without leaks or deadlocks.
-- [ ] Run a sustained thermal/energy trace rather than a short burst only.
+- [x] Run a sustained thermal/energy trace rather than a short burst only.
 
 ### 2C.7 Make and record the investment decision
 
@@ -201,18 +206,18 @@ corpus conformance remain open.
 - [ ] Performance telemetry unit tests use a deterministic fake clock where
   practical.
 - [x] Generation ordering rejects stale completion.
-- [ ] Queue and memory admission remain bounded under randomized request bursts.
+- [x] Queue and memory admission remain bounded under randomized request bursts.
 - [x] Metal shader known vectors match the CPU reference.
-- [ ] Full CPU/Metal perceptual corpus report.
+- [x] Full CPU/Metal perceptual corpus report.
 - [x] Nil-device and injected Metal failure fallback.
 - [ ] Retina/non-Retina resize and display-change behavior.
-- [ ] No work continues while the on-demand viewer is static or occluded.
+- [x] No work continues while the on-demand viewer is static or occluded.
 - [ ] Repeated open/edit/close and memory-pressure leak soak.
 
 ## Exit criteria
 
 - [ ] Baseline and final p50/p95/p99 reports cover every named workload.
-- [x] Cached late adjustment is ≤ 33 ms p95 end to visible; ≤ 16.7 ms is the
+- [ ] Cached late adjustment is ≤ 33 ms p95 end to visible; ≤ 16.7 ms is the
   stretch target on the M3 reference machine.
 - [ ] Once RAW decode completes, a developed edge-1440 preview is visible in
   ≤ 100 ms p95.

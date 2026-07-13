@@ -64,8 +64,10 @@ Metal does not relabel the CPU artifact as Metal-developed.
   texture allocation, command encoding, repeated drawable acquisition, or GPU
   command execution fails, the controller requests a strict CPU display artifact
   and SwiftUI presents that `CGImage` without requiring Metal. The explicit
-  `BANKSIA_INJECT_METAL_FAILURE=1` test hook makes this path reproducible without
-  changing normal routing.
+  `BANKSIA_INJECT_METAL_FAILURE=<stage>` test hook makes this path reproducible
+  without changing normal routing. Stages are `initialization`, `allocation`,
+  `shader`, `commandBuffer`, `drawable`, and `completion`; the legacy value `1`
+  aliases initialization.
 - `bk_render` and its pointer lifetime remain unchanged for existing callers.
 
 ## Supersession and publication

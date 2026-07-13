@@ -114,3 +114,44 @@ struct RenderGenerationClock: Sendable {
         generation == latest
     }
 }
+
+enum MetalFrameAdmissionDecision: Equatable, Sendable {
+    case admitted
+    case coalesced
+}
+
+/// Pure admission state shared by tests and the viewer lock boundary. A burst
+/// can occupy two drawable slots and retain only its newest rejected generation.
+struct MetalFrameAdmissionState: Sendable {
+    let limit: Int
+    private(set) var inFlight = 0
+    private(set) var newestGeneration: UInt64 = 0
+    private(set) var retryGeneration: UInt64?
+
+    init(limit: Int = 2) {
+        precondition(limit > 0)
+        self.limit = limit
+    }
+
+    mutating func request(generation: UInt64) -> MetalFrameAdmissionDecision {
+        precondition(generation >= newestGeneration)
+        newestGeneration = generation
+        guard inFlight < limit else {
+            retryGeneration = generation
+            return .coalesced
+        }
+        inFlight += 1
+        return .admitted
+    }
+
+    mutating func complete() -> UInt64? {
+        precondition(inFlight > 0)
+        inFlight -= 1
+        defer { retryGeneration = nil }
+        return retryGeneration
+    }
+
+    func shouldPublish(generation: UInt64) -> Bool {
+        generation == newestGeneration
+    }
+}
