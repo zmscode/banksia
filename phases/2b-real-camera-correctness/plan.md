@@ -55,9 +55,9 @@ meet the promotion rule through committed permission-covered DNG derivatives.
 
 The local corpus is recorded in [corpus.md](corpus.md), the machine-readable
 [corpus.tsv](corpus.tsv), and [corpus.sha256](corpus.sha256). `zig build corpus`
-verifies all 27 hashes, checks the 18 supported metadata/geometry records,
-completes full v2 CR2/CR3 renders, checks 9 Apple LinearRaw DNGs fail by their
-expected unsupported name, and ImageIO-decodes every file. The committed
+verifies all 27 hashes, checks the 18 proprietary metadata/geometry records,
+completes full v2 CR2/CR3 renders, renders all 9 Apple LinearRaw DNGs through
+the typed three-channel input, and ImageIO-decodes every file. The committed
 `tests/corpus/phase2b` subset adds eight permission-covered full-resolution DNGs,
 exact metadata and render hashes, four storage shapes, and mandatory CI renders.
 
@@ -139,9 +139,14 @@ not misrepresented as a neutral chart oracle.
 - [x] Record packaging, licensing, binary-size, and deployment implications.
 - [x] Require LibRaw before private alpha for the initial CR2/CR3 corpus.
 - [x] Keep native DNG as the deterministic reference path regardless.
+- [x] Route already-demosaiced Apple LinearRaw through an explicit three-channel
+  engine-v2 input rather than pretending it is a Bayer mosaic.
+- [x] Suppress high-frequency Bayer false colour in engine-v2 while leaving
+  engine-v1 output frozen.
 
 See [decoder-strategy.md](decoder-strategy.md). Banksia links `libraw_r`
-dynamically and stops at the sensor-mosaic boundary.
+dynamically. Bayer cameras stop at the sensor-mosaic boundary; LinearRaw keeps
+its already-demosaiced linear RGB domain.
 
 ### 2B.8 Harden performance and fuzzing
 

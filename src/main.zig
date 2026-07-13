@@ -253,10 +253,17 @@ fn inspect_file(
         }
     }
     if (decoded) |*raw| {
-        try status(io, "  decoded sensor: {d} samples ({d} bytes)\n", .{
-            raw.sensor.bayer.len,
-            raw.sensor.bayer.len * @sizeOf(u16),
-        });
+        if (raw.linear) |linear| {
+            try status(io, "  decoded linear RGB: {d} samples ({d} bytes)\n", .{
+                linear.rgb.len,
+                linear.rgb.len * @sizeOf(u16),
+            });
+        } else {
+            try status(io, "  decoded sensor: {d} samples ({d} bytes)\n", .{
+                raw.sensor.bayer.len,
+                raw.sensor.bayer.len * @sizeOf(u16),
+            });
+        }
         if (render_pixels) {
             var rendered = emu.pipeline.render_decoded(
                 gpa,

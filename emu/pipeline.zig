@@ -153,7 +153,10 @@ pub fn render_decoded(
     options: RenderOptions,
 ) RenderError!Rendered {
     return switch (recipe.engine_version) {
-        1 => render(gpa, &raw.sensor, recipe, options),
+        1 => if (raw.linear == null)
+            render(gpa, &raw.sensor, recipe, options)
+        else
+            error.UnsupportedSensor,
         2 => {
             const dimensions = geometry.Transform.init(raw.metadata).output_dimensions();
             const longest = @max(dimensions.width, dimensions.height);
@@ -223,7 +226,8 @@ pub fn render_linear_memory_bytes_max(raw: *const dng.DecodedRaw, edge_px_max_ou
     const raw_pixels = @as(u64, raw.sensor.width) * raw.sensor.height;
     const work_pixels = @as(u64, work_width) * work_height;
     const output_pixels = @as(u64, width_out) * height_out;
-    const cfa_bytes = raw_pixels * @sizeOf(u16) + work_pixels * @sizeOf(u16);
+    const input_channels: u64 = if (raw.linear == null) 1 else 3;
+    const cfa_bytes = (raw_pixels + work_pixels) * @sizeOf(u16) * input_channels;
     const early_stage_bytes = work_pixels * @sizeOf(f32) * 7;
     const output_stage_bytes = output_pixels * 72;
     return cfa_bytes + early_stage_bytes + output_stage_bytes;
@@ -242,6 +246,16 @@ fn render_decoded_v2(
     const color_transform = color.Transform.init(raw.metadata) catch {
         return error.InvalidColorMetadata;
     };
+    if (raw.linear) |*linear| {
+        return render_linear_source_display(
+            gpa,
+            linear,
+            raw.metadata,
+            recipe,
+            options,
+            color_transform,
+        );
+    }
     return render_internal(
         gpa,
         &raw.sensor,
@@ -261,6 +275,16 @@ fn render_linear_decoded_v2(
     const color_transform = color.Transform.init(raw.metadata) catch {
         return error.InvalidColorMetadata;
     };
+    if (raw.linear) |*linear| {
+        return render_linear_source_working(
+            gpa,
+            linear,
+            raw.metadata,
+            recipe,
+            options,
+            color_transform,
+        );
+    }
     return render_linear_internal(
         gpa,
         &raw.sensor,
@@ -280,17 +304,42 @@ fn preview_raw_make(
     assert(factor % 2 == 0);
     const width = (source.sensor.width + factor - 1) / factor;
     const height = (source.sensor.height + factor - 1) / factor;
-    const bayer = try gpa.alloc(u16, @as(usize, width) * height);
+    const bayer_count = if (source.linear == null) @as(usize, width) * height else 0;
+    const bayer = try gpa.alloc(u16, bayer_count);
     errdefer gpa.free(bayer);
-    preview_bayer_reduce(
-        bayer,
-        width,
-        height,
-        source.sensor.bayer,
-        source.sensor.width,
-        source.sensor.height,
-        factor,
-    );
+    var linear: ?dng.LinearData = null;
+    if (source.linear) |linear_source| {
+        const rgb = try gpa.alloc(u16, @as(usize, width) * height * 3);
+        errdefer gpa.free(rgb);
+        preview_linear_reduce(
+            rgb,
+            width,
+            height,
+            linear_source.rgb,
+            linear_source.width,
+            linear_source.height,
+            factor,
+        );
+        linear = .{
+            .width = width,
+            .height = height,
+            .black_level = linear_source.black_level,
+            .white_level = linear_source.white_level,
+            .baseline_exposure_ev = linear_source.baseline_exposure_ev,
+            .wb_neutral = linear_source.wb_neutral,
+            .rgb = rgb,
+        };
+    } else {
+        preview_bayer_reduce(
+            bayer,
+            width,
+            height,
+            source.sensor.bayer,
+            source.sensor.width,
+            source.sensor.height,
+            factor,
+        );
+    }
 
     var metadata = source.metadata;
     metadata.width = width;
@@ -311,6 +360,7 @@ fn preview_raw_make(
     };
     return .{
         .metadata = metadata,
+        .linear = linear,
         .sensor = .{
             .width = width,
             .height = height,
@@ -323,6 +373,44 @@ fn preview_raw_make(
             .bayer = bayer,
         },
     };
+}
+
+fn preview_linear_reduce(
+    target: []u16,
+    width_out: u32,
+    height_out: u32,
+    source: []const u16,
+    width: u32,
+    height: u32,
+    factor: u32,
+) void {
+    assert(target.len == @as(usize, width_out) * height_out * 3);
+    assert(source.len == @as(usize, width) * height * 3);
+    assert(factor >= 2);
+    var y: u32 = 0;
+    while (y < height_out) : (y += 1) {
+        var x: u32 = 0;
+        while (x < width_out) : (x += 1) {
+            const x_end = @min(width, (x + 1) * factor);
+            const y_end = @min(height, (y + 1) * factor);
+            var sums: [3]u64 = @splat(0);
+            var count: u32 = 0;
+            var source_y = y * factor;
+            while (source_y < y_end) : (source_y += 1) {
+                var source_x = x * factor;
+                while (source_x < x_end) : (source_x += 1) {
+                    const source_index = (@as(usize, source_y) * width + source_x) * 3;
+                    inline for (0..3) |channel| sums[channel] += source[source_index + channel];
+                    count += 1;
+                }
+            }
+            assert(count > 0);
+            const target_index = (@as(usize, y) * width_out + x) * 3;
+            inline for (0..3) |channel| {
+                target[target_index + channel] = @intCast(sums[channel] / count);
+            }
+        }
+    }
 }
 
 fn rect_scale(rect: dng.Rect, factor: u32) dng.Rect {
@@ -395,6 +483,144 @@ fn preview_site_last(parity: u32, limit: u32) u32 {
     return last - 1;
 }
 
+fn render_linear_source_display(
+    gpa: std.mem.Allocator,
+    source: *const dng.LinearData,
+    metadata: dng.Metadata,
+    recipe: Recipe,
+    options: RenderOptions,
+    color_transform: color.Transform,
+) RenderError!Rendered {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var planes = try linear_source_planes(
+        arena,
+        source,
+        recipe,
+        options.cancellation,
+        color_transform,
+        true,
+    );
+    color.working_to_linear_srgb(&planes);
+    const transformed = try planes_transform(arena, &planes, geometry.Transform.init(metadata));
+    const width_out, const height_out = dims_out(
+        transformed.width,
+        transformed.height,
+        options.edge_px_max_out,
+    );
+    const output = if (width_out == transformed.width and height_out == transformed.height)
+        transformed
+    else
+        try planes_downsample(arena, &transformed, width_out, height_out);
+    try cancellation_check(options.cancellation);
+    const rgba = try gpa.alloc(u8, @as(usize, width_out) * height_out * 4);
+    errdefer gpa.free(rgba);
+    kernel_srgb_pack(rgba, output.r, output.g, output.b);
+    return .{ .width = width_out, .height = height_out, .rgba = rgba };
+}
+
+fn render_linear_source_working(
+    gpa: std.mem.Allocator,
+    source: *const dng.LinearData,
+    metadata: dng.Metadata,
+    recipe: Recipe,
+    options: RenderOptions,
+    color_transform: color.Transform,
+) RenderError!LinearRendered {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const planes = try linear_source_planes(
+        arena,
+        source,
+        recipe,
+        options.cancellation,
+        color_transform,
+        false,
+    );
+    const transformed = try planes_transform(arena, &planes, geometry.Transform.init(metadata));
+    const width_out, const height_out = dims_out(
+        transformed.width,
+        transformed.height,
+        options.edge_px_max_out,
+    );
+    const output = if (width_out == transformed.width and height_out == transformed.height)
+        transformed
+    else
+        try planes_downsample(arena, &transformed, width_out, height_out);
+    try cancellation_check(options.cancellation);
+    const rgba = try gpa.alloc(f32, @as(usize, width_out) * height_out * 4);
+    errdefer gpa.free(rgba);
+    kernel_linear_pack(rgba, output.r, output.g, output.b);
+    return .{ .width = width_out, .height = height_out, .rgba = rgba };
+}
+
+fn linear_source_planes(
+    arena: std.mem.Allocator,
+    source: *const dng.LinearData,
+    recipe: Recipe,
+    cancellation: Cancellation,
+    color_transform: color.Transform,
+    apply_late: bool,
+) RenderError!image.Planes {
+    assert(source.rgb.len == @as(usize, source.width) * source.height * 3);
+    assert(source.white_level > source.black_level);
+    var ops: std.MultiArrayList(Op) = .empty;
+    defer ops.deinit(arena);
+    try ops.ensureTotalCapacity(arena, recipe.ops.len);
+    for (recipe.ops) |op| ops.appendAssumeCapacity(op);
+    try stack_validate(ops.items(.tags));
+
+    var planes = try image.Planes.init(arena, source.width, source.height);
+    const scale = std.math.exp2(source.baseline_exposure_ev) /
+        (source.white_level - source.black_level);
+    for (planes.r, planes.g, planes.b, 0..) |*red, *green, *blue, index| {
+        const sample = index * 3;
+        red.* = @max(0, (@as(f32, @floatFromInt(source.rgb[sample])) -
+            source.black_level) * scale);
+        green.* = @max(0, (@as(f32, @floatFromInt(source.rgb[sample + 1])) -
+            source.black_level) * scale);
+        blue.* = @max(0, (@as(f32, @floatFromInt(source.rgb[sample + 2])) -
+            source.black_level) * scale);
+    }
+
+    var transformed = false;
+    for (0..ops.len) |index| {
+        try cancellation_check(cancellation);
+        const op = ops.get(index);
+        switch (op) {
+            .black_point, .srgb_encode => {},
+            .white_balance => {
+                if (!op.white_balance.as_shot or color_transform.apply_as_shot_white_balance) {
+                    const gains = wb_gains(op.white_balance, source.wb_neutral);
+                    kernel_gain(planes.r, gains[0]);
+                    kernel_gain(planes.g, gains[1]);
+                    kernel_gain(planes.b, gains[2]);
+                }
+            },
+            .demosaic => {
+                assert(!transformed);
+                color_transform.camera_to_working(&planes);
+                transformed = true;
+            },
+            .exposure => if (apply_late) {
+                const gain = std.math.exp2(op.exposure.ev);
+                kernel_gain(planes.r, gain);
+                kernel_gain(planes.g, gain);
+                kernel_gain(planes.b, gain);
+            },
+            .tone_curve => if (apply_late and op.tone_curve.contrast != 0) {
+                kernel_tone_curve(planes.r, op.tone_curve.contrast);
+                kernel_tone_curve(planes.g, op.tone_curve.contrast);
+                kernel_tone_curve(planes.b, op.tone_curve.contrast);
+            },
+        }
+    }
+    assert(transformed);
+    return planes;
+}
+
 fn render_internal(
     gpa: std.mem.Allocator,
     sensor: *const dng.SensorData,
@@ -427,6 +653,7 @@ fn render_internal(
 
     for (0..ops.len) |i| {
         try op_apply(
+            arena,
             ops.get(i),
             recipe.engine_version,
             sensor,
@@ -494,6 +721,7 @@ fn render_linear_internal(
         switch (op) {
             .exposure, .tone_curve, .srgb_encode => {},
             else => try op_apply(
+                arena,
                 op,
                 recipe.engine_version,
                 sensor,
@@ -602,6 +830,7 @@ fn planes_downsample(
 }
 
 fn op_apply(
+    arena: std.mem.Allocator,
     op: Op,
     engine_version: u32,
     sensor: *const dng.SensorData,
@@ -643,6 +872,7 @@ fn op_apply(
             try demosaic_dispatch(sensor.cfa, mosaic, planes);
             if (color_transform) |value| {
                 if (engine_version >= 2) {
+                    try kernel_chroma_lowpass(arena, planes);
                     if (applied_wb_gains.*) |gains| {
                         kernel_highlight_recovery_balanced(planes, gains);
                     } else {
@@ -809,6 +1039,95 @@ fn kernel_gain(plane: []f32, gain: f32) void {
         plane[i..][0..vector_len].* = v * gain_v;
     }
     while (i < plane.len) : (i += 1) plane[i] *= gain;
+}
+
+/// Bayer reconstruction carries luminance detail at full resolution, but its
+/// red-minus-green and blue-minus-green estimates are only half-resolution.
+/// A broad, selective chroma low-pass suppresses the alternating false colour
+/// produced by neutral fabric near the sensor Nyquist limit while retaining the
+/// sharper green/luminance plane. Stable chroma is left untouched; only a large
+/// deviation from the local chroma mean is blended away. Engine v1 bypasses it.
+fn kernel_chroma_lowpass(
+    arena: std.mem.Allocator,
+    planes: *image.Planes,
+) RenderError!void {
+    assert(planes.r.len == planes.g.len);
+    assert(planes.r.len == planes.b.len);
+    const current = try arena.alloc(f32, planes.r.len);
+    const horizontal = try arena.alloc(f32, planes.r.len);
+    const filtered = try arena.alloc(f32, planes.r.len);
+    const radius: i64 = 12;
+    const diameter: f32 = @floatFromInt(radius * 2 + 1);
+    for ([_][]f32{ planes.r, planes.b }) |channel| {
+        for (current, channel, planes.g) |*chroma, value, green| {
+            chroma.* = value - green;
+        }
+        var y: u32 = 0;
+        while (y < planes.height) : (y += 1) {
+            const row = @as(usize, y) * planes.width;
+            var sum: f32 = 0;
+            var offset: i64 = -radius;
+            while (offset <= radius) : (offset += 1) {
+                const source_x: u32 = @intCast(std.math.clamp(
+                    offset,
+                    0,
+                    @as(i64, planes.width) - 1,
+                ));
+                sum += current[row + source_x];
+            }
+            var x: u32 = 0;
+            while (x < planes.width) : (x += 1) {
+                horizontal[row + x] = sum / diameter;
+                const left_x: u32 = @intCast(std.math.clamp(
+                    @as(i64, x) - radius,
+                    0,
+                    @as(i64, planes.width) - 1,
+                ));
+                const right_x: u32 = @intCast(std.math.clamp(
+                    @as(i64, x) + radius + 1,
+                    0,
+                    @as(i64, planes.width) - 1,
+                ));
+                sum += current[row + right_x] - current[row + left_x];
+            }
+        }
+        var x: u32 = 0;
+        while (x < planes.width) : (x += 1) {
+            var sum: f32 = 0;
+            var offset: i64 = -radius;
+            while (offset <= radius) : (offset += 1) {
+                const source_y: u32 = @intCast(std.math.clamp(
+                    offset,
+                    0,
+                    @as(i64, planes.height) - 1,
+                ));
+                sum += horizontal[@as(usize, source_y) * planes.width + x];
+            }
+            y = 0;
+            while (y < planes.height) : (y += 1) {
+                const center = @as(usize, y) * planes.width + x;
+                filtered[center] = sum / diameter;
+                const top_y: u32 = @intCast(std.math.clamp(
+                    @as(i64, y) - radius,
+                    0,
+                    @as(i64, planes.height) - 1,
+                ));
+                const bottom_y: u32 = @intCast(std.math.clamp(
+                    @as(i64, y) + radius + 1,
+                    0,
+                    @as(i64, planes.height) - 1,
+                ));
+                sum += horizontal[@as(usize, bottom_y) * planes.width + x] -
+                    horizontal[@as(usize, top_y) * planes.width + x];
+            }
+        }
+        for (channel, planes.g, current, filtered) |*value, green, original, local| {
+            const residual = @abs(original - local);
+            const blend = std.math.clamp((residual - 0.005) * 20, 0, 1);
+            const chroma = original + (local - original) * blend;
+            value.* = green + chroma;
+        }
+    }
 }
 
 /// White balance cannot recover a channel that already hit sensor white. Near

@@ -117,12 +117,38 @@ pub const SensorData = struct {
     }
 };
 
+/// Already-demosaiced, interleaved camera RGB from a DNG LinearRaw IFD.
+/// Values retain the container's linear sample encoding and enter engine-v2
+/// after normalization rather than being forced through a Bayer abstraction.
+pub const LinearData = struct {
+    width: u32,
+    height: u32,
+    black_level: f32,
+    white_level: f32,
+    baseline_exposure_ev: f32 = 0,
+    wb_neutral: [3]f32,
+    rgb: []u16,
+
+    pub fn deinit(self: *LinearData, gpa: std.mem.Allocator) void {
+        assert(self.rgb.len == @as(usize, self.width) * self.height * 3);
+        gpa.free(self.rgb);
+        self.* = undefined;
+    }
+};
+
 pub const DecodedRaw = struct {
     sensor: SensorData,
+    linear: ?LinearData = null,
     metadata: Metadata,
 
     pub fn deinit(self: *DecodedRaw, gpa: std.mem.Allocator) void {
-        self.sensor.deinit(gpa);
+        if (self.linear) |*linear| {
+            assert(self.sensor.bayer.len == 0);
+            gpa.free(self.sensor.bayer);
+            linear.deinit(gpa);
+        } else {
+            self.sensor.deinit(gpa);
+        }
         self.* = undefined;
     }
 };

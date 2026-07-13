@@ -144,6 +144,12 @@ the Metal drawable is upright.
 
 ### 2C.5 Prove a GPU-resident late-develop path
 
+Apple LinearRaw DNG now enters engine-v2 as explicit three-channel linear RGB,
+retaining its distinct domain through preview reduction before the shared
+linear-Rec.2020 Metal boundary. Bayer CR2/CR3 remains on the sensor-CFA path;
+engine-v1 output is unchanged. A selective camera-domain chroma reconstruction
+filter suppresses high-frequency false colour before the working-space matrix.
+
 - [x] Upload or share one linear working preview and retain it across late edits.
 - [ ] Fuse exposure, camera/working matrix where applicable, tone, output colour,
   clipping policy, and display encoding into the fewest measured passes.

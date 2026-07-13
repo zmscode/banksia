@@ -11,20 +11,30 @@ pub const Error = dng.Error || libraw.Error;
 
 pub fn decode_metadata(bytes: []const u8) Error!dng.Metadata {
     return dng.decode_metadata(bytes) catch |err| switch (err) {
-        error.UnsupportedCr2, error.UnsupportedCr3 => libraw.decode_metadata(bytes),
+        error.UnsupportedCr2,
+        error.UnsupportedCr3,
+        error.UnsupportedLinearRaw,
+        => libraw.decode_metadata(bytes),
         else => return err,
     };
 }
 
 pub fn decode_raw(gpa: std.mem.Allocator, bytes: []const u8) Error!dng.DecodedRaw {
     return dng.decode_raw(gpa, bytes) catch |err| switch (err) {
-        error.UnsupportedCr2, error.UnsupportedCr3 => libraw.decode_raw(gpa, bytes),
+        error.UnsupportedCr2,
+        error.UnsupportedCr3,
+        error.UnsupportedLinearRaw,
+        => libraw.decode_raw(gpa, bytes),
         else => return err,
     };
 }
 
 pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) Error!dng.SensorData {
-    const decoded = try decode_raw(gpa, bytes);
+    var decoded = try decode_raw(gpa, bytes);
+    if (decoded.linear != null) {
+        decoded.deinit(gpa);
+        return error.UnsupportedLinearRaw;
+    }
     return decoded.sensor;
 }
 

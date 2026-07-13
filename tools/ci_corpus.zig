@@ -24,7 +24,7 @@ const cases = [_]Case{
     .{
         .path = "tests/corpus/phase2b/canon-1dx2-backlight-action.dng",
         .source_sha256 = "05e53b59e51049747675877c979e4493be3cd6ce3d13d5b057069105a4434fe1",
-        .render_sha256 = "16a491ac342912c821230ac090f2837464db81911ec93fc17d17b1ee83e4754c",
+        .render_sha256 = "e4c971a70df89b693cc34a83c7ac9cd16f0f1a883fd07375d6bd8b19b7b49065",
         .width = 5496,
         .height = 3670,
         .output_width = 3648,
@@ -38,7 +38,7 @@ const cases = [_]Case{
     .{
         .path = "tests/corpus/phase2b/canon-1dx2-daylight-detail.dng",
         .source_sha256 = "3673bf27cf382b3669fbeca33ab93a8cd6b80fd8c36e77ca3a5a6dfa79c5eb16",
-        .render_sha256 = "198b98d38fe61841d744f9b990ced581c6292f166e192d29a47f44bf49ec1841",
+        .render_sha256 = "b86ffdc49b25faf75a81e5cda325660458393b44116eed115d54a40a345769ee",
         .width = 5496,
         .height = 3670,
         .output_width = 5472,
@@ -52,7 +52,7 @@ const cases = [_]Case{
     .{
         .path = "tests/corpus/phase2b/canon-1dx2-high-contrast.dng",
         .source_sha256 = "d1f5d56c1279b319fbca4eb11facc25f5885c2d5580d20e879e3846505a0d7fd",
-        .render_sha256 = "24e5fb0c72469f73547570b59580e85fb7e75fdccfbe4a78f60f00ca438be6ae",
+        .render_sha256 = "bc91771b01f532beff73321f36ff5995a57f118ad0bbd9d15189e5fb7bb74b4d",
         .width = 5496,
         .height = 3670,
         .output_width = 5472,
@@ -66,7 +66,7 @@ const cases = [_]Case{
     .{
         .path = "tests/corpus/phase2b/canon-1dx2-high-iso12800.dng",
         .source_sha256 = "377aaf48024398323fee31686b133378e00ee3b8b50b22e7707729cf73439b5f",
-        .render_sha256 = "311477e3fbe10723644959f963c9cf7f02be2d2ae5c2d5c55879b68f13cf0b2d",
+        .render_sha256 = "a825a3d7f13322e916b47cacc83a274f33423405f6bc33a9cd4df778233919da",
         .width = 5496,
         .height = 3670,
         .output_width = 5472,
@@ -80,7 +80,7 @@ const cases = [_]Case{
     .{
         .path = "tests/corpus/phase2b/canon-1dx2-skin-iso1000.dng",
         .source_sha256 = "a205bb8496d6a527b37d989a72f9f5831106f1310f1e6f3cc869536768137e39",
-        .render_sha256 = "4a1d4e1b765bb2bcc09aaecbd2baf2414cdc0646eb93ba8a70fc9d4dd04033c2",
+        .render_sha256 = "ceaeb1be41be49e61bd55d5adff4f834f1dcee3839da544f493dc07b883f14c4",
         .width = 5496,
         .height = 3670,
         .output_width = 3648,
@@ -94,7 +94,7 @@ const cases = [_]Case{
     .{
         .path = "tests/corpus/phase2b/canon-1dx2-warm-backlight.dng",
         .source_sha256 = "ea90d5c5b7e668b1b0e4abc42ca2279d5374c073bf9f0d52d80ba7a803fa47c2",
-        .render_sha256 = "17ccb8f575beaef3d62e2df6dea321348e16982734c3515352ee66167e629a7a",
+        .render_sha256 = "58a72213b271e3c14d23eb89fb9a2caf6248ef989ee2b631e1f8771363f87ced",
         .width = 5496,
         .height = 3670,
         .output_width = 3648,
@@ -108,7 +108,7 @@ const cases = [_]Case{
     .{
         .path = "tests/corpus/phase2b/canon-r3-black-fabric.dng",
         .source_sha256 = "3ffb3f58b61a47d54567c85917428032a197a7de3dcdb5c6020c8b3803998bc9",
-        .render_sha256 = "0b17eabaf1a568c4351da326d16b21a98fbe5f9dca34dd7f9f771ed3972a676b",
+        .render_sha256 = "a4342306286cf7ca68b3aa8347b83987d131a20595dc8b12e4ad2e5548cbebff",
         .width = 6032,
         .height = 4032,
         .output_width = 4000,
@@ -122,7 +122,7 @@ const cases = [_]Case{
     .{
         .path = "tests/corpus/phase2b/canon-r3-emerald-fabric.dng",
         .source_sha256 = "c3706b854bc04d5d1fa593af018ac16b1aad8c372a69cf9df378efbcaa895bd3",
-        .render_sha256 = "390620a44d32203662d4cf496fb48335906f0353cadfcd9b824d73bd472ef6c7",
+        .render_sha256 = "a40773e62d28015511908ea028e9051a52576d2494b3152c28df502aa117670b",
         .width = 6032,
         .height = 4032,
         .output_width = 4000,

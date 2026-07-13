@@ -71,18 +71,7 @@ done < "$inventory"
 
 count=0
 find "$asset_root/DNG" -type f -iname '*.dng' -print0 | while IFS= read -r -d '' path; do
-    if output=$(zig-out/bin/banksia inspect "$path" 2>&1); then
-        echo "corpus: expected LinearRaw rejection for $path" >&2
-        exit 1
-    fi
-    case "$output" in
-        *UnsupportedLinearRaw*) ;;
-        *)
-            printf '%s\n' "$output" >&2
-            echo "corpus: wrong rejection for $path" >&2
-            exit 1
-            ;;
-    esac
+    zig-out/bin/banksia inspect "$path" --render >/dev/null
     sips -s format png --resampleHeightWidthMax 1024 "$path" --out "$tmp" >/dev/null 2>&1
     count=$((count + 1))
     printf '%s\n' "$count" > "$tmp/linear-count"
@@ -95,7 +84,7 @@ if [ "$actual_linear" -ne "$expected_linear" ]; then
 fi
 
 actual=$((actual_supported + actual_linear))
-printf 'corpus: %d hashes verified; %d full v2 renders; ' "$actual" "$actual_supported"
-printf '%d metadata rows checked; %d LinearRaw files rejected by name; ' \
+printf 'corpus: %d hashes verified; %d full v2 renders; ' "$actual" "$actual"
+printf '%d metadata rows checked; %d LinearRaw files rendered; ' \
     "$actual_supported" "$actual_linear"
 printf '%d ImageIO previews decoded\n' "$actual"

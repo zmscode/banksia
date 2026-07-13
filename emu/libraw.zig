@@ -42,6 +42,9 @@ pub fn decode_raw(gpa: std.mem.Allocator, bytes: []const u8) Error!dng.DecodedRa
     if (c.libraw_unpack(context) != 0) return error.LibRawUnpackFailed;
 
     const metadata = try metadata_from_context(context);
+    if (context.idata.filters == 0) {
+        return decode_linear_raw(gpa, context, metadata);
+    }
     const sizes = context.sizes;
     const raw = context.rawdata.raw_image orelse return error.UnsupportedRawLayout;
     const pitch_samples = sizes.raw_pitch / @sizeOf(u16);
@@ -84,6 +87,78 @@ pub fn decode_raw(gpa: std.mem.Allocator, bytes: []const u8) Error!dng.DecodedRa
     };
 }
 
+fn decode_linear_raw(
+    gpa: std.mem.Allocator,
+    context: *c.libraw_data_t,
+    metadata: dng.Metadata,
+) Error!dng.DecodedRaw {
+    const sizes = context.sizes;
+    const source3 = context.rawdata.color3_image;
+    const source4 = context.rawdata.color4_image;
+    if (source3 == null and source4 == null) return error.UnsupportedRawLayout;
+    const pixel_size: u32 = if (source3 != null)
+        3 * @sizeOf(u16)
+    else
+        4 * @sizeOf(u16);
+    if (sizes.raw_pitch % pixel_size != 0) return error.UnsupportedRawLayout;
+    const pitch_pixels = sizes.raw_pitch / pixel_size;
+    if (pitch_pixels < sizes.raw_width) return error.UnsupportedRawLayout;
+    if (@as(u32, sizes.left_margin) + metadata.width > sizes.raw_width) {
+        return error.InvalidMetadata;
+    }
+    if (@as(u32, sizes.top_margin) + metadata.height > sizes.raw_height) {
+        return error.InvalidMetadata;
+    }
+
+    const sample_count = @as(usize, metadata.width) * metadata.height * 3;
+    const rgb = try gpa.alloc(u16, sample_count);
+    errdefer gpa.free(rgb);
+    var y: u32 = 0;
+    while (y < metadata.height) : (y += 1) {
+        const source_row = @as(usize, sizes.top_margin + y) * pitch_pixels;
+        const source_start = source_row + sizes.left_margin;
+        var x: u32 = 0;
+        while (x < metadata.width) : (x += 1) {
+            const target = (@as(usize, y) * metadata.width + x) * 3;
+            if (source3) |pixels| {
+                const source_pixel = pixels[source_start + x];
+                rgb[target] = source_pixel[0];
+                rgb[target + 1] = source_pixel[1];
+                rgb[target + 2] = source_pixel[2];
+            } else if (source4) |pixels| {
+                const source_pixel = pixels[source_start + x];
+                rgb[target] = source_pixel[0];
+                rgb[target + 1] = source_pixel[1];
+                rgb[target + 2] = source_pixel[2];
+            } else unreachable;
+        }
+    }
+
+    const empty_bayer = try gpa.alloc(u16, 0);
+    errdefer gpa.free(empty_bayer);
+    return .{
+        .metadata = metadata,
+        .sensor = .{
+            .width = metadata.width,
+            .height = metadata.height,
+            .cfa = metadata.cfa,
+            .black_level = metadata.black_level,
+            .white_level = metadata.white_level,
+            .wb_neutral = metadata.wb_neutral,
+            .bayer = empty_bayer,
+        },
+        .linear = .{
+            .width = metadata.width,
+            .height = metadata.height,
+            .black_level = metadata.black_level,
+            .white_level = metadata.white_level,
+            .baseline_exposure_ev = context.color.dng_levels.baseline_exposure,
+            .wb_neutral = metadata.wb_neutral,
+            .rgb = rgb,
+        },
+    };
+}
+
 fn context_open(bytes: []const u8) Error!*c.libraw_data_t {
     const context = c.libraw_init(0) orelse return error.LibRawInitFailed;
     errdefer c.libraw_close(context);
@@ -105,7 +180,11 @@ fn metadata_from_context(context: *c.libraw_data_t) Error!dng.Metadata {
         return error.UnsupportedDimensions;
     }
 
-    const black_sites = try black_levels_read(context);
+    const is_linear = context.idata.filters == 0;
+    const black_sites = if (is_linear)
+        @as([4]f32, @splat(@floatFromInt(context.color.black)))
+    else
+        try black_levels_read(context);
     const white: f32 = @floatFromInt(context.color.maximum);
     var black = black_sites[0];
     for (black_sites[1..]) |value| black = @min(black, value);
@@ -118,11 +197,14 @@ fn metadata_from_context(context: *c.libraw_data_t) Error!dng.Metadata {
         .width = width,
         .height = height,
         .compression = .proprietary,
-        .cfa = try cfa_read(context),
+        .cfa = if (is_linear)
+            .{ .red, .green, .green, .blue }
+        else
+            try cfa_read(context),
         .black_level = black,
         .white_level = white,
-        .black_level_site = black_sites,
-        .white_level_site = @splat(white),
+        .black_level_site = if (is_linear) null else black_sites,
+        .white_level_site = if (is_linear) null else @splat(white),
         .wb_neutral = neutral_read(context),
         .orientation = orientation_from_flip(sizes.flip),
         .active_area = .{ .x = 0, .y = 0, .width = width, .height = height },
@@ -135,7 +217,10 @@ fn metadata_from_context(context: *c.libraw_data_t) Error!dng.Metadata {
             @intCast(context.other.timestamp)
         else
             null,
-        .camera_to_xyz = try camera_to_xyz_read(context),
+        .camera_to_xyz = if (is_linear)
+            try camera_to_xyz_linear_read(context)
+        else
+            try camera_to_xyz_read(context),
     };
 }
 
@@ -164,6 +249,32 @@ fn default_crop_read(context: *const c.libraw_data_t) Error!dng.Rect {
 
 fn camera_to_xyz_read(context: *const c.libraw_data_t) Error!?dng.Matrix3x3 {
     return camera_to_xyz_from_libraw(context.color.cam_xyz);
+}
+
+fn camera_to_xyz_linear_read(context: *const c.libraw_data_t) Error!?dng.Matrix3x3 {
+    if (try camera_to_xyz_read(context)) |matrix| return matrix;
+    return camera_to_xyz_from_rgb_cam(context.color.rgb_cam);
+}
+
+fn camera_to_xyz_from_rgb_cam(rgb_cam: anytype) Error!?dng.Matrix3x3 {
+    var camera_to_srgb: dng.Matrix3x3 = undefined;
+    var nonzero = false;
+    for (0..3) |srgb| {
+        for (0..3) |camera| {
+            const value = rgb_cam[srgb][camera];
+            if (!std.math.isFinite(value)) return error.InvalidMetadata;
+            nonzero = nonzero or value != 0;
+            camera_to_srgb[srgb * 3 + camera] = value;
+        }
+    }
+    if (!nonzero) return null;
+    const linear_srgb_to_xyz_d65 = color_math.Mat3.init(.{
+        0.4124564, 0.3575761, 0.1804375,
+        0.2126729, 0.7151522, 0.0721750,
+        0.0193339, 0.1191920, 0.9503041,
+    });
+    const result = linear_srgb_to_xyz_d65.multiply(color_math.Mat3.init(camera_to_srgb));
+    return result.values;
 }
 
 fn camera_to_xyz_from_libraw(cam_xyz: anytype) Error!?dng.Matrix3x3 {
