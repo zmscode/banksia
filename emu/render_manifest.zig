@@ -11,8 +11,10 @@ const dng = @import("dng.zig");
 
 pub const recipe_schema_id_current = "recipe.banksia.global.v2";
 pub const graph_id_legacy_v2 = "graph.banksia.matrix.v2";
+pub const graph_id_reconstruction_v3 = "graph.banksia.reconstruction.v3";
 pub const graph_id_calibrated_v1 = "graph.banksia.calibrated.v1";
 pub const renderer_id_strict_cpu_v2 = "banksia.cpu.strict-f32.v2";
+pub const renderer_id_strict_cpu_v3 = "banksia.cpu.strict-f32.v3";
 pub const renderer_id_metal_late_v1 = "banksia.metal.late-develop-f32.v1";
 pub const demosaic_id_bilinear_v1 = "banksia.demosaic.bilinear.v1";
 pub const demosaic_id_bilinear_chroma_safe_v2 =
@@ -24,6 +26,7 @@ const iso_dependency_count_max: u8 = 20;
 comptime {
     assert(iso_dependency_count_max >= 2 * 10);
     assert(calibrated_stages.len > legacy_stages.len);
+    assert(reconstruction_stages.len > legacy_stages.len);
 }
 
 pub const Domain = enum {
@@ -76,6 +79,73 @@ pub const legacy_stages = [_]Stage{
         .input = .sensor_cfa,
         .output = .camera_rgb,
         .neutral = .always_on_technical,
+        .status = .active,
+    },
+    .{
+        .stage_id = "camera-matrix",
+        .implementation_id = "banksia.color.dng-matrix.v2",
+        .input = .camera_rgb,
+        .output = .profiled_working_rgb,
+        .neutral = .always_on_technical,
+        .status = .active,
+    },
+    .{
+        .stage_id = "global-develop",
+        .implementation_id = "banksia.develop.global.v2",
+        .input = .profiled_working_rgb,
+        .output = .developed_linear_rgb,
+        .neutral = .identity,
+        .status = .active,
+    },
+    .{
+        .stage_id = "display-output",
+        .implementation_id = "banksia.output.srgb.v2",
+        .input = .developed_linear_rgb,
+        .output = .display_output_rgb,
+        .neutral = .always_on_technical,
+        .status = .active,
+    },
+};
+
+pub const reconstruction_stages = [_]Stage{
+    .{
+        .stage_id = "normalize",
+        .implementation_id = "banksia.normalize.calibrated.v1",
+        .input = .sensor_cfa,
+        .output = .sensor_cfa,
+        .neutral = .calibration_default,
+        .status = .active,
+    },
+    .{
+        .stage_id = "sensor-cleanup",
+        .implementation_id = "banksia.sensor-cleanup.reference.v1",
+        .input = .sensor_cfa,
+        .output = .sensor_cfa,
+        .neutral = .identity,
+        .status = .active,
+    },
+    .{
+        .stage_id = "demosaic",
+        .implementation_id = demosaic_id_rcd_reference_v1,
+        .input = .sensor_cfa,
+        .output = .camera_rgb,
+        .neutral = .always_on_technical,
+        .status = .active,
+    },
+    .{
+        .stage_id = "anti-color-alias",
+        .implementation_id = "banksia.chroma.camera-neutral-texture.v1",
+        .input = .camera_rgb,
+        .output = .camera_rgb,
+        .neutral = .calibration_default,
+        .status = .active,
+    },
+    .{
+        .stage_id = "highlight-reconstruction",
+        .implementation_id = "banksia.highlight.channel-recovery.v1",
+        .input = .camera_rgb,
+        .output = .camera_rgb,
+        .neutral = .identity,
         .status = .active,
     },
     .{
@@ -199,6 +269,12 @@ pub const graph_legacy_v2 = Graph{
     .graph_id = graph_id_legacy_v2,
     .recipe_schema_id = recipe_schema_id_current,
     .stages = &legacy_stages,
+};
+
+pub const graph_reconstruction_v3 = Graph{
+    .graph_id = graph_id_reconstruction_v3,
+    .recipe_schema_id = recipe_schema_id_current,
+    .stages = &reconstruction_stages,
 };
 
 pub const graph_calibrated_v1 = Graph{

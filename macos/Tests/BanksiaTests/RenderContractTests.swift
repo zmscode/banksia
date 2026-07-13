@@ -158,8 +158,8 @@ final class RenderContractTests: XCTestCase {
             precision: .float32
         )
 
-        XCTAssertNotEqual(metal, .strictCPUV2)
-        XCTAssertNotEqual(metal.implementationID, RendererManifest.strictCPUV2.implementationID)
+        XCTAssertNotEqual(metal, .strictCPUV3)
+        XCTAssertNotEqual(metal.implementationID, RendererManifest.strictCPUV3.implementationID)
     }
 
     func testLinearWorkingOutputHasItsOwnExecutionContract() {
@@ -173,7 +173,7 @@ final class RenderContractTests: XCTestCase {
         )
         XCTAssertEqual(
             RenderExecutionContract.strictCPULinearWorking.renderer,
-            .strictCPUV2
+            .strictCPUV3
         )
     }
 

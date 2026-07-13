@@ -83,7 +83,7 @@ final class DevelopModel {
         let gainR = format(exp2(temperature))
         let gainG = format(exp2(-tint))
         let gainB = format(exp2(-temperature))
-        return "{\"engine_version\":2,\"ops\":["
+        return "{\"engine_version\":3,\"ops\":["
             + "{\"black_point\":{}},"
             + "{\"white_balance\":{\"as_shot\":true,\"gain_r\":1,\"gain_g\":1,\"gain_b\":1}},"
             + "{\"white_balance\":{\"as_shot\":false"

@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const color = @import("color.zig");
 const dng = @import("dng.zig");
 const geometry = @import("geometry.zig");
+const icc_profile = @import("icc_profile.zig");
 const image = @import("image.zig");
 
 /// Per-element asserts inside pixel loops run only when this is set: slow
@@ -28,7 +29,10 @@ const image = @import("image.zig");
 const verify = builtin.mode == .Debug;
 
 pub const engine_version_current: u32 = 1;
-pub const engine_version_latest: u32 = 2;
+pub const engine_version_latest: u32 = 3;
+/// Recovered Capture One 16.7.3 clipping-recovery safety point, expressed as a
+/// fraction of the per-channel sensor clip after CFA-site normalization.
+pub const highlight_recovery_start_bootstrap: f32 = 0.9659363;
 
 /// An edit stack longer than this is not a recipe, it is a bug.
 pub const ops_max: u32 = 64;
@@ -96,6 +100,38 @@ pub const RenderOptions = struct {
     /// Benchmark-only measurement of the final planar-to-RGBA8 packing pass.
     /// Disabled for normal renders so the stable renderer pays no timing cost.
     measure_output_packing: bool = false,
+    reconstruction: ReconstructionDefaults = .legacy,
+    camera_profile: CameraProfile = .technical_matrix,
+};
+
+/// The nonlinear profile replaces, rather than mutates, the independently
+/// selectable DNG/LibRaw technical matrix conversion.
+pub const CameraProfile = union(enum) {
+    technical_matrix,
+    nonlinear: icc_profile.Profile,
+};
+
+pub const ReconstructionDefaults = struct {
+    enabled: bool = false,
+    adaptive_green_enabled: bool = false,
+    hot_pixel_cleanup_amount: f32 = 0,
+    anti_color_aliasing_strength: f32 = 1,
+    highlight_recovery_start: f32 = 0.8,
+
+    pub const legacy = ReconstructionDefaults{};
+
+    pub fn assertValid(defaults: ReconstructionDefaults) void {
+        assert(std.math.isFinite(defaults.hot_pixel_cleanup_amount));
+        assert(defaults.hot_pixel_cleanup_amount >= 0);
+        assert(defaults.hot_pixel_cleanup_amount <= 100);
+        assert(std.math.isFinite(defaults.anti_color_aliasing_strength));
+        assert(defaults.anti_color_aliasing_strength >= 0);
+        assert(defaults.anti_color_aliasing_strength <= 1);
+        assert(std.math.isFinite(defaults.highlight_recovery_start));
+        assert(defaults.highlight_recovery_start >= 0);
+        assert(defaults.highlight_recovery_start < 1);
+        if (!defaults.enabled) assert(!defaults.adaptive_green_enabled);
+    }
 };
 
 pub const Rendered = struct {
@@ -161,7 +197,7 @@ pub fn render_decoded(
             render(gpa, &raw.sensor, recipe, options)
         else
             error.UnsupportedSensor,
-        2 => {
+        2, 3 => {
             const dimensions = geometry.Transform.init(raw.metadata).output_dimensions();
             const longest = @max(dimensions.width, dimensions.height);
             const ratio = if (options.edge_px_max_out == 0)
@@ -188,9 +224,17 @@ pub fn render_linear_decoded(
     recipe: Recipe,
     options: RenderOptions,
 ) RenderError!LinearRendered {
-    if (recipe.engine_version != 2) return error.UnsupportedEngineVersion;
+    if (recipe.engine_version != 2 and recipe.engine_version != 3) {
+        return error.UnsupportedEngineVersion;
+    }
+    options.reconstruction.assertValid();
+    if (recipe.engine_version == 2) assert(!options.reconstruction.enabled);
     try cancellation_check(options.cancellation);
-    const memory_bytes_max = render_linear_memory_bytes_max(raw, options.edge_px_max_out);
+    const memory_bytes_max = render_linear_memory_bytes_max_internal(
+        raw,
+        options.edge_px_max_out,
+        options.reconstruction.enabled,
+    );
     if (options.memory_budget_bytes > 0 and
         memory_bytes_max > options.memory_budget_bytes)
     {
@@ -209,6 +253,14 @@ pub fn render_linear_decoded(
 }
 
 pub fn render_linear_memory_bytes_max(raw: *const dng.DecodedRaw, edge_px_max_out: u32) u64 {
+    return render_linear_memory_bytes_max_internal(raw, edge_px_max_out, false);
+}
+
+fn render_linear_memory_bytes_max_internal(
+    raw: *const dng.DecodedRaw,
+    edge_px_max_out: u32,
+    calibrated_reconstruction: bool,
+) u64 {
     const dimensions = geometry.Transform.init(raw.metadata).output_dimensions();
     const longest = @max(dimensions.width, dimensions.height);
     const factor = @max(1, preview_factor(longest, edge_px_max_out));
@@ -227,7 +279,12 @@ pub fn render_linear_memory_bytes_max(raw: *const dng.DecodedRaw, edge_px_max_ou
     const output_pixels = @as(u64, width_out) * height_out;
     const input_channels: u64 = if (raw.linear == null) 1 else 3;
     const cfa_bytes = (raw_pixels + work_pixels) * @sizeOf(u16) * input_channels;
-    const early_stage_bytes = work_pixels * @sizeOf(f32) * 7;
+    // Legacy peak: mosaic + RGB planes + three chroma-filter scratch planes.
+    // Calibrated v3's larger peak is mosaic + RGB planes + four RCD scratch
+    // planes. Cleanup, RCD, and chroma scratch are scoped to their kernels, so
+    // admission models concurrent memory rather than summing old lifetimes.
+    const early_channels: u64 = if (calibrated_reconstruction) 8 else 7;
+    const early_stage_bytes = work_pixels * @sizeOf(f32) * early_channels;
     const output_stage_bytes = output_pixels * 72;
     return cfa_bytes + early_stage_bytes + output_stage_bytes;
 }
@@ -658,6 +715,11 @@ fn render_internal(
 ) RenderError!Rendered {
     assert(sensor.bayer.len == @as(usize, sensor.width) * sensor.height);
     assert(sensor.white_level > sensor.black_level);
+    options.reconstruction.assertValid();
+    if (recipe.engine_version < 3) assert(!options.reconstruction.enabled);
+    if (recipe.engine_version < 3) {
+        assert(std.meta.activeTag(options.camera_profile) == .technical_matrix);
+    }
 
     // The op stack is struct-of-arrays: validation walks the tag column
     // without touching a single payload.
@@ -680,7 +742,7 @@ fn render_internal(
 
     for (0..ops.len) |i| {
         try op_apply(
-            arena,
+            gpa,
             ops.get(i),
             recipe.engine_version,
             sensor,
@@ -688,6 +750,8 @@ fn render_internal(
             &planes,
             color_transform,
             &applied_wb_gains,
+            options.reconstruction,
+            options.camera_profile,
         );
     }
     if (color_transform != null) color.working_to_linear_srgb(&planes);
@@ -745,6 +809,11 @@ fn render_linear_internal(
 ) RenderError!LinearRendered {
     assert(sensor.bayer.len == @as(usize, sensor.width) * sensor.height);
     assert(sensor.white_level > sensor.black_level);
+    options.reconstruction.assertValid();
+    if (recipe.engine_version < 3) assert(!options.reconstruction.enabled);
+    if (recipe.engine_version < 3) {
+        assert(std.meta.activeTag(options.camera_profile) == .technical_matrix);
+    }
 
     var ops: std.MultiArrayList(Op) = .empty;
     defer ops.deinit(gpa);
@@ -767,7 +836,7 @@ fn render_linear_internal(
         switch (op) {
             .exposure, .tone_curve, .srgb_encode => {},
             else => try op_apply(
-                arena,
+                gpa,
                 op,
                 recipe.engine_version,
                 sensor,
@@ -775,6 +844,8 @@ fn render_linear_internal(
                 &planes,
                 color_transform,
                 &applied_wb_gains,
+                options.reconstruction,
+                options.camera_profile,
             ),
         }
     }
@@ -924,7 +995,7 @@ fn planes_downsample(
 }
 
 fn op_apply(
-    arena: std.mem.Allocator,
+    scratch_gpa: std.mem.Allocator,
     op: Op,
     engine_version: u32,
     sensor: *const dng.SensorData,
@@ -932,6 +1003,8 @@ fn op_apply(
     planes: *image.Planes,
     color_transform: ?color.Transform,
     applied_wb_gains: *?[3]f32,
+    reconstruction: ReconstructionDefaults,
+    camera_profile: CameraProfile,
 ) RenderError!void {
     switch (op) {
         .black_point => {
@@ -950,12 +1023,25 @@ fn op_apply(
                 const scale = 1.0 / (sensor.white_level - sensor.black_level);
                 kernel_black_scale(mosaic, sensor.bayer, sensor.black_level, scale);
             }
+            if (reconstruction.enabled) {
+                if (reconstruction.adaptive_green_enabled) {
+                    kernel_green_equalize(mosaic, sensor.width, sensor.height, sensor.cfa);
+                }
+                try kernel_hot_pixel_cleanup(
+                    scratch_gpa,
+                    mosaic,
+                    sensor.width,
+                    sensor.height,
+                    reconstruction.hot_pixel_cleanup_amount,
+                );
+            }
         },
         .white_balance => {
             const wb = op.white_balance;
             if (color_transform == null or
                 !wb.as_shot or
-                color_transform.?.apply_as_shot_white_balance)
+                color_transform.?.apply_as_shot_white_balance or
+                std.meta.activeTag(camera_profile) == .nonlinear)
             {
                 const gains = wb_gains(wb, sensor.wb_neutral);
                 kernel_wb(mosaic, sensor.width, sensor.height, sensor.cfa, gains);
@@ -963,17 +1049,52 @@ fn op_apply(
             }
         },
         .demosaic => {
-            try demosaic_dispatch(sensor.cfa, mosaic, planes);
+            if (reconstruction.enabled) {
+                var rcd_scratch = std.heap.ArenaAllocator.init(scratch_gpa);
+                defer rcd_scratch.deinit();
+                try demosaic_rcd_dispatch(
+                    rcd_scratch.allocator(),
+                    sensor.cfa,
+                    mosaic,
+                    planes,
+                );
+            } else {
+                try demosaic_dispatch(sensor.cfa, mosaic, planes);
+            }
             if (color_transform) |value| {
                 if (engine_version >= 2) {
-                    try kernel_chroma_lowpass(arena, planes);
-                    if (applied_wb_gains.*) |gains| {
-                        kernel_highlight_recovery_balanced(planes, gains);
+                    if (reconstruction.enabled) {
+                        const neutral_ratios = if (applied_wb_gains.* != null)
+                            @as([3]f32, @splat(1))
+                        else
+                            neutral_ratios_green(sensor.wb_neutral);
+                        try kernel_chroma_lowpass_calibrated(
+                            scratch_gpa,
+                            planes,
+                            reconstruction.anti_color_aliasing_strength,
+                            neutral_ratios,
+                        );
                     } else {
-                        kernel_highlight_recovery_unbalanced(planes, sensor.wb_neutral);
+                        try kernel_chroma_lowpass_legacy(scratch_gpa, planes);
+                    }
+                    if (applied_wb_gains.*) |gains| {
+                        kernel_highlight_recovery_balanced(
+                            planes,
+                            gains,
+                            reconstruction.highlight_recovery_start,
+                        );
+                    } else {
+                        kernel_highlight_recovery_unbalanced(
+                            planes,
+                            sensor.wb_neutral,
+                            reconstruction.highlight_recovery_start,
+                        );
                     }
                 }
-                value.camera_to_working(planes);
+                switch (camera_profile) {
+                    .technical_matrix => value.camera_to_working(planes),
+                    .nonlinear => |profile| profile.apply(planes),
+                }
             }
         },
         .exposure => {
@@ -1089,6 +1210,106 @@ fn kernel_black_scale_sites(
     }
 }
 
+/// Equalize the two green CFA lattices with a deliberately bounded global
+/// correction. The calibration flag enables the operation; the two-percent
+/// bound prevents scene content from being mistaken for sensor imbalance.
+fn kernel_green_equalize(
+    mosaic: []f32,
+    width: u32,
+    height: u32,
+    cfa: [4]dng.CfaColor,
+) void {
+    assert(mosaic.len == @as(usize, width) * height);
+    var green_sites: [2]u2 = undefined;
+    var green_count: u2 = 0;
+    for (cfa, 0..) |color_at_site, site| {
+        if (color_at_site == .green) {
+            assert(green_count < 2);
+            green_sites[green_count] = @intCast(site);
+            green_count += 1;
+        }
+    }
+    assert(green_count == 2);
+
+    var sums: [2]f64 = @splat(0);
+    var counts: [2]u64 = @splat(0);
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < width) : (x += 1) {
+            const site: u2 = @intCast((y & 1) * 2 + (x & 1));
+            for (green_sites, 0..) |green_site, green_index| {
+                if (site == green_site) {
+                    sums[green_index] += mosaic[pixel_index(width, x, y)];
+                    counts[green_index] += 1;
+                }
+            }
+        }
+    }
+    assert(counts[0] > 0);
+    assert(counts[1] > 0);
+    const mean_first = sums[0] / @as(f64, @floatFromInt(counts[0]));
+    const mean_second = sums[1] / @as(f64, @floatFromInt(counts[1]));
+    if (mean_first <= 0 or mean_second <= 0) return;
+    const ratio = std.math.clamp(mean_first / mean_second, 0.98, 1.02);
+    const gain_first: f32 = @floatCast(1 / @sqrt(ratio));
+    const gain_second: f32 = @floatCast(@sqrt(ratio));
+    assert(gain_first >= 0.98);
+    assert(gain_first <= 1.02);
+    assert(gain_second >= 0.98);
+    assert(gain_second <= 1.02);
+
+    y = 0;
+    while (y < height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < width) : (x += 1) {
+            const site: u2 = @intCast((y & 1) * 2 + (x & 1));
+            const index = pixel_index(width, x, y);
+            if (site == green_sites[0]) mosaic[index] *= gain_first;
+            if (site == green_sites[1]) mosaic[index] *= gain_second;
+        }
+    }
+}
+
+/// Remove only isolated positive outliers using same-color neighbors two
+/// pixels away. Amount follows the extracted 0...100 calibration scale; zero
+/// is an exact identity and the correction never crosses CFA channels.
+fn kernel_hot_pixel_cleanup(
+    scratch_gpa: std.mem.Allocator,
+    mosaic: []f32,
+    width: u32,
+    height: u32,
+    amount: f32,
+) RenderError!void {
+    assert(mosaic.len == @as(usize, width) * height);
+    assert(std.math.isFinite(amount));
+    assert(amount >= 0);
+    assert(amount <= 100);
+    if (amount == 0 or width < 5 or height < 5) return;
+    const source = try scratch_gpa.dupe(f32, mosaic);
+    defer scratch_gpa.free(source);
+    const blend = amount / 100;
+    const threshold = 0.25 - 0.20 * blend;
+    var y: u32 = 2;
+    while (y < height - 2) : (y += 1) {
+        var x: u32 = 2;
+        while (x < width - 2) : (x += 1) {
+            var neighbors = [4]f32{
+                source[pixel_index(width, x - 2, y)],
+                source[pixel_index(width, x + 2, y)],
+                source[pixel_index(width, x, y - 2)],
+                source[pixel_index(width, x, y + 2)],
+            };
+            std.sort.insertion(f32, &neighbors, {}, std.sort.asc(f32));
+            const local = 0.5 * (neighbors[1] + neighbors[2]);
+            const index = pixel_index(width, x, y);
+            if (source[index] > neighbors[3] + threshold) {
+                mosaic[index] = source[index] + (local - source[index]) * blend;
+            }
+        }
+    }
+}
+
 fn kernel_wb(
     mosaic: []f32,
     width: u32,
@@ -1141,15 +1362,18 @@ fn kernel_gain(plane: []f32, gain: f32) void {
 /// produced by neutral fabric near the sensor Nyquist limit while retaining the
 /// sharper green/luminance plane. Stable chroma is left untouched; only a large
 /// deviation from the local chroma mean is blended away. Engine v1 bypasses it.
-fn kernel_chroma_lowpass(
-    arena: std.mem.Allocator,
+fn kernel_chroma_lowpass_legacy(
+    scratch_gpa: std.mem.Allocator,
     planes: *image.Planes,
 ) RenderError!void {
     assert(planes.r.len == planes.g.len);
     assert(planes.r.len == planes.b.len);
-    const current = try arena.alloc(f32, planes.r.len);
-    const horizontal = try arena.alloc(f32, planes.r.len);
-    const filtered = try arena.alloc(f32, planes.r.len);
+    const current = try scratch_gpa.alloc(f32, planes.r.len);
+    defer scratch_gpa.free(current);
+    const horizontal = try scratch_gpa.alloc(f32, planes.r.len);
+    defer scratch_gpa.free(horizontal);
+    const filtered = try scratch_gpa.alloc(f32, planes.r.len);
+    defer scratch_gpa.free(filtered);
     const radius: i64 = 12;
     const diameter: f32 = @floatFromInt(radius * 2 + 1);
     for ([_][]f32{ planes.r, planes.b }) |channel| {
@@ -1224,17 +1448,189 @@ fn kernel_chroma_lowpass(
     }
 }
 
+/// The calibrated path is independently versioned so historical v2 bytes do
+/// not change while its texture mask evolves against the visual corpus.
+fn kernel_chroma_lowpass_calibrated(
+    scratch_gpa: std.mem.Allocator,
+    planes: *image.Planes,
+    strength: f32,
+    neutral_ratios: [3]f32,
+) RenderError!void {
+    assert(planes.r.len == planes.g.len);
+    assert(planes.r.len == planes.b.len);
+    assert(std.math.isFinite(strength));
+    assert(strength >= 0);
+    assert(strength <= 1);
+    for (neutral_ratios) |ratio| {
+        assert(std.math.isFinite(ratio));
+        assert(ratio > 0);
+    }
+    if (strength == 0) return;
+    const current = try scratch_gpa.alloc(f32, planes.r.len);
+    defer scratch_gpa.free(current);
+    const horizontal = try scratch_gpa.alloc(f32, planes.r.len);
+    defer scratch_gpa.free(horizontal);
+    const filtered = try scratch_gpa.alloc(f32, planes.r.len);
+    defer scratch_gpa.free(filtered);
+    const radius: i64 = 12;
+    const diameter: f32 = @floatFromInt(radius * 2 + 1);
+    const channels = [_][]f32{ planes.r, planes.b };
+    const ratios = [_]f32{ neutral_ratios[0], neutral_ratios[2] };
+    for (channels, ratios) |channel, neutral_ratio| {
+        for (current, channel, planes.g) |*chroma, value, green| {
+            chroma.* = value - green * neutral_ratio;
+        }
+        var y: u32 = 0;
+        while (y < planes.height) : (y += 1) {
+            const row = @as(usize, y) * planes.width;
+            var sum: f32 = 0;
+            var offset: i64 = -radius;
+            while (offset <= radius) : (offset += 1) {
+                const source_x: u32 = @intCast(std.math.clamp(
+                    offset,
+                    0,
+                    @as(i64, planes.width) - 1,
+                ));
+                sum += current[row + source_x];
+            }
+            var x: u32 = 0;
+            while (x < planes.width) : (x += 1) {
+                horizontal[row + x] = sum / diameter;
+                const left_x: u32 = @intCast(std.math.clamp(
+                    @as(i64, x) - radius,
+                    0,
+                    @as(i64, planes.width) - 1,
+                ));
+                const right_x: u32 = @intCast(std.math.clamp(
+                    @as(i64, x) + radius + 1,
+                    0,
+                    @as(i64, planes.width) - 1,
+                ));
+                sum += current[row + right_x] - current[row + left_x];
+            }
+        }
+        var x: u32 = 0;
+        while (x < planes.width) : (x += 1) {
+            var sum: f32 = 0;
+            var offset: i64 = -radius;
+            while (offset <= radius) : (offset += 1) {
+                const source_y: u32 = @intCast(std.math.clamp(
+                    offset,
+                    0,
+                    @as(i64, planes.height) - 1,
+                ));
+                sum += horizontal[@as(usize, source_y) * planes.width + x];
+            }
+            y = 0;
+            while (y < planes.height) : (y += 1) {
+                const center = @as(usize, y) * planes.width + x;
+                filtered[center] = sum / diameter;
+                const top_y: u32 = @intCast(std.math.clamp(
+                    @as(i64, y) - radius,
+                    0,
+                    @as(i64, planes.height) - 1,
+                ));
+                const bottom_y: u32 = @intCast(std.math.clamp(
+                    @as(i64, y) + radius + 1,
+                    0,
+                    @as(i64, planes.height) - 1,
+                ));
+                sum += horizontal[@as(usize, bottom_y) * planes.width + x] -
+                    horizontal[@as(usize, top_y) * planes.width + x];
+            }
+        }
+        @memset(horizontal, 0);
+        y = 1;
+        while (y + 1 < planes.height) : (y += 1) {
+            x = 1;
+            while (x + 1 < planes.width) : (x += 1) {
+                const index = @as(usize, y) * planes.width + x;
+                const original = current[index];
+                const horizontal_alternation =
+                    original * current[index - 1] < 0 and
+                    original * current[index + 1] < 0;
+                const vertical_alternation =
+                    original * current[index - planes.width] < 0 and
+                    original * current[index + planes.width] < 0;
+                const local = filtered[index];
+                const green = planes.g[index];
+                const horizontal_green_product =
+                    (green - planes.g[index - 1]) * (green - planes.g[index + 1]);
+                const vertical_green_product =
+                    (green - planes.g[index - planes.width]) *
+                    (green - planes.g[index + planes.width]);
+                const luminance_oscillation =
+                    horizontal_green_product > 0.000025 or
+                    vertical_green_product > 0.000025;
+                const zero_mean_chroma = @abs(local) <= 0.12;
+                const neutral_texture = luminance_oscillation and zero_mean_chroma;
+                if (horizontal_alternation or vertical_alternation or neutral_texture) {
+                    horizontal[index] = 1;
+                }
+            }
+        }
+
+        y = 1;
+        while (y + 1 < planes.height) : (y += 1) {
+            x = 1;
+            while (x + 1 < planes.width) : (x += 1) {
+                const index = @as(usize, y) * planes.width + x;
+                var selected = false;
+                var offset_y: i64 = -2;
+                while (offset_y <= 2) : (offset_y += 1) {
+                    const sample_y: u32 = @intCast(std.math.clamp(
+                        @as(i64, y) + offset_y,
+                        1,
+                        @as(i64, planes.height) - 2,
+                    ));
+                    var offset_x: i64 = -2;
+                    while (offset_x <= 2) : (offset_x += 1) {
+                        const sample_x: u32 = @intCast(std.math.clamp(
+                            @as(i64, x) + offset_x,
+                            1,
+                            @as(i64, planes.width) - 2,
+                        ));
+                        const sample_index = @as(usize, sample_y) * planes.width + sample_x;
+                        if (horizontal[sample_index] != 0) selected = true;
+                    }
+                }
+                if (!selected) continue;
+                const original = current[index];
+                const local = filtered[index];
+                const target = if (@abs(local) <= 0.12) @as(f32, 0) else local;
+                const residual = @abs(original - target);
+                const blend = std.math.clamp((residual - 0.005) * 20 * strength, 0, 1);
+                const chroma = original + (target - original) * blend;
+                channel[index] = planes.g[index] * neutral_ratio + chroma;
+            }
+        }
+    }
+}
+
+fn neutral_ratios_green(neutral: [3]f32) [3]f32 {
+    for (neutral) |value| {
+        assert(std.math.isFinite(value));
+        assert(value > 0);
+    }
+    return .{ neutral[0] / neutral[1], 1, neutral[2] / neutral[1] };
+}
+
 /// White balance cannot recover a channel that already hit sensor white. Near
 /// that boundary, progressively remove the false chroma produced when clipped
-/// camera channels receive different WB gains. Values below 80% of the second
-/// brightest channel's pre-WB range are bit-identical; clipped highlights converge
-/// to the strongest surviving common camera-RGB value.
-fn kernel_highlight_recovery_balanced(planes: *image.Planes, gains: [3]f32) void {
+/// camera channels receive different WB gains. Values below `start` of the
+/// second-brightest channel's pre-WB range are bit-identical; clipped highlights
+/// converge to the strongest surviving common camera-RGB value.
+fn kernel_highlight_recovery_balanced(
+    planes: *image.Planes,
+    gains: [3]f32,
+    start: f32,
+) void {
     assert(planes.r.len == planes.g.len);
     assert(planes.r.len == planes.b.len);
     for (gains) |gain| assert(gain > 0);
+    assert(start >= 0);
+    assert(start < 1);
 
-    const start: f32 = 0.8;
     const scale: f32 = 1 / (1 - start);
     for (planes.r, planes.g, planes.b) |*r, *g, *b| {
         const sensor_peak = middle3(r.* / gains[0], g.* / gains[1], b.* / gains[2]);
@@ -1250,10 +1646,16 @@ fn kernel_highlight_recovery_balanced(planes: *image.Planes, gains: [3]f32) void
 /// Native DNG colour selection is performed by the camera transform rather
 /// than Bayer-domain gains. Convert each camera channel to its neutral-relative
 /// intensity for blending, then return it to the original camera-RGB ratios.
-fn kernel_highlight_recovery_unbalanced(planes: *image.Planes, neutral: [3]f32) void {
+fn kernel_highlight_recovery_unbalanced(
+    planes: *image.Planes,
+    neutral: [3]f32,
+    start: f32,
+) void {
     assert(planes.r.len == planes.g.len);
     assert(planes.r.len == planes.b.len);
     for (neutral) |value| assert(value > 0);
+    assert(start >= 0);
+    assert(start < 1);
 
     const neutral_max = @max(neutral[0], @max(neutral[1], neutral[2]));
     const ratios = [3]f32{
@@ -1261,7 +1663,6 @@ fn kernel_highlight_recovery_unbalanced(planes: *image.Planes, neutral: [3]f32) 
         neutral[1] / neutral_max,
         neutral[2] / neutral_max,
     };
-    const start: f32 = 0.8;
     const scale: f32 = 1 / (1 - start);
     for (planes.r, planes.g, planes.b) |*r, *g, *b| {
         const sensor_peak = middle3(r.*, g.*, b.*);
@@ -1446,6 +1847,26 @@ fn demosaic_dispatch(
     inline for (layouts) |layout| {
         if (std.mem.eql(dng.CfaColor, &cfa, &layout)) {
             return demosaic_bilinear(layout, mosaic, planes);
+        }
+    }
+    return error.UnsupportedSensor;
+}
+
+fn demosaic_rcd_dispatch(
+    arena: std.mem.Allocator,
+    cfa: [4]dng.CfaColor,
+    mosaic: []const f32,
+    planes: *image.Planes,
+) RenderError!void {
+    const layouts = [_][4]dng.CfaColor{
+        .{ .red, .green, .green, .blue },
+        .{ .blue, .green, .green, .red },
+        .{ .green, .red, .blue, .green },
+        .{ .green, .blue, .red, .green },
+    };
+    inline for (layouts) |layout| {
+        if (std.mem.eql(dng.CfaColor, &cfa, &layout)) {
+            return demosaic_rcd_reference(arena, layout, mosaic, planes);
         }
     }
     return error.UnsupportedSensor;
@@ -2089,6 +2510,148 @@ test "RCD reference has finite deterministic borders for tiny and odd images" {
     }
 }
 
+const DemosaicArtifactScene = enum {
+    diagonal_lines,
+    zipper_edge,
+    maze_detail,
+    color_edge,
+    clipped_highlight,
+    deep_shadow,
+    saturated_edge,
+};
+
+test "RCD artifact suite covers structured edges shadows and clipped highlights" {
+    // Each fixture starts as known linear RGB, is sampled through an RGGB CFA,
+    // and is reconstructed independently. The gate is deliberately objective:
+    // RCD must improve aggregate interior RGB error over the diagnostic
+    // bilinear implementation while preserving finite bounded output.
+    const gpa = std.testing.allocator;
+    const width: u32 = 67;
+    const height: u32 = 51;
+    const cfa = [4]dng.CfaColor{ .red, .green, .green, .blue };
+    const scenes = [_]DemosaicArtifactScene{
+        .diagonal_lines,
+        .zipper_edge,
+        .maze_detail,
+        .color_edge,
+        .clipped_highlight,
+        .deep_shadow,
+        .saturated_edge,
+    };
+    var error_bilinear_total: f64 = 0;
+    var error_rcd_total: f64 = 0;
+
+    for (scenes) |scene| {
+        const pixel_count = @as(usize, width) * height;
+        const mosaic = try gpa.alloc(f32, pixel_count);
+        defer gpa.free(mosaic);
+        const reference = try gpa.alloc([3]f32, pixel_count);
+        defer gpa.free(reference);
+        artifact_scene_sample(scene, cfa, mosaic, reference, width, height);
+
+        var bilinear = try image.Planes.init(gpa, width, height);
+        defer bilinear.deinit(gpa);
+        demosaic_bilinear(cfa, mosaic, &bilinear);
+        var rcd = try image.Planes.init(gpa, width, height);
+        defer rcd.deinit(gpa);
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        try demosaic_rcd_reference(scratch.allocator(), cfa, mosaic, &rcd);
+
+        var y: u32 = 9;
+        while (y < height - 9) : (y += 1) {
+            var x: u32 = 9;
+            while (x < width - 9) : (x += 1) {
+                const index = pixel_index(width, x, y);
+                const expected = reference[index];
+                const actual_bilinear = [3]f32{
+                    bilinear.r[index], bilinear.g[index], bilinear.b[index],
+                };
+                const actual_rcd = [3]f32{ rcd.r[index], rcd.g[index], rcd.b[index] };
+                for (actual_bilinear, actual_rcd, expected) |linear, ratio, target| {
+                    error_bilinear_total += squared(linear - target);
+                    error_rcd_total += squared(ratio - target);
+                    try std.testing.expect(std.math.isFinite(ratio));
+                    try std.testing.expect(ratio >= 0);
+                }
+            }
+        }
+    }
+    try std.testing.expect(error_bilinear_total > 0);
+    try std.testing.expect(error_rcd_total < error_bilinear_total);
+}
+
+fn artifact_scene_sample(
+    scene: DemosaicArtifactScene,
+    comptime cfa: [4]dng.CfaColor,
+    mosaic: []f32,
+    reference: [][3]f32,
+    width: u32,
+    height: u32,
+) void {
+    assert(mosaic.len == @as(usize, width) * height);
+    assert(reference.len == mosaic.len);
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < width) : (x += 1) {
+            const index = pixel_index(width, x, y);
+            const rgb = artifact_scene_rgb(scene, x, y, width, height);
+            reference[index] = rgb;
+            mosaic[index] = rgb[@intFromEnum(site_color(cfa, x, y))];
+        }
+    }
+}
+
+fn artifact_scene_rgb(
+    scene: DemosaicArtifactScene,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) [3]f32 {
+    assert(x < width);
+    assert(y < height);
+    return switch (scene) {
+        .diagonal_lines => blk: {
+            const light: f32 = if ((x + 2 * y) % 11 < 4) 0.82 else 0.18;
+            break :blk @splat(light);
+        },
+        .zipper_edge => blk: {
+            const boundary = width / 2 + @as(u32, @intFromBool(y % 4 >= 2));
+            const light: f32 = if (x < boundary) 0.12 else 0.88;
+            break :blk @splat(light);
+        },
+        .maze_detail => blk: {
+            const cell_x = x / 3;
+            const cell_y = y / 3;
+            const light: f32 = if ((cell_x ^ cell_y) & 1 == 0) 0.72 else 0.28;
+            break :blk @splat(light);
+        },
+        .color_edge => if (x + y < (width + height) / 2)
+            .{ 0.78, 0.24, 0.12 }
+        else
+            .{ 0.08, 0.52, 0.88 },
+        .clipped_highlight => blk: {
+            const center_x = width / 2;
+            const center_y = height / 2;
+            const distance = @abs(@as(i64, x) - center_x) +
+                @abs(@as(i64, y) - center_y);
+            if (distance < 7) break :blk .{ 1, 1, 1 };
+            if (distance < 12) break :blk .{ 1, 0.92, 0.78 };
+            break :blk .{ 0.16, 0.20, 0.24 };
+        },
+        .deep_shadow => blk: {
+            const level: f32 = if ((x + y * 3) % 9 < 4) 0.012 else 0.035;
+            break :blk .{ level * 0.9, level, level * 1.1 };
+        },
+        .saturated_edge => if (x < width / 2)
+            .{ 1, 0.12, 0.04 }
+        else
+            .{ 0.02, 0.18, 1 },
+    };
+}
+
 test "per-site black and white levels normalize each CFA site independently" {
     const source = [4]u16{ 60, 120, 180, 240 };
     const black = [4]f32{ 10, 20, 30, 40 };
@@ -2096,6 +2659,81 @@ test "per-site black and white levels normalize each CFA site independently" {
     var target: [4]f32 = undefined;
     kernel_black_scale_sites(&target, &source, 2, 2, black, white);
     for (target) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.5), value, 1e-6);
+}
+
+test "calibrated sensor cleanup is CFA-local bounded and has an exact off state" {
+    const gpa = std.testing.allocator;
+    const width: u32 = 10;
+    const height: u32 = 10;
+    const cfa = [4]dng.CfaColor{ .red, .green, .green, .blue };
+    var mosaic: [width * height]f32 = @splat(0.2);
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < width) : (x += 1) {
+            const site = (y & 1) * 2 + (x & 1);
+            if (site == 1) mosaic[pixel_index(width, x, y)] = 1.01;
+            if (site == 2) mosaic[pixel_index(width, x, y)] = 0.99;
+        }
+    }
+    kernel_green_equalize(&mosaic, width, height, cfa);
+    try std.testing.expectApproxEqAbs(mosaic[1], mosaic[width], 0.0002);
+    try std.testing.expect(mosaic[1] >= 0.98);
+    try std.testing.expect(mosaic[width] <= 1.02);
+
+    const hot_index = pixel_index(width, 4, 4);
+    mosaic[hot_index] = 0.95;
+    const before_off = mosaic;
+    var scratch_off = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_off.deinit();
+    try kernel_hot_pixel_cleanup(scratch_off.allocator(), &mosaic, width, height, 0);
+    try std.testing.expectEqualSlices(f32, &before_off, &mosaic);
+
+    var scratch_on = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_on.deinit();
+    try kernel_hot_pixel_cleanup(scratch_on.allocator(), &mosaic, width, height, 100);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), mosaic[hot_index], 1e-6);
+    try std.testing.expectEqual(before_off[hot_index - 1], mosaic[hot_index - 1]);
+}
+
+test "anti-color-alias strength zero is identity and one suppresses chroma" {
+    const gpa = std.testing.allocator;
+    const width: u32 = 17;
+    const height: u32 = 13;
+    var planes = try image.Planes.init(gpa, width, height);
+    defer planes.deinit(gpa);
+    @memset(planes.g, 0.5);
+    @memset(planes.b, 0.5);
+    for (planes.r, 0..) |*value, index| {
+        value.* = if (index & 1 == 0) 0.1 else 0.9;
+    }
+    const original = try gpa.dupe(f32, planes.r);
+    defer gpa.free(original);
+    var scratch_off = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_off.deinit();
+    try kernel_chroma_lowpass_calibrated(scratch_off.allocator(), &planes, 0, @splat(1));
+    try std.testing.expectEqualSlices(f32, original, planes.r);
+
+    var scratch_on = std.heap.ArenaAllocator.init(gpa);
+    defer scratch_on.deinit();
+    try kernel_chroma_lowpass_calibrated(scratch_on.allocator(), &planes, 1, @splat(1));
+    var residual_before: f64 = 0;
+    var residual_after: f64 = 0;
+    for (original, planes.r) |before, after| {
+        residual_before += @abs(before - 0.5);
+        residual_after += @abs(after - 0.5);
+    }
+    try std.testing.expect(residual_after < residual_before);
+
+    // A sustained colour step is not alternating CFA false colour and must
+    // remain exact, including the pixels nearest the boundary.
+    for (planes.r, 0..) |*value, index| {
+        value.* = if (index % width < width / 2) 0.2 else 0.8;
+    }
+    const color_edge = try gpa.dupe(f32, planes.r);
+    defer gpa.free(color_edge);
+    try kernel_chroma_lowpass_calibrated(gpa, &planes, 1, @splat(1));
+    try std.testing.expectEqualSlices(f32, color_edge, planes.r);
 }
 
 test "render is deterministic: two runs, identical bytes" {
@@ -2200,6 +2838,12 @@ test "engine v2 applies default crop and orientation before preview sizing" {
     try std.testing.expectEqualSlices(f32, linear_neutral.rgba, linear_late_edit.rgba);
     const memory_bytes_max = render_linear_memory_bytes_max(&raw, 3);
     try std.testing.expect(memory_bytes_max > 0);
+    const calibrated_memory_bytes_max = render_linear_memory_bytes_max_internal(
+        &raw,
+        3,
+        true,
+    );
+    try std.testing.expect(calibrated_memory_bytes_max > memory_bytes_max);
     try std.testing.expectError(error.OutOfMemory, render_linear_decoded(
         gpa,
         &raw,
@@ -2211,6 +2855,16 @@ test "engine v2 applies default crop and orientation before preview sizing" {
         &raw,
         recipe,
         .{ .cancellation = .{ .callback = test_cancel_requested } },
+    ));
+    try std.testing.expectError(error.OutOfMemory, render_linear_decoded(
+        gpa,
+        &raw,
+        .{ .engine_version = 3, .ops = &test_ops_default },
+        .{
+            .edge_px_max_out = 3,
+            .memory_budget_bytes = calibrated_memory_bytes_max - 1,
+            .reconstruction = .{ .enabled = true },
+        },
     ));
     for (linear_neutral.rgba, 0..) |value, i| {
         try std.testing.expect(std.math.isFinite(value));
@@ -2232,6 +2886,71 @@ test "engine v2 applies default crop and orientation before preview sizing" {
     );
     defer linear_early_edit.deinit(gpa);
     try std.testing.expect(!std.mem.eql(f32, linear_neutral.rgba, linear_early_edit.rgba));
+}
+
+test "engine v3 calibrated reconstruction is explicit and leaves v2 frozen" {
+    const gpa = std.testing.allocator;
+    const sensor = try test_sensor(gpa, 33, 25);
+    var raw = dng.DecodedRaw{
+        .sensor = sensor,
+        .metadata = .{
+            .width = 33,
+            .height = 25,
+            .compression = .none,
+            .cfa = sensor.cfa,
+            .black_level = sensor.black_level,
+            .white_level = sensor.white_level,
+            .wb_neutral = sensor.wb_neutral,
+            .orientation = .normal,
+            .active_area = .{ .x = 0, .y = 0, .width = 33, .height = 25 },
+            .default_crop = .{ .x = 0, .y = 0, .width = 33, .height = 25 },
+            .color_matrix_1 = color.Mat3.identity.values,
+            .calibration_illuminant_1 = 23,
+        },
+    };
+    defer raw.deinit(gpa);
+    const legacy_recipe = Recipe{ .engine_version = 2, .ops = &test_ops_default };
+    var legacy_first = try render_decoded(gpa, &raw, legacy_recipe, .{});
+    defer legacy_first.deinit(gpa);
+    var calibrated = try render_decoded(
+        gpa,
+        &raw,
+        .{ .engine_version = 3, .ops = &test_ops_default },
+        .{ .reconstruction = .{
+            .enabled = true,
+            .adaptive_green_enabled = true,
+            .hot_pixel_cleanup_amount = 10,
+            .anti_color_aliasing_strength = 0.5,
+            .highlight_recovery_start = highlight_recovery_start_bootstrap,
+        } },
+    );
+    defer calibrated.deinit(gpa);
+    var legacy_second = try render_decoded(gpa, &raw, legacy_recipe, .{});
+    defer legacy_second.deinit(gpa);
+
+    try std.testing.expectEqualSlices(u8, legacy_first.rgba, legacy_second.rgba);
+    try std.testing.expect(!std.mem.eql(u8, legacy_first.rgba, calibrated.rgba));
+    try std.testing.expectEqual(legacy_first.width, calibrated.width);
+    try std.testing.expectEqual(legacy_first.height, calibrated.height);
+
+    var calibrated_preview = try render_decoded(
+        gpa,
+        &raw,
+        .{ .engine_version = 3, .ops = &test_ops_default },
+        .{
+            .edge_px_max_out = 16,
+            .reconstruction = .{
+                .enabled = true,
+                .adaptive_green_enabled = true,
+                .hot_pixel_cleanup_amount = 10,
+                .anti_color_aliasing_strength = 0.5,
+                .highlight_recovery_start = highlight_recovery_start_bootstrap,
+            },
+        },
+    );
+    defer calibrated_preview.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 16), calibrated_preview.width);
+    try std.testing.expectEqual(@as(u32, 12), calibrated_preview.height);
 }
 
 test "box downsample bins tile the source and average exactly" {
@@ -2268,7 +2987,7 @@ test "v2 highlight recovery is neutral below sensor white" {
         .g = &g,
         .b = &b,
     };
-    kernel_highlight_recovery_balanced(&planes, .{ 2, 1, 1.5 });
+    kernel_highlight_recovery_balanced(&planes, .{ 2, 1, 1.5 }, 0.8);
 
     // Nothing below 80% of the sensor range changes.
     try std.testing.expectEqual(@as(f32, 0.8), r[0]);
@@ -2295,7 +3014,7 @@ test "v2 unbalanced DNG highlight recovery follows AsShotNeutral" {
         .g = &g,
         .b = &b,
     };
-    kernel_highlight_recovery_unbalanced(&planes, .{ 0.5, 1, 0.75 });
+    kernel_highlight_recovery_unbalanced(&planes, .{ 0.5, 1, 0.75 }, 0.8);
 
     try std.testing.expectEqual(@as(f32, 0.4), r[0]);
     try std.testing.expectEqual(@as(f32, 0.7), g[0]);
@@ -2307,6 +3026,34 @@ test "v2 unbalanced DNG highlight recovery follows AsShotNeutral" {
     try std.testing.expectEqual(@as(f32, 1), r[2]);
     try std.testing.expectEqual(@as(f32, 0.2), g[2]);
     try std.testing.expectEqual(@as(f32, 0.1), b[2]);
+}
+
+test "calibrated highlight headroom starts at the recovered clip safety point" {
+    var r = [_]f32{ 1.93, 2 };
+    var g = [_]f32{ 0.965, 1 };
+    var b = [_]f32{ 1.4475, 1.5 };
+    var planes = image.Planes{
+        .width = 2,
+        .height = 1,
+        .r = &r,
+        .g = &g,
+        .b = &b,
+    };
+    kernel_highlight_recovery_balanced(
+        &planes,
+        .{ 2, 1, 1.5 },
+        highlight_recovery_start_bootstrap,
+    );
+
+    // Per-channel sensor values at 0.965 remain bit-identical, while a sensor
+    // white shared by all three channels converges to a neutral recoverable
+    // value. CFA-site white normalization is covered independently above.
+    try std.testing.expectEqual(@as(f32, 1.93), r[0]);
+    try std.testing.expectEqual(@as(f32, 0.965), g[0]);
+    try std.testing.expectEqual(@as(f32, 1.4475), b[0]);
+    try std.testing.expectEqual(@as(f32, 1), r[1]);
+    try std.testing.expectEqual(@as(f32, 1), g[1]);
+    try std.testing.expectEqual(@as(f32, 1), b[1]);
 }
 
 test "a flat grey field survives the pipeline as flat grey" {
@@ -2377,7 +3124,7 @@ test "stack validation rejects malformed recipes (negative space)" {
         render_decoded(
             gpa,
             &raw,
-            .{ .engine_version = 3, .ops = &test_ops_default },
+            .{ .engine_version = 4, .ops = &test_ops_default },
             .{},
         ),
     );

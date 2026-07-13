@@ -166,16 +166,16 @@ struct RendererManifest: Hashable, Sendable {
     let backend: RenderBackend
     let precision: RenderPrecision
 
-    static let strictCPUV2 = RendererManifest(
-        implementationID: "banksia.cpu.strict-f32.v2",
-        engineVersion: 2,
+    static let strictCPUV3 = RendererManifest(
+        implementationID: "banksia.cpu.strict-f32.v3",
+        engineVersion: 3,
         backend: .strictCPU,
         precision: .float32
     )
 
     static let metalLateDevelopV1 = RendererManifest(
         implementationID: "banksia.metal.late-develop-f32.v1",
-        engineVersion: 2,
+        engineVersion: 3,
         backend: .metalCandidate,
         precision: .float32
     )
@@ -186,12 +186,12 @@ struct RenderExecutionContract: Hashable, Sendable {
     let output: RenderOutputKind
 
     static let strictCPUDisplay = RenderExecutionContract(
-        renderer: .strictCPUV2,
+        renderer: .strictCPUV3,
         output: .cpuRGBA8SRGB
     )
 
     static let strictCPULinearWorking = RenderExecutionContract(
-        renderer: .strictCPUV2,
+        renderer: .strictCPUV3,
         output: .cpuRGBA32FloatLinearWorking
     )
 

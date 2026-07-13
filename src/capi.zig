@@ -56,6 +56,8 @@ const Engine = struct {
     recipe: ?std.json.Parsed(emu.pipeline.Recipe) = null,
     rendered: ?emu.pipeline.Rendered = null,
     linear_rendered: ?emu.pipeline.LinearRendered = null,
+    resolved_calibration: ?emu.calibration.ResolvedCalibration = null,
+    input_profile: ?emu.calibration.Mft2 = null,
     /// Always NUL-terminated; index error_message_bytes_max is the fence.
     last_error: [error_message_bytes_max + 1]u8,
     manifest_json: [manifest_json_bytes_max + 1]u8,
@@ -79,6 +81,7 @@ pub export fn bk_engine_destroy(engine_maybe: ?*Engine) void {
     if (engine.recipe) |*recipe| recipe.deinit();
     if (engine.rendered) |*rendered| rendered.deinit(engine.gpa);
     if (engine.linear_rendered) |*rendered| rendered.deinit(engine.gpa);
+    if (engine.input_profile) |*profile| profile.deinit(engine.gpa);
     if (verify) {
         // The leak gate: every allocation made through this handle must be
         // gone. In release builds the report (and the assert) compile out.
@@ -139,6 +142,9 @@ fn load_raw(engine: *Engine, path: []const u8) i32 {
     };
     if (engine.raw) |*old| old.deinit(engine.gpa);
     engine.raw = raw;
+    engine.resolved_calibration = null;
+    if (engine.input_profile) |*profile| profile.deinit(engine.gpa);
+    engine.input_profile = null;
     return succeed(engine);
 }
 
@@ -194,14 +200,21 @@ pub export fn bk_pipeline_manifest_json(
         _ = fail(engine, err_render, "cannot resolve calibration: {s}", .{@errorName(err)});
         return null;
     };
+    const input_profile = loadInputProfile(&database, engine.gpa, &resolved) catch |err| {
+        _ = fail(engine, err_render, "cannot load input profile: {s}", .{@errorName(err)});
+        return null;
+    };
+    if (engine.input_profile) |*old| old.deinit(engine.gpa);
+    engine.input_profile = input_profile;
+    engine.resolved_calibration = resolved;
     const dependencies = emu.render_manifest.DependencyManifest.init(&resolved);
 
     var iso_record_ids: [20][]const u8 = @splat("");
     for (dependencies.isoRecordIds(), 0..) |*record_id, index| {
         iso_record_ids[index] = record_id.slice();
     }
-    var stages: [emu.render_manifest.calibrated_stages.len]PipelineStageJSON = undefined;
-    for (&stages, emu.render_manifest.calibrated_stages) |*target, stage| {
+    var stages: [emu.render_manifest.reconstruction_stages.len]PipelineStageJSON = undefined;
+    for (&stages, emu.render_manifest.reconstruction_stages) |*target, stage| {
         target.* = .{
             .stage_id = stage.stage_id,
             .implementation_id = stage.implementation_id,
@@ -213,9 +226,9 @@ pub export fn bk_pipeline_manifest_json(
     }
     const view = PipelineManifestJSON{
         .recipe_schema_id = emu.render_manifest.recipe_schema_id_current,
-        .active_graph_id = emu.render_manifest.graph_id_legacy_v2,
+        .active_graph_id = emu.render_manifest.graph_id_reconstruction_v3,
         .target_graph_id = resolved.processing_graph_id.slice(),
-        .renderer_id = emu.render_manifest.renderer_id_strict_cpu_v2,
+        .renderer_id = emu.render_manifest.renderer_id_strict_cpu_v3,
         .backend_id = "strict_cpu",
         .precision_id = "float32",
         .resolution_state = @tagName(resolved.state),
@@ -228,7 +241,7 @@ pub export fn bk_pipeline_manifest_json(
         .input_profile_id = optionalTextSlice(&dependencies.input_profile_id),
         .film_curve_id = optionalTextSlice(&dependencies.film_curve_id),
         .lens_profile_id = optionalTextSlice(&dependencies.lens_profile_id),
-        .first_affected_stage_id = emu.render_manifest.calibrated_stages[0].stage_id,
+        .first_affected_stage_id = emu.render_manifest.reconstruction_stages[0].stage_id,
         .stages = &stages,
     };
 
@@ -298,9 +311,19 @@ pub export fn bk_render(
 
     // A handle with no recipe set renders the engine's default recipe: the
     // shell can show an image before its first slider moves.
-    const recipe = if (engine.recipe) |parsed| parsed.value else emu.recipe.default_recipe();
+    const recipe = renderRecipe(engine);
+    const reconstruction = reconstructionDefaults(engine, recipe) orelse {
+        _ = fail(engine, err_render, "engine v3 requires resolved calibration", .{});
+        return null;
+    };
+    const camera_profile = cameraProfile(engine, recipe) orelse {
+        _ = fail(engine, err_render, "invalid nonlinear camera profile", .{});
+        return null;
+    };
     const rendered = emu.pipeline.render_decoded(engine.gpa, &engine.raw.?, recipe, .{
         .edge_px_max_out = edge_px_max,
+        .reconstruction = reconstruction,
+        .camera_profile = camera_profile,
     }) catch |err| {
         const code = switch (err) {
             error.OutOfMemory => err_out_of_memory,
@@ -378,7 +401,15 @@ fn render_linear_with_admission(
         return null;
     }
 
-    const recipe = if (engine.recipe) |parsed| parsed.value else emu.recipe.default_recipe();
+    const recipe = renderRecipe(engine);
+    const reconstruction = reconstructionDefaults(engine, recipe) orelse {
+        _ = fail(engine, err_render, "engine v3 requires resolved calibration", .{});
+        return null;
+    };
+    const camera_profile = cameraProfile(engine, recipe) orelse {
+        _ = fail(engine, err_render, "invalid nonlinear camera profile", .{});
+        return null;
+    };
     const rendered = emu.pipeline.render_linear_decoded(
         engine.gpa,
         &engine.raw.?,
@@ -390,6 +421,8 @@ fn render_linear_with_admission(
                 .context = cancel_context,
                 .callback = should_cancel,
             },
+            .reconstruction = reconstruction,
+            .camera_profile = camera_profile,
         },
     ) catch |err| {
         const code = switch (err) {
@@ -407,6 +440,49 @@ fn render_linear_with_admission(
     height_ptr.* = rendered.height;
     _ = succeed(engine);
     return engine.linear_rendered.?.rgba.ptr;
+}
+
+fn reconstructionDefaults(
+    engine: *const Engine,
+    recipe: emu.pipeline.Recipe,
+) ?emu.pipeline.ReconstructionDefaults {
+    if (recipe.engine_version != 3) return .legacy;
+    const resolved = engine.resolved_calibration orelse return null;
+    return emu.reconstruction.defaults(&resolved) catch null;
+}
+
+fn loadInputProfile(
+    database: *emu.calibration.Database,
+    gpa: std.mem.Allocator,
+    resolved: *const emu.calibration.ResolvedCalibration,
+) !?emu.calibration.Mft2 {
+    const profile_id = switch (resolved.camera) {
+        .resolved => |camera| camera.input_profile_id.slice(),
+        .generic_fallback => return null,
+    };
+    var mft2 = try database.loadMft2(gpa, profile_id);
+    errdefer mft2.deinit(gpa);
+    const profile = try emu.icc_profile.Profile.init(&mft2);
+    if (!profile.isBootstrapCanonical()) return error.InvalidData;
+    return mft2;
+}
+
+fn cameraProfile(
+    engine: *const Engine,
+    recipe: emu.pipeline.Recipe,
+) ?emu.pipeline.CameraProfile {
+    if (recipe.engine_version != 3) return .technical_matrix;
+    const mft2 = &(engine.input_profile orelse return .technical_matrix);
+    const profile = emu.icc_profile.Profile.init(mft2) catch return null;
+    return .{ .nonlinear = profile };
+}
+
+fn renderRecipe(engine: *const Engine) emu.pipeline.Recipe {
+    if (engine.recipe) |parsed| return parsed.value;
+    if (engine.resolved_calibration != null) {
+        return .{ .engine_version = 3, .ops = &emu.recipe.default_ops };
+    }
+    return emu.recipe.default_recipe();
 }
 
 pub export fn bk_last_error(engine_maybe: ?*const Engine) [*:0]const u8 {
@@ -566,7 +642,7 @@ test "create/load/render/destroy round trip through a real DNG file" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         manifest_json,
-        "\"active_graph_id\":\"graph.banksia.matrix.v2\"",
+        "\"active_graph_id\":\"graph.banksia.reconstruction.v3\"",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -602,6 +678,22 @@ test "create/load/render/destroy round trip through a real DNG file" {
     try std.testing.expectEqual(@as(u32, 16), width);
     try std.testing.expectEqual(@as(u32, 10), height);
     try std.testing.expectEqual(@as(f32, 1), linear.?[3]);
+
+    // Engine v3 is calibration-backed: the manifest resolution above snapshots
+    // a generic fallback, which is still an explicit and valid resolved default.
+    try std.testing.expectEqual(ok, bk_set_recipe_json(
+        engine,
+        "{\"engine_version\":3,\"ops\":[" ++
+            "{\"black_point\":{}},{\"white_balance\":{\"as_shot\":true," ++
+            "\"gain_r\":1,\"gain_g\":1,\"gain_b\":1}},{\"demosaic\":{}}," ++
+            "{\"exposure\":{\"ev\":0}},{\"tone_curve\":{\"contrast\":0}}," ++
+            "{\"srgb_encode\":{}}]}",
+    ));
+    const calibrated_linear = bk_render_linear(engine, 16, &width, &height);
+    try std.testing.expect(calibrated_linear != null);
+    try std.testing.expectEqual(@as(u32, 16), width);
+    try std.testing.expectEqual(@as(u32, 10), height);
+    try std.testing.expectEqual(@as(f32, 1), calibrated_linear.?[3]);
 
     try std.testing.expectEqual(
         null,

@@ -148,6 +148,17 @@ pub fn working_to_linear_srgb(planes: *image.Planes) void {
     apply_matrix(planes, rec2020_to_linear_srgb);
 }
 
+/// Convert ICC's D50 PCS XYZ into Banksia's linear Rec.2020 working space.
+/// Negative finite components are retained for later gamut handling.
+pub fn pcs_xyz_d50_to_working(xyz: [3]f32) [3]f32 {
+    const result = xyz_d50_to_rec2020.vector(xyz);
+    var sanitized: [3]f32 = undefined;
+    for (&sanitized, result) |*target, value| {
+        target.* = sanitize(value);
+    }
+    return sanitized;
+}
+
 const Profile = struct {
     color_1: Mat3,
     color_2: ?Mat3,
@@ -359,6 +370,8 @@ const xyz_d65_to_rec2020 = Mat3{ .values = .{
     -0.6666844, 1.6164812,  0.0157685,
     0.0176399,  -0.0427706, 0.9421031,
 } };
+const pcs_d50_to_d65 = bradford(d50_xy, d65_xy) catch unreachable;
+const xyz_d50_to_rec2020 = xyz_d65_to_rec2020.multiply(pcs_d50_to_d65);
 const rec2020_to_xyz_d65 = Mat3{ .values = .{
     0.6369580, 0.1446169, 0.1688810,
     0.2627002, 0.6779981, 0.0593017,

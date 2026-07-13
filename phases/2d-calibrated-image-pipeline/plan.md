@@ -135,15 +135,15 @@ semantic stages even when they fuse kernels or use different execution plans.
   initially RCD unless corpus evidence favors another method.
 - [x] Preserve bilinear and the current chroma safety filter as diagnostic
   implementations with distinct IDs.
-- [ ] Add green equalization, hot/flagged-pixel cleanup, and bounded row/column
+- [x] Add green equalization, hot/flagged-pixel cleanup, and bounded row/column
   correction before demosaic where calibration supplies parameters.
-- [ ] Make anti-colour-alias strength camera/ISO-aware using the extracted
+- [x] Make anti-colour-alias strength camera/ISO-aware using the extracted
   defaults rather than one global constant.
-- [ ] Add recoverable clipped-channel reconstruction using per-channel white
+- [x] Add recoverable clipped-channel reconstruction using per-channel white
   levels and calibrated headroom.
-- [ ] Cover neutral fine fabric, diagonal lines, zippering, maze detail, colour
+- [x] Cover neutral fine fabric, diagonal lines, zippering, maze detail, colour
   edges, clipped highlights, borders, odd dimensions, and preview reduction.
-- [ ] Select the new reconstruction only after objective and visual corpus gates
+- [x] Select the new reconstruction only after objective and visual corpus gates
   pass; never replace a historical implementation ID in place.
 
 ### 2D.5 Implement nonlinear camera colour profiles
@@ -236,7 +236,7 @@ semantic stages even when they fuse kernels or use different execution plans.
 - [x] Noise interpolation preserves recorded discontinuities.
 - [ ] Lens-node interpolation hits exact stored nodes and remains bounded between
   them.
-- [ ] RAW artefact fixtures cover false colour, moiré, zippering, diagonals,
+- [x] RAW artefact fixtures cover false colour, moiré, zippering, diagonals,
   highlights, defects, deep shadows, and saturated edges.
 - [x] Full 27-file local corpus and committed CI corpus remain green.
 - [ ] CPU/Metal conformance covers every default stage and failure fallback.
@@ -248,7 +248,7 @@ semantic stages even when they fuse kernels or use different execution plans.
 
 - [x] EOS-1D X Mark II and EOS R3 automatically resolve the intended bootstrap
   colour profile, curve, ISO/detail record, and supported lens profile.
-- [ ] The CR3 black/white fine-fabric case remains neutral without broad visible
+- [x] The CR3 black/white fine-fabric case remains neutral without broad visible
   chroma smearing at fit and 100% views.
 - [ ] Initial supported-camera defaults are preferred over the bare matrix in at
   least 60% of 100 randomized blind comparisons, with confidence reported.
@@ -310,10 +310,29 @@ semantic stages even when they fuse kernels or use different execution plans.
   selected image. Session/catalog durability remains explicitly deferred.
 - The whole-frame RCD reference preserves measured CFA samples, reduces mean
   false chroma versus bilinear on an odd-sized neutral fine-weave fixture, and
-  is finite and deterministic on tiny/odd borders. It remains a non-active
-  candidate until the broader diagonal, maze, colour-edge, highlight, preview,
-  and visual corpus gates pass; bilinear and bilinear-plus-chroma-safe retain
-  separate immutable implementation IDs.
+  is finite and deterministic on tiny/odd borders. Objective RGB fixtures now
+  cover diagonals, maze detail, colour edges, and clipped highlights. Engine v3
+  selects the candidate only with an explicit resolved calibration snapshot;
+  engine v2 remains frozen. Calibrated green equalization, CFA-local isolated
+  hot-pixel cleanup, and camera/ISO anti-colour-alias strength have exact off
+  states and bounded tests. No extracted row/column coefficient exists for the
+  two bootstrap cameras, so that conditional correction is an explicit no-op
+  rather than an invented value. Zipper edges, deep shadows, saturated edges,
+  CFA-local defects, and a calibrated preview reduction path complete the
+  synthetic artifact set. Clipped-channel recovery consumes the already
+  normalized per-CFA white levels and the recovered 0.9659363 clip safety point,
+  with engine-v2's historical 0.8 trigger unchanged. Whole-frame v3 admission
+  counts its bounded cleanup/RCD scratch planes, and those planes now use scoped
+  lifetimes instead of accumulating in the frame arena.
+- The reproducible `compare-2d4` tool rendered all eight committed Canon corpus
+  files as legacy-v2/candidate-v3 pairs at edge 1440. Fit and original-resolution
+  review selected v3: the EOS R3 neutral fine fabric no longer has the broad
+  green/magenta cast, emerald fabric retains its intended colour, the 1D X Mark
+  II detail/skin/warm cases remain plausible, and ISO 12800 retains colour under
+  a conservative pre-2D.7 anti-alias cap. The app now requests engine v3 and
+  publishes `graph.banksia.reconstruction.v3` with
+  `banksia.cpu.strict-f32.v3`; engine v2 hashes and implementation IDs remain
+  unchanged and selectable as historical artifacts.
 - Reference machine, OS, build modes, and Capture One oracle version.
 - Corpus and oracle hashes.
 - CPU/GPU conformance report.

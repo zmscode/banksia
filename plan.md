@@ -148,10 +148,15 @@ bounded 4096-edge textures. Full source-pixel inspection will use bounded
 region/tile rendering as the 2D.4 reconstruction path matures.
 
 Edits are now session-scoped to canonical asset identity rather than shared by
-the window. The first whole-frame RCD reference candidate is also implemented:
-its assert-backed neutral-weave and odd-border gates pass, while the active
-historical bilinear/chroma-safe renderer remains unchanged until the complete
-artifact and visual corpus approves an explicit graph migration.
+the window. The whole-frame RCD reference now has assert-backed
+neutral-weave, diagonal, maze, colour-edge, clipped-highlight, and odd-border
+gates. The active calibration-backed engine-v3 graph adds bounded green
+equalization, CFA-local hot-pixel cleanup, and camera/ISO anti-colour-alias
+strength and calibrated per-channel highlight headroom while engine v2 remains
+frozen. Eight reproducible legacy/candidate corpus pairs passed visual review,
+including the EOS R3 neutral fine-fabric case, so the macOS app and C manifest
+now select the immutable v3 reconstruction IDs. Phase 2D continues with the
+separately selectable nonlinear camera colour profile.
 
 ### Foundation Phase 2E — safe sessions and import
 

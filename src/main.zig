@@ -157,16 +157,18 @@ fn calibration_audit_file(
     }
     if (!include_pipeline) return;
     try status(io, "recipe schema: {s}\n", .{emu.render_manifest.recipe_schema_id_current});
-    try status(io, "active graph: {s}\n", .{emu.render_manifest.graph_id_legacy_v2});
+    try status(io, "active graph: {s}\n", .{
+        emu.render_manifest.graph_id_reconstruction_v3,
+    });
     try status(io, "target graph: {s}\n", .{resolved.processing_graph_id.slice()});
     try status(io, "renderer: {s}; backend=strict_cpu; precision=float32\n", .{
-        emu.render_manifest.renderer_id_strict_cpu_v2,
+        emu.render_manifest.renderer_id_strict_cpu_v3,
     });
     try status(io, "first affected stage: {s}; dependency IDs={d}\n", .{
-        emu.render_manifest.calibrated_stages[0].stage_id,
+        emu.render_manifest.reconstruction_stages[0].stage_id,
         dependencies.dependencyCount(),
     });
-    for (emu.render_manifest.calibrated_stages) |stage| {
+    for (emu.render_manifest.reconstruction_stages) |stage| {
         try status(
             io,
             "stage: {s} [{s}] {s}->{s}; impl={s}; neutral={s}; fusion=none\n",
