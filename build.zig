@@ -237,12 +237,24 @@ pub fn build(b: *std.Build) void {
     const run_reconstruction_compare = b.addRunArtifact(reconstruction_compare);
     run_reconstruction_compare.setCwd(b.path("."));
     run_reconstruction_compare.has_side_effects = true;
+    run_reconstruction_compare.addArg("reconstruction");
     if (b.args) |args| run_reconstruction_compare.addArgs(args);
     const reconstruction_compare_step = b.step(
         "compare-2d4",
         "Write v2/v3 Phase 2D.4 visual comparison PNGs",
     );
     reconstruction_compare_step.dependOn(&run_reconstruction_compare.step);
+
+    const run_profile_compare = b.addRunArtifact(reconstruction_compare);
+    run_profile_compare.setCwd(b.path("."));
+    run_profile_compare.has_side_effects = true;
+    run_profile_compare.addArg("profile");
+    if (b.args) |args| run_profile_compare.addArgs(args);
+    const profile_compare_step = b.step(
+        "compare-2d5",
+        "Write matrix/profile Phase 2D.5 visual comparison PNGs",
+    );
+    profile_compare_step.dependOn(&run_profile_compare.step);
 
     // ---- `raw-swarm`: deterministic DNG truncation/mutation parser swarm ----------
     const raw_swarm_emu = emu_module(b, target, .ReleaseSafe, libraw_prefix);

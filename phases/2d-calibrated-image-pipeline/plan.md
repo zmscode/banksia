@@ -148,15 +148,15 @@ semantic stages even when they fuse kernels or use different execution plans.
 
 ### 2D.5 Implement nonlinear camera colour profiles
 
-- [ ] Import ICC input shapers, 33×33×33 `mft2` CLUTs, and output tables into a
+- [x] Import ICC input shapers, 33×33×33 `mft2` CLUTs, and output tables into a
   canonical Banksia profile record.
-- [ ] Implement a strict CPU tetrahedral or trilinear CLUT reference with
+- [x] Implement a strict CPU tetrahedral or trilinear CLUT reference with
   documented Lab/PCS conversion and boundary behavior.
-- [ ] Keep the technical DNG/LibRaw matrix path independently selectable.
-- [ ] Apply the nonlinear camera profile before creative tone and colour tools.
-- [ ] Validate neutral-axis continuity, saturated colours, skin, gradients, LUT
+- [x] Keep the technical DNG/LibRaw matrix path independently selectable.
+- [x] Apply the nonlinear camera profile before creative tone and colour tools.
+- [x] Validate neutral-axis continuity, saturated colours, skin, gradients, LUT
   boundaries, and finite out-of-gamut handling.
-- [ ] Add provisional ProStandard profiles for EOS-1D X Mark II and EOS R3.
+- [x] Add provisional ProStandard profiles for EOS-1D X Mark II and EOS R3.
 
 ### 2D.6 Implement camera film curves and baseline defaults
 
@@ -231,7 +231,7 @@ semantic stages even when they fuse kernels or use different execution plans.
 - [x] Historical engine-v2 manifests remain reproducible.
 - [x] Calibration import is deterministic and canonical.
 - [x] Camera/ISO/lens selection and fallback tables are exhaustive.
-- [ ] Extracted ICC shaper/CLUT known vectors match the source profile evaluator.
+- [x] Extracted ICC shaper/CLUT known vectors match the source profile evaluator.
 - [ ] Film-curve control points and interpolation known vectors match extraction.
 - [x] Noise interpolation preserves recorded discontinuities.
 - [ ] Lens-node interpolation hits exact stored nodes and remains bounded between
@@ -333,6 +333,21 @@ semantic stages even when they fuse kernels or use different execution plans.
   publishes `graph.banksia.reconstruction.v3` with
   `banksia.cpu.strict-f32.v3`; engine v2 hashes and implementation IDs remain
   unchanged and selectable as historical artifacts.
+- The strict ICC reference evaluates the canonical 1025-entry input shapers,
+  33×33×33 `mft2` tetrahedral CLUT, output tables, ICC v2 Lab PCS, D50 XYZ, and
+  linear Rec.2020 conversion. LittleCMS-derived primary, mixed, and skin vectors
+  pass for both bootstrap profiles; neutral axes, saturated CLUT boundaries,
+  gradients, odd-sized uniform fields, and non-finite/out-of-gamut inputs are
+  bounded and deterministic. Engine v4 applies a separately identified,
+  luminance-preserving local-chroma policy before global develop, while engine
+  v3 and an explicit engine-v4 technical-matrix selection remain available.
+  Eight matrix/profile edge-1440 corpus pairs passed visual review after a
+  rejected block-grid approximation was replaced with immutable per-pixel ICC
+  corrections and a bounded five-by-five stabilization pass. The active
+  provisional strength is deliberately conservative at 0.4; changing it
+  requires a new implementation ID. Generic calibration fallback continues to
+  publish the v3 reconstruction/matrix graph, and an explicit nonlinear request
+  without a resolved profile fails rather than silently rendering the matrix.
 - Reference machine, OS, build modes, and Capture One oracle version.
 - Corpus and oracle hashes.
 - CPU/GPU conformance report.

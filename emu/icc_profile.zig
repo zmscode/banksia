@@ -102,6 +102,73 @@ pub const Profile = struct {
         }
     }
 
+    /// Capture One selects its film curve separately from the input profile.
+    /// Preserve the technical matrix's scene luminance here so the ICC A2B0
+    /// transform contributes nonlinear hue/chroma without silently becoming a
+    /// second tone curve. Native DNG matrices already incorporate white-point
+    /// adaptation, whereas LibRaw matrices consume balanced camera channels.
+    pub fn applyPreservingTechnicalLuminance(
+        profile: Profile,
+        scratch_gpa: std.mem.Allocator,
+        planes: *image.Planes,
+        technical: color.Transform,
+        white_balance_gains: ?[3]f32,
+    ) std.mem.Allocator.Error!void {
+        assert(planes.r.len == planes.g.len);
+        assert(planes.r.len == planes.b.len);
+        assert(planes.r.len == @as(usize, planes.width) * planes.height);
+        const corrections = try scratch_gpa.alloc(f32, planes.r.len * 3);
+        defer scratch_gpa.free(corrections);
+        const correction_r = corrections[0..planes.r.len];
+        const correction_g = corrections[planes.r.len .. planes.r.len * 2];
+        const correction_b = corrections[planes.r.len * 2 ..];
+
+        for (planes.r, planes.g, planes.b, 0..) |red, green, blue, index| {
+            const camera_rgb = [3]f32{ red, green, blue };
+            const reference = technicalReference(technical, white_balance_gains, camera_rgb);
+            const mapped = profile.evaluateWorking(camera_rgb);
+            const profiled = preserveLuminance(
+                reference,
+                mapped,
+                color.working_luminance(reference),
+                color.working_luminance(mapped),
+            );
+            correction_r[index] = profiled[0] - reference[0];
+            correction_g[index] = profiled[1] - reference[1];
+            correction_b[index] = profiled[2] - reference[2];
+        }
+
+        for (planes.r, planes.g, planes.b, 0..) |*red, *green, *blue, index| {
+            const reference = technicalReference(
+                technical,
+                white_balance_gains,
+                .{ red.*, green.*, blue.* },
+            );
+            const correction = localCorrection(
+                .{ correction_r, correction_g, correction_b },
+                planes.width,
+                planes.height,
+                index,
+            );
+            const strength = neutralProtectedStrength(reference) *
+                profile_correction_strength;
+            const candidate = [3]f32{
+                reference[0] + correction[0] * strength,
+                reference[1] + correction[1] * strength,
+                reference[2] + correction[2] * strength,
+            };
+            const result = preserveLuminance(
+                reference,
+                candidate,
+                color.working_luminance(reference),
+                color.working_luminance(candidate),
+            );
+            red.* = finiteOr(result[0], reference[0]);
+            green.* = finiteOr(result[1], reference[1]);
+            blue.* = finiteOr(result[2], reference[2]);
+        }
+    }
+
     fn tetrahedral(profile: Profile, coordinate: [3]f32) [3]f32 {
         const grid: usize = profile.mft2.grid_points;
         var lower: [3]usize = undefined;
@@ -194,6 +261,98 @@ pub const Profile = struct {
     }
 };
 
+fn technicalReference(
+    technical: color.Transform,
+    white_balance_gains: ?[3]f32,
+    balanced: [3]f32,
+) [3]f32 {
+    var technical_input = balanced;
+    if (!technical.apply_as_shot_white_balance) {
+        if (white_balance_gains) |gains| {
+            for (&technical_input, gains) |*value, gain| {
+                assert(gain > 0);
+                assert(std.math.isFinite(gain));
+                value.* /= gain;
+            }
+        }
+    }
+    return technical.camera_to_rec2020.vector(technical_input);
+}
+
+/// The bootstrap profiles were recovered as behavioral oracles, not tuned as
+/// final Banksia defaults. A conservative chroma fraction keeps their useful
+/// hue separation without magnifying residual reconstruction chroma; changing
+/// this value requires a new immutable implementation ID.
+const profile_correction_strength: f32 = 0.4;
+
+comptime {
+    assert(profile_correction_strength > 0);
+    assert(profile_correction_strength <= 1);
+}
+
+fn localCorrection(
+    corrections: [3][]const f32,
+    width: u32,
+    height: u32,
+    center_index: usize,
+) [3]f32 {
+    assert(center_index < corrections[0].len);
+    assert(corrections[0].len == corrections[1].len);
+    assert(corrections[0].len == corrections[2].len);
+    assert(corrections[0].len == @as(usize, width) * height);
+    const center_x: u32 = @intCast(center_index % width);
+    const center_y: u32 = @intCast(center_index / width);
+    const x_start = center_x -| 2;
+    const y_start = center_y -| 2;
+    const x_end = @min(center_x + 2, width - 1);
+    const y_end = @min(center_y + 2, height - 1);
+    var sum: [3]f32 = @splat(0);
+    var count: u8 = 0;
+    for (y_start..y_end + 1) |y| {
+        for (x_start..x_end + 1) |x| {
+            const index = y * @as(usize, width) + x;
+            for (&sum, corrections) |*value, channel| value.* += channel[index];
+            count += 1;
+        }
+    }
+    assert(count > 0);
+    assert(count <= 25);
+    const scale = 1 / @as(f32, @floatFromInt(count));
+    return .{ sum[0] * scale, sum[1] * scale, sum[2] * scale };
+}
+
+fn finiteOr(value: f32, fallback: f32) f32 {
+    return if (std.math.isFinite(value)) value else fallback;
+}
+
+fn neutralProtectedStrength(reference: [3]f32) f32 {
+    const channel_max = @max(reference[0], @max(reference[1], reference[2]));
+    const channel_min = @min(reference[0], @min(reference[1], reference[2]));
+    const luminance = @max(@abs(color.working_luminance(reference)), 0.02);
+    const chroma = @max(0, channel_max - channel_min) / luminance;
+    const position = std.math.clamp((chroma - 0.04) / 0.14, 0, 1);
+    return position * position * (3 - 2 * position);
+}
+
+fn preserveLuminance(
+    reference: [3]f32,
+    mapped: [3]f32,
+    reference_y: f32,
+    mapped_y: f32,
+) [3]f32 {
+    if (!std.math.isFinite(reference_y)) return @splat(0);
+    if (!std.math.isFinite(mapped_y)) return reference;
+    if (mapped_y <= 1e-7) return reference;
+    const scale = reference_y / mapped_y;
+    if (!std.math.isFinite(scale)) return reference;
+    var result: [3]f32 = undefined;
+    for (&result, mapped, reference) |*target, value, fallback| {
+        const scaled = value * scale;
+        target.* = if (std.math.isFinite(scaled)) scaled else fallback;
+    }
+    return result;
+}
+
 fn tetraMix(
     first: [3]f32,
     second: [3]f32,
@@ -277,6 +436,7 @@ test "both bootstrap profiles match canonical dimensions and LittleCMS vectors" 
         green: Lab,
         blue: Lab,
         mixed: Lab,
+        skin: Lab,
     }{
         .{
             .id = "profile.capture-one.CanonEOS1DX2-ProStandard.v1",
@@ -284,6 +444,7 @@ test "both bootstrap profiles match canonical dimensions and LittleCMS vectors" 
             .green = .{ .l = 84.7626, .a = -128, .b = 100.8711 },
             .blue = .{ .l = 29.2662, .a = 110.3750, .b = -128 },
             .mixed = .{ .l = 56.9547, .a = -7.6289, .b = -69.8242 },
+            .skin = .{ .l = 63.0025, .a = 35.6758, .b = 35.7774 },
         },
         .{
             .id = "profile.capture-one.CanonEOSR3-ProStandard.v1",
@@ -291,6 +452,7 @@ test "both bootstrap profiles match canonical dimensions and LittleCMS vectors" 
             .green = .{ .l = 84.7626, .a = -128, .b = 99.1133 },
             .blue = .{ .l = 27.5781, .a = 109.8984, .b = -128 },
             .mixed = .{ .l = 55.7782, .a = -10.6523, .b = -61.7734 },
+            .skin = .{ .l = 63.0025, .a = 34.3164, .b = 34.3789 },
         },
     };
     for (cases) |case| {
@@ -304,6 +466,10 @@ test "both bootstrap profiles match canonical dimensions and LittleCMS vectors" 
         try expectLab(
             case.mixed,
             profile.evaluateLab(.{ 64.0 / 255.0, 128.0 / 255.0, 192.0 / 255.0 }),
+        );
+        try expectLab(
+            case.skin,
+            profile.evaluateLab(.{ 179.0 / 255.0, 115.0 / 255.0, 89.0 / 255.0 }),
         );
     }
 }
@@ -336,6 +502,95 @@ test "profile boundaries gradients and out of gamut inputs stay finite" {
             try std.testing.expect(std.math.isFinite(value));
         }
     }
+
+    // Traverse all CLUT cell boundaries along saturated device-space edges.
+    // Adjacent samples must remain finite and locally continuous.
+    for ([_][3]f32{
+        .{ 1, 0, 0 },
+        .{ 0, 1, 0 },
+        .{ 0, 0, 1 },
+    }) |axis| {
+        var previous = profile.evaluateLab(.{ 0, 0, 0 });
+        for (1..1025) |index| {
+            const amount = @as(f32, @floatFromInt(index)) / 1024;
+            const current = profile.evaluateLab(.{
+                axis[0] * amount,
+                axis[1] * amount,
+                axis[2] * amount,
+            });
+            try std.testing.expect(labDistance(previous, current) < 2);
+            previous = current;
+        }
+    }
+}
+
+test "neutral protection is smooth bounded and rejects isolated chroma" {
+    try std.testing.expectEqual(@as(f32, 0), neutralProtectedStrength(.{ 0.5, 0.5, 0.5 }));
+    try std.testing.expectEqual(@as(f32, 1), neutralProtectedStrength(.{ 0.8, 0.1, 0.1 }));
+
+    var previous: f32 = 0;
+    for (0..101) |index| {
+        const chroma = @as(f32, @floatFromInt(index)) / 100;
+        const strength = neutralProtectedStrength(.{ 0.5 + chroma * 0.2, 0.5, 0.5 });
+        try std.testing.expect(strength >= previous);
+        try std.testing.expect(strength >= 0);
+        try std.testing.expect(strength <= 1);
+        previous = strength;
+    }
+}
+
+test "active profile application preserves neutral and uniform-field continuity" {
+    const gpa = std.testing.allocator;
+    var database = try calibration.Database.open(calibration.database_path_default);
+    defer database.deinit();
+    var mft2 = try database.loadMft2(
+        gpa,
+        "profile.capture-one.CanonEOSR3-ProStandard.v1",
+    );
+    defer mft2.deinit(gpa);
+    const profile = try Profile.init(&mft2);
+    var planes = try image.Planes.init(gpa, 7, 5);
+    defer planes.deinit(gpa);
+    const technical = color.Transform{
+        .camera_to_rec2020 = .identity,
+        .apply_as_shot_white_balance = false,
+    };
+
+    @memset(planes.r, 0.5);
+    @memset(planes.g, 0.5);
+    @memset(planes.b, 0.5);
+    try profile.applyPreservingTechnicalLuminance(gpa, &planes, technical, null);
+    for (planes.r, planes.g, planes.b) |red, green, blue| {
+        try std.testing.expectEqual(@as(f32, 0.5), red);
+        try std.testing.expectEqual(@as(f32, 0.5), green);
+        try std.testing.expectEqual(@as(f32, 0.5), blue);
+    }
+
+    @memset(planes.r, 0.8);
+    @memset(planes.g, 0.2);
+    @memset(planes.b, 0.1);
+    try profile.applyPreservingTechnicalLuminance(gpa, &planes, technical, null);
+    const expected = [3]f32{ planes.r[0], planes.g[0], planes.b[0] };
+    for (planes.r, planes.g, planes.b) |red, green, blue| {
+        try std.testing.expectApproxEqAbs(expected[0], red, 1e-6);
+        try std.testing.expectApproxEqAbs(expected[1], green, 1e-6);
+        try std.testing.expectApproxEqAbs(expected[2], blue, 1e-6);
+        try std.testing.expect(std.math.isFinite(red));
+        try std.testing.expect(std.math.isFinite(green));
+        try std.testing.expect(std.math.isFinite(blue));
+    }
+    try std.testing.expectApproxEqAbs(
+        color.working_luminance(.{ 0.8, 0.2, 0.1 }),
+        color.working_luminance(expected),
+        1e-6,
+    );
+}
+
+fn labDistance(first: Lab, second: Lab) f32 {
+    const delta_l = second.l - first.l;
+    const delta_a = second.a - first.a;
+    const delta_b = second.b - first.b;
+    return @sqrt(delta_l * delta_l + delta_a * delta_a + delta_b * delta_b);
 }
 
 fn expectLab(expected: Lab, actual: Lab) !void {

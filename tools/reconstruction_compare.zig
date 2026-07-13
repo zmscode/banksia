@@ -1,4 +1,4 @@
-//! Produce bounded v2/v3 corpus pairs for the Phase 2D.4 visual gate.
+//! Produce bounded reconstruction or camera-profile corpus pairs.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -10,6 +10,11 @@ const file_bytes_max = std.Io.Limit.limited(64 * 1024 * 1024);
 const Case = struct {
     id: []const u8,
     path: []const u8,
+};
+
+const Mode = enum {
+    reconstruction,
+    profile,
 };
 
 const cases = [_]Case{
@@ -26,15 +31,18 @@ const cases = [_]Case{
 pub fn main(init: std.process.Init) !void {
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next();
+    const mode_text = args.next() orelse return error.MissingMode;
+    const mode = std.meta.stringToEnum(Mode, mode_text) orelse return error.InvalidMode;
     const output_directory = args.next() orelse return error.MissingOutputDirectory;
     if (args.next() != null) return error.TooManyArguments;
 
     var database = try emu.calibration.Database.open(emu.calibration.database_path_default);
     defer database.deinit();
     for (cases) |case| {
-        try compareCase(init.gpa, init.io, &database, output_directory, case);
+        try compareCase(init.gpa, init.io, &database, output_directory, mode, case);
     }
-    std.debug.print("2d4-compare: {d} visual pairs written to {s}\n", .{
+    std.debug.print("{s}-compare: {d} visual pairs written to {s}\n", .{
+        @tagName(mode),
         cases.len,
         output_directory,
     });
@@ -45,6 +53,7 @@ fn compareCase(
     io: std.Io,
     database: *emu.calibration.Database,
     output_directory: []const u8,
+    mode: Mode,
     case: Case,
 ) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, case.path, gpa, file_bytes_max);
@@ -54,22 +63,39 @@ fn compareCase(
     const resolved = try database.resolve(&raw.metadata, .{});
     const reconstruction = try emu.reconstruction.defaults(&resolved);
 
-    var legacy = try emu.pipeline.render_decoded(
-        gpa,
-        &raw,
-        .{ .engine_version = 2, .ops = &emu.recipe.default_ops },
-        .{ .edge_px_max_out = edge_px_max_out },
-    );
+    const left_recipe = emu.pipeline.Recipe{
+        .engine_version = if (mode == .reconstruction) 2 else 3,
+        .ops = &emu.recipe.default_ops,
+    };
+    var legacy = try emu.pipeline.render_decoded(gpa, &raw, left_recipe, .{
+        .edge_px_max_out = edge_px_max_out,
+        .reconstruction = if (mode == .reconstruction) .legacy else reconstruction,
+    });
     defer legacy.deinit(gpa);
-    var candidate = try emu.pipeline.render_decoded(
-        gpa,
-        &raw,
-        .{ .engine_version = 3, .ops = &emu.recipe.default_ops },
-        .{ .edge_px_max_out = edge_px_max_out, .reconstruction = reconstruction },
-    );
+    const legacy_snapshot = try gpa.dupe(u8, legacy.rgba);
+    defer gpa.free(legacy_snapshot);
+    var mft2 = if (mode == .profile)
+        try loadProfile(database, gpa, &resolved)
+    else
+        null;
+    defer if (mft2) |*profile| profile.deinit(gpa);
+    const camera_profile = if (mft2) |*record|
+        emu.pipeline.CameraProfile{ .nonlinear = try emu.icc_profile.Profile.init(record) }
+    else
+        emu.pipeline.CameraProfile.technical_matrix;
+    var candidate = try emu.pipeline.render_decoded(gpa, &raw, .{
+        .engine_version = if (mode == .reconstruction) 3 else 4,
+        .camera_profile = if (mode == .profile) .resolved_nonlinear else .technical_matrix,
+        .ops = &emu.recipe.default_ops,
+    }, .{
+        .edge_px_max_out = edge_px_max_out,
+        .reconstruction = reconstruction,
+        .camera_profile = camera_profile,
+    });
     defer candidate.deinit(gpa);
     assert(legacy.width == candidate.width);
     assert(legacy.height == candidate.height);
+    assert(std.mem.eql(u8, legacy_snapshot, legacy.rgba));
 
     const pair_width = legacy.width * 2;
     const pair = try gpa.alloc(u8, @as(usize, pair_width) * legacy.height * 4);
@@ -98,14 +124,31 @@ fn compareCase(
     defer gpa.free(png);
     const output_path = try std.fmt.allocPrint(
         gpa,
-        "{s}/{s}-v2-left-v3-right.png",
-        .{ output_directory, case.id },
+        "{s}/{s}-{s}.png",
+        .{
+            output_directory,
+            case.id,
+            if (mode == .reconstruction) "v2-left-v3-right" else "matrix-left-profile-right",
+        },
     );
     defer gpa.free(output_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = png });
-    std.debug.print("2d4-compare: {s} mean_abs={d:.3} max={d}\n", .{
+    std.debug.print("{s}-compare: {s} mean_abs={d:.3} max={d}\n", .{
+        @tagName(mode),
         case.id,
         difference_mean,
         difference_max,
     });
+}
+
+fn loadProfile(
+    database: *emu.calibration.Database,
+    gpa: std.mem.Allocator,
+    resolved: *const emu.calibration.ResolvedCalibration,
+) !emu.calibration.Mft2 {
+    const profile_id = switch (resolved.camera) {
+        .resolved => |camera| camera.input_profile_id.slice(),
+        .generic_fallback => return error.ProfileUnavailable,
+    };
+    return database.loadMft2(gpa, profile_id);
 }

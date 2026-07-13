@@ -18,6 +18,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const builtin = @import("builtin");
+const calibration = @import("calibration.zig");
 const color = @import("color.zig");
 const dng = @import("dng.zig");
 const geometry = @import("geometry.zig");
@@ -29,7 +30,7 @@ const image = @import("image.zig");
 const verify = builtin.mode == .Debug;
 
 pub const engine_version_current: u32 = 1;
-pub const engine_version_latest: u32 = 3;
+pub const engine_version_latest: u32 = 4;
 /// Recovered Capture One 16.7.3 clipping-recovery safety point, expressed as a
 /// fraction of the per-channel sensor clip after CFA-site normalization.
 pub const highlight_recovery_start_bootstrap: f32 = 0.9659363;
@@ -74,7 +75,13 @@ pub const SrgbEncode = struct {};
 
 pub const Recipe = struct {
     engine_version: u32 = engine_version_current,
+    camera_profile: CameraProfileSelection = .technical_matrix,
     ops: []const Op,
+};
+
+pub const CameraProfileSelection = enum {
+    technical_matrix,
+    resolved_nonlinear,
 };
 
 pub const Cancellation = struct {
@@ -197,7 +204,7 @@ pub fn render_decoded(
             render(gpa, &raw.sensor, recipe, options)
         else
             error.UnsupportedSensor,
-        2, 3 => {
+        2, 3, 4 => {
             const dimensions = geometry.Transform.init(raw.metadata).output_dimensions();
             const longest = @max(dimensions.width, dimensions.height);
             const ratio = if (options.edge_px_max_out == 0)
@@ -224,7 +231,7 @@ pub fn render_linear_decoded(
     recipe: Recipe,
     options: RenderOptions,
 ) RenderError!LinearRendered {
-    if (recipe.engine_version != 2 and recipe.engine_version != 3) {
+    if (recipe.engine_version < 2 or recipe.engine_version > engine_version_latest) {
         return error.UnsupportedEngineVersion;
     }
     options.reconstruction.assertValid();
@@ -279,10 +286,11 @@ fn render_linear_memory_bytes_max_internal(
     const output_pixels = @as(u64, width_out) * height_out;
     const input_channels: u64 = if (raw.linear == null) 1 else 3;
     const cfa_bytes = (raw_pixels + work_pixels) * @sizeOf(u16) * input_channels;
-    // Legacy peak: mosaic + RGB planes + three chroma-filter scratch planes.
-    // Calibrated v3's larger peak is mosaic + RGB planes + four RCD scratch
-    // planes. Cleanup, RCD, and chroma scratch are scoped to their kernels, so
-    // admission models concurrent memory rather than summing old lifetimes.
+    // Legacy/profile peak: mosaic + RGB planes + three chroma/profile scratch
+    // planes. Calibrated v3/v4's larger peak is mosaic + RGB planes + four RCD
+    // scratch planes. Cleanup, RCD, chroma, and profile scratch are scoped to
+    // their kernels, so admission models concurrent memory rather than summing
+    // old lifetimes.
     const early_channels: u64 = if (calibrated_reconstruction) 8 else 7;
     const early_stage_bytes = work_pixels * @sizeOf(f32) * early_channels;
     const output_stage_bytes = output_pixels * 72;
@@ -720,6 +728,10 @@ fn render_internal(
     if (recipe.engine_version < 3) {
         assert(std.meta.activeTag(options.camera_profile) == .technical_matrix);
     }
+    if (std.meta.activeTag(options.camera_profile) == .nonlinear) {
+        assert(recipe.engine_version >= 4);
+        assert(recipe.camera_profile == .resolved_nonlinear);
+    }
 
     // The op stack is struct-of-arrays: validation walks the tag column
     // without touching a single payload.
@@ -813,6 +825,10 @@ fn render_linear_internal(
     if (recipe.engine_version < 3) assert(!options.reconstruction.enabled);
     if (recipe.engine_version < 3) {
         assert(std.meta.activeTag(options.camera_profile) == .technical_matrix);
+    }
+    if (std.meta.activeTag(options.camera_profile) == .nonlinear) {
+        assert(recipe.engine_version >= 4);
+        assert(recipe.camera_profile == .resolved_nonlinear);
     }
 
     var ops: std.MultiArrayList(Op) = .empty;
@@ -1093,7 +1109,12 @@ fn op_apply(
                 }
                 switch (camera_profile) {
                     .technical_matrix => value.camera_to_working(planes),
-                    .nonlinear => |profile| profile.apply(planes),
+                    .nonlinear => |profile| try profile.applyPreservingTechnicalLuminance(
+                        scratch_gpa,
+                        planes,
+                        value,
+                        applied_wb_gains.*,
+                    ),
                 }
             }
         },
@@ -3124,8 +3145,96 @@ test "stack validation rejects malformed recipes (negative space)" {
         render_decoded(
             gpa,
             &raw,
-            .{ .engine_version = 4, .ops = &test_ops_default },
+            .{ .engine_version = 5, .ops = &test_ops_default },
             .{},
         ),
     );
+}
+
+test "engine v4 profile is selectable and precedes creative late develop" {
+    const gpa = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "tests/corpus/phase2b/canon-r3-emerald-fabric.dng",
+        gpa,
+        std.Io.Limit.limited(64 * 1024 * 1024),
+    );
+    defer gpa.free(bytes);
+    var raw = try dng.decode_raw(gpa, bytes);
+    defer raw.deinit(gpa);
+    var database = try calibration.Database.open(calibration.database_path_default);
+    defer database.deinit();
+    var mft2 = try database.loadMft2(
+        gpa,
+        "profile.capture-one.CanonEOSR3-ProStandard.v1",
+    );
+    defer mft2.deinit(gpa);
+    const profile = try icc_profile.Profile.init(&mft2);
+    const reconstruction = ReconstructionDefaults{
+        .enabled = true,
+        .adaptive_green_enabled = true,
+        .hot_pixel_cleanup_amount = 0,
+        .anti_color_aliasing_strength = 1,
+        .highlight_recovery_start = highlight_recovery_start_bootstrap,
+    };
+    const profile_recipe = Recipe{
+        .engine_version = 4,
+        .camera_profile = .resolved_nonlinear,
+        .ops = &test_ops_default,
+    };
+    var profiled = try render_linear_decoded(gpa, &raw, profile_recipe, .{
+        .edge_px_max_out = 64,
+        .reconstruction = reconstruction,
+        .camera_profile = .{ .nonlinear = profile },
+    });
+    defer profiled.deinit(gpa);
+    var matrix = try render_linear_decoded(gpa, &raw, .{
+        .engine_version = 4,
+        .camera_profile = .technical_matrix,
+        .ops = &test_ops_default,
+    }, .{
+        .edge_px_max_out = 64,
+        .reconstruction = reconstruction,
+        .camera_profile = .technical_matrix,
+    });
+    defer matrix.deinit(gpa);
+    try std.testing.expect(!std.mem.eql(f32, profiled.rgba, matrix.rgba));
+
+    const late_ops = [_]Op{
+        .{ .black_point = .{} },
+        .{ .white_balance = .{} },
+        .{ .demosaic = .{} },
+        .{ .exposure = .{ .ev = 0.75 } },
+        .{ .tone_curve = .{ .contrast = 0.4 } },
+        .{ .srgb_encode = .{} },
+    };
+    var retained_after_late_edit = try render_linear_decoded(gpa, &raw, .{
+        .engine_version = 4,
+        .camera_profile = .resolved_nonlinear,
+        .ops = &late_ops,
+    }, .{
+        .edge_px_max_out = 64,
+        .reconstruction = reconstruction,
+        .camera_profile = .{ .nonlinear = profile },
+    });
+    defer retained_after_late_edit.deinit(gpa);
+    try std.testing.expectEqualSlices(f32, profiled.rgba, retained_after_late_edit.rgba);
+
+    var developed = try render_decoded(gpa, &raw, .{
+        .engine_version = 4,
+        .camera_profile = .resolved_nonlinear,
+        .ops = &late_ops,
+    }, .{
+        .edge_px_max_out = 64,
+        .reconstruction = reconstruction,
+        .camera_profile = .{ .nonlinear = profile },
+    });
+    defer developed.deinit(gpa);
+    var neutral = try render_decoded(gpa, &raw, profile_recipe, .{
+        .edge_px_max_out = 64,
+        .reconstruction = reconstruction,
+        .camera_profile = .{ .nonlinear = profile },
+    });
+    defer neutral.deinit(gpa);
+    try std.testing.expect(!std.mem.eql(u8, developed.rgba, neutral.rgba));
 }

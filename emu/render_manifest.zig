@@ -12,9 +12,11 @@ const dng = @import("dng.zig");
 pub const recipe_schema_id_current = "recipe.banksia.global.v2";
 pub const graph_id_legacy_v2 = "graph.banksia.matrix.v2";
 pub const graph_id_reconstruction_v3 = "graph.banksia.reconstruction.v3";
+pub const graph_id_profiled_v4 = "graph.banksia.profiled.v4";
 pub const graph_id_calibrated_v1 = "graph.banksia.calibrated.v1";
 pub const renderer_id_strict_cpu_v2 = "banksia.cpu.strict-f32.v2";
 pub const renderer_id_strict_cpu_v3 = "banksia.cpu.strict-f32.v3";
+pub const renderer_id_strict_cpu_v4 = "banksia.cpu.strict-f32.v4";
 pub const renderer_id_metal_late_v1 = "banksia.metal.late-develop-f32.v1";
 pub const demosaic_id_bilinear_v1 = "banksia.demosaic.bilinear.v1";
 pub const demosaic_id_bilinear_chroma_safe_v2 =
@@ -27,6 +29,7 @@ comptime {
     assert(iso_dependency_count_max >= 2 * 10);
     assert(calibrated_stages.len > legacy_stages.len);
     assert(reconstruction_stages.len > legacy_stages.len);
+    assert(profiled_stages.len == reconstruction_stages.len);
 }
 
 pub const Domain = enum {
@@ -174,6 +177,24 @@ pub const reconstruction_stages = [_]Stage{
     },
 };
 
+pub const profiled_stages = [_]Stage{
+    reconstruction_stages[0],
+    reconstruction_stages[1],
+    reconstruction_stages[2],
+    reconstruction_stages[3],
+    reconstruction_stages[4],
+    .{
+        .stage_id = "camera-profile",
+        .implementation_id = "banksia.color.icc-mft2-local-chroma.v1",
+        .input = .camera_rgb,
+        .output = .profiled_working_rgb,
+        .neutral = .always_on_technical,
+        .status = .active,
+    },
+    reconstruction_stages[6],
+    reconstruction_stages[7],
+};
+
 pub const calibrated_stages = [_]Stage{
     .{
         .stage_id = "normalize",
@@ -275,6 +296,12 @@ pub const graph_reconstruction_v3 = Graph{
     .graph_id = graph_id_reconstruction_v3,
     .recipe_schema_id = recipe_schema_id_current,
     .stages = &reconstruction_stages,
+};
+
+pub const graph_profiled_v4 = Graph{
+    .graph_id = graph_id_profiled_v4,
+    .recipe_schema_id = recipe_schema_id_current,
+    .stages = &profiled_stages,
 };
 
 pub const graph_calibrated_v1 = Graph{
@@ -465,6 +492,26 @@ test "calibrated graph domains form one legal ordered chain" {
     try std.testing.expectEqual(
         Domain.display_output_rgb,
         calibrated_stages[calibrated_stages.len - 1].output,
+    );
+}
+
+test "profiled graph forms a legal chain with colour before creative develop" {
+    try std.testing.expectEqual(Domain.sensor_cfa, profiled_stages[0].input);
+    var profile_index: ?usize = null;
+    var develop_index: ?usize = null;
+    for (profiled_stages, 0..) |stage, index| {
+        if (index > 0) {
+            try std.testing.expectEqual(profiled_stages[index - 1].output, stage.input);
+        }
+        if (std.mem.eql(u8, stage.stage_id, "camera-profile")) profile_index = index;
+        if (std.mem.eql(u8, stage.stage_id, "global-develop")) develop_index = index;
+    }
+    try std.testing.expect(profile_index != null);
+    try std.testing.expect(develop_index != null);
+    try std.testing.expect(profile_index.? < develop_index.?);
+    try std.testing.expectEqual(
+        Domain.display_output_rgb,
+        profiled_stages[profiled_stages.len - 1].output,
     );
 }
 

@@ -28,8 +28,13 @@ pub fn parse(
     gpa: std.mem.Allocator,
     bytes: []const u8,
 ) !std.json.Parsed(pipeline.Recipe) {
-    const parsed = try std.json.parseFromSlice(pipeline.Recipe, gpa, bytes, .{});
-    errdefer comptime unreachable;
+    var parsed = try std.json.parseFromSlice(pipeline.Recipe, gpa, bytes, .{});
+    errdefer parsed.deinit();
+    if (parsed.value.engine_version < 4 and
+        parsed.value.camera_profile != .technical_matrix)
+    {
+        return error.InvalidCameraProfileSelection;
+    }
     assert(parsed.value.ops.len <= pipeline.ops_max or true); // length gated in render
     return parsed;
 }
@@ -37,11 +42,17 @@ pub fn parse(
 /// The canonical byte form. `serialize(parse(serialize(x))) == serialize(x)`
 /// — the roundtrip test below is the pair assertion for this property.
 pub fn serialize_canonical(gpa: std.mem.Allocator, recipe: pipeline.Recipe) ![]u8 {
+    if (recipe.engine_version < 4) assert(recipe.camera_profile == .technical_matrix);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
 
     try out.appendSlice(gpa, "{\"engine_version\":");
     try append_u32(gpa, &out, recipe.engine_version);
+    if (recipe.engine_version >= 4) {
+        try out.appendSlice(gpa, ",\"camera_profile\":\"");
+        try out.appendSlice(gpa, @tagName(recipe.camera_profile));
+        try out.append(gpa, '"');
+    }
     try out.appendSlice(gpa, ",\"ops\":[");
     for (recipe.ops, 0..) |op, i| {
         if (i > 0) try out.append(gpa, ',');
@@ -128,6 +139,40 @@ test "parse/serialize roundtrip is byte-stable (pair assertion)" {
     defer gpa.free(second);
 
     try std.testing.expectEqualStrings(first, second);
+}
+
+test "engine v4 canonical recipe preserves the camera profile selection" {
+    const gpa = std.testing.allocator;
+    const recipe = pipeline.Recipe{
+        .engine_version = 4,
+        .camera_profile = .resolved_nonlinear,
+        .ops = &default_ops,
+    };
+    const first = try serialize_canonical(gpa, recipe);
+    defer gpa.free(first);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        first,
+        "\"camera_profile\":\"resolved_nonlinear\"",
+    ) != null);
+    var parsed = try parse(gpa, first);
+    defer parsed.deinit();
+    try std.testing.expectEqual(
+        pipeline.CameraProfileSelection.resolved_nonlinear,
+        parsed.value.camera_profile,
+    );
+    const second = try serialize_canonical(gpa, parsed.value);
+    defer gpa.free(second);
+    try std.testing.expectEqualStrings(first, second);
+}
+
+test "nonlinear profile selection is rejected before engine v4" {
+    const text =
+        "{\"engine_version\":3,\"camera_profile\":\"resolved_nonlinear\",\"ops\":[]}";
+    try std.testing.expectError(
+        error.InvalidCameraProfileSelection,
+        parse(std.testing.allocator, text),
+    );
 }
 
 test "unknown fields and malformed JSON are rejected (negative space)" {

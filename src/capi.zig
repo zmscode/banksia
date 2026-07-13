@@ -208,13 +208,18 @@ pub export fn bk_pipeline_manifest_json(
     engine.input_profile = input_profile;
     engine.resolved_calibration = resolved;
     const dependencies = emu.render_manifest.DependencyManifest.init(&resolved);
+    const profile_active = input_profile != null;
+    const active_stages = if (profile_active)
+        emu.render_manifest.profiled_stages
+    else
+        emu.render_manifest.reconstruction_stages;
 
     var iso_record_ids: [20][]const u8 = @splat("");
     for (dependencies.isoRecordIds(), 0..) |*record_id, index| {
         iso_record_ids[index] = record_id.slice();
     }
-    var stages: [emu.render_manifest.reconstruction_stages.len]PipelineStageJSON = undefined;
-    for (&stages, emu.render_manifest.reconstruction_stages) |*target, stage| {
+    var stages: [emu.render_manifest.profiled_stages.len]PipelineStageJSON = undefined;
+    for (&stages, active_stages) |*target, stage| {
         target.* = .{
             .stage_id = stage.stage_id,
             .implementation_id = stage.implementation_id,
@@ -226,9 +231,15 @@ pub export fn bk_pipeline_manifest_json(
     }
     const view = PipelineManifestJSON{
         .recipe_schema_id = emu.render_manifest.recipe_schema_id_current,
-        .active_graph_id = emu.render_manifest.graph_id_reconstruction_v3,
+        .active_graph_id = if (profile_active)
+            emu.render_manifest.graph_id_profiled_v4
+        else
+            emu.render_manifest.graph_id_reconstruction_v3,
         .target_graph_id = resolved.processing_graph_id.slice(),
-        .renderer_id = emu.render_manifest.renderer_id_strict_cpu_v3,
+        .renderer_id = if (profile_active)
+            emu.render_manifest.renderer_id_strict_cpu_v4
+        else
+            emu.render_manifest.renderer_id_strict_cpu_v3,
         .backend_id = "strict_cpu",
         .precision_id = "float32",
         .resolution_state = @tagName(resolved.state),
@@ -241,7 +252,7 @@ pub export fn bk_pipeline_manifest_json(
         .input_profile_id = optionalTextSlice(&dependencies.input_profile_id),
         .film_curve_id = optionalTextSlice(&dependencies.film_curve_id),
         .lens_profile_id = optionalTextSlice(&dependencies.lens_profile_id),
-        .first_affected_stage_id = emu.render_manifest.reconstruction_stages[0].stage_id,
+        .first_affected_stage_id = active_stages[0].stage_id,
         .stages = &stages,
     };
 
@@ -313,7 +324,7 @@ pub export fn bk_render(
     // shell can show an image before its first slider moves.
     const recipe = renderRecipe(engine);
     const reconstruction = reconstructionDefaults(engine, recipe) orelse {
-        _ = fail(engine, err_render, "engine v3 requires resolved calibration", .{});
+        _ = fail(engine, err_render, "calibrated reconstruction requires resolution", .{});
         return null;
     };
     const camera_profile = cameraProfile(engine, recipe) orelse {
@@ -403,7 +414,7 @@ fn render_linear_with_admission(
 
     const recipe = renderRecipe(engine);
     const reconstruction = reconstructionDefaults(engine, recipe) orelse {
-        _ = fail(engine, err_render, "engine v3 requires resolved calibration", .{});
+        _ = fail(engine, err_render, "calibrated reconstruction requires resolution", .{});
         return null;
     };
     const camera_profile = cameraProfile(engine, recipe) orelse {
@@ -446,7 +457,8 @@ fn reconstructionDefaults(
     engine: *const Engine,
     recipe: emu.pipeline.Recipe,
 ) ?emu.pipeline.ReconstructionDefaults {
-    if (recipe.engine_version != 3) return .legacy;
+    if (recipe.engine_version < 3) return .legacy;
+    if (recipe.engine_version > emu.pipeline.engine_version_latest) return null;
     const resolved = engine.resolved_calibration orelse return null;
     return emu.reconstruction.defaults(&resolved) catch null;
 }
@@ -471,14 +483,22 @@ fn cameraProfile(
     engine: *const Engine,
     recipe: emu.pipeline.Recipe,
 ) ?emu.pipeline.CameraProfile {
-    if (recipe.engine_version != 3) return .technical_matrix;
-    const mft2 = &(engine.input_profile orelse return .technical_matrix);
+    if (recipe.camera_profile == .technical_matrix) return .technical_matrix;
+    if (recipe.engine_version != 4) return null;
+    const mft2 = &(engine.input_profile orelse return null);
     const profile = emu.icc_profile.Profile.init(mft2) catch return null;
     return .{ .nonlinear = profile };
 }
 
 fn renderRecipe(engine: *const Engine) emu.pipeline.Recipe {
     if (engine.recipe) |parsed| return parsed.value;
+    if (engine.input_profile != null) {
+        return .{
+            .engine_version = 4,
+            .camera_profile = .resolved_nonlinear,
+            .ops = &emu.recipe.default_ops,
+        };
+    }
     if (engine.resolved_calibration != null) {
         return .{ .engine_version = 3, .ops = &emu.recipe.default_ops };
     }
@@ -649,6 +669,11 @@ test "create/load/render/destroy round trip through a real DNG file" {
         manifest_json,
         "\"resolution_state\":\"generic_fallback\"",
     ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        manifest_json,
+        "banksia.color.icc-mft2-local-chroma.v1",
+    ) == null);
     var width: u32 = 0;
     var height: u32 = 0;
 
@@ -665,6 +690,16 @@ test "create/load/render/destroy round trip through a real DNG file" {
     try std.testing.expectEqual(@as(u32, 40), height);
     try std.testing.expectEqual(@as(u8, 255), full.?[3]); // alpha is opaque
 
+    // A requested nonlinear profile must never become an unreported matrix
+    // render when calibration resolved only the generic fallback.
+    try std.testing.expectEqual(ok, bk_set_recipe_json(engine, test_recipe_profile_v4));
+    try std.testing.expectEqual(null, bk_render(engine, 16, &width, &height));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        std.mem.span(bk_last_error(engine)),
+        "invalid nonlinear camera profile",
+    ) != null);
+
     try std.testing.expectEqual(ok, bk_set_recipe_json(
         engine,
         "{\"engine_version\":2,\"ops\":[" ++
@@ -679,7 +714,7 @@ test "create/load/render/destroy round trip through a real DNG file" {
     try std.testing.expectEqual(@as(u32, 10), height);
     try std.testing.expectEqual(@as(f32, 1), linear.?[3]);
 
-    // Engine v3 is calibration-backed: the manifest resolution above snapshots
+    // Engine v3 is reconstruction-backed: the manifest resolution above snapshots
     // a generic fallback, which is still an explicit and valid resolved default.
     try std.testing.expectEqual(ok, bk_set_recipe_json(
         engine,
@@ -723,6 +758,60 @@ test "create/load/render/destroy round trip through a real DNG file" {
         "Cancelled",
     ) != null);
 }
+
+test "resolved engine v4 selects nonlinear profile while retaining matrix choice" {
+    const gpa = std.testing.allocator;
+    const engine = bk_engine_create() orelse return error.OutOfMemory;
+    defer bk_engine_destroy(engine);
+    try std.testing.expectEqual(ok, bk_load_raw(
+        engine,
+        "tests/corpus/phase2b/canon-r3-emerald-fabric.dng",
+    ));
+    const manifest_pointer = bk_pipeline_manifest_json(
+        engine,
+        emu.calibration.database_path_default,
+    ) orelse return error.TestUnexpectedResult;
+    const manifest = std.mem.span(manifest_pointer);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        manifest,
+        "profile.capture-one.CanonEOSR3-ProStandard.v1",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        manifest,
+        "banksia.color.icc-mft2-local-chroma.v1",
+    ) != null);
+
+    var width: u32 = 0;
+    var height: u32 = 0;
+    try std.testing.expectEqual(ok, bk_set_recipe_json(engine, test_recipe_matrix_v4));
+    const matrix_pointer = bk_render(engine, 96, &width, &height) orelse {
+        return error.TestUnexpectedResult;
+    };
+    const byte_count = @as(usize, width) * height * 4;
+    const matrix = try gpa.dupe(u8, matrix_pointer[0..byte_count]);
+    defer gpa.free(matrix);
+
+    try std.testing.expectEqual(ok, bk_set_recipe_json(engine, test_recipe_profile_v4));
+    const profile_pointer = bk_render(engine, 96, &width, &height) orelse {
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqual(byte_count, @as(usize, width) * height * 4);
+    try std.testing.expect(!std.mem.eql(u8, matrix, profile_pointer[0..byte_count]));
+}
+
+const test_recipe_ops =
+    "[{\"black_point\":{}},{\"white_balance\":{\"as_shot\":true," ++
+    "\"gain_r\":1,\"gain_g\":1,\"gain_b\":1}},{\"demosaic\":{}}," ++
+    "{\"exposure\":{\"ev\":0}},{\"tone_curve\":{\"contrast\":0}}," ++
+    "{\"srgb_encode\":{}}]";
+const test_recipe_matrix_v4 =
+    "{\"engine_version\":4,\"camera_profile\":\"technical_matrix\",\"ops\":" ++
+    test_recipe_ops ++ "}";
+const test_recipe_profile_v4 =
+    "{\"engine_version\":4,\"camera_profile\":\"resolved_nonlinear\",\"ops\":" ++
+    test_recipe_ops ++ "}";
 
 fn test_should_cancel(context: ?*anyopaque) callconv(.c) i32 {
     assert(context == null);

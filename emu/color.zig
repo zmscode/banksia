@@ -159,6 +159,12 @@ pub fn pcs_xyz_d50_to_working(xyz: [3]f32) [3]f32 {
     return sanitized;
 }
 
+pub fn working_luminance(rgb: [3]f32) f32 {
+    return rec2020_to_xyz_d65.values[3] * rgb[0] +
+        rec2020_to_xyz_d65.values[4] * rgb[1] +
+        rec2020_to_xyz_d65.values[5] * rgb[2];
+}
+
 const Profile = struct {
     color_1: Mat3,
     color_2: ?Mat3,

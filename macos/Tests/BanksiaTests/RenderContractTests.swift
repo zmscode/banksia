@@ -53,6 +53,13 @@ final class RenderContractTests: XCTestCase {
         XCTAssertFalse(model.hasEdits)
     }
 
+    func testDevelopModelSelectsImmutableEngineV4NonlinearProfile() {
+        let recipe = DevelopModel().recipeJSON
+
+        XCTAssertTrue(recipe.contains("\"engine_version\":4"))
+        XCTAssertTrue(recipe.contains("\"camera_profile\":\"resolved_nonlinear\""))
+    }
+
     func testPreviewResolutionPolicyProgressesWithoutExceedingSource() {
         XCTAssertEqual(
             PreviewResolutionPolicy.edgeMax(
@@ -158,8 +165,8 @@ final class RenderContractTests: XCTestCase {
             precision: .float32
         )
 
-        XCTAssertNotEqual(metal, .strictCPUV3)
-        XCTAssertNotEqual(metal.implementationID, RendererManifest.strictCPUV3.implementationID)
+        XCTAssertNotEqual(metal, .strictCPUV4)
+        XCTAssertNotEqual(metal.implementationID, RendererManifest.strictCPUV4.implementationID)
     }
 
     func testLinearWorkingOutputHasItsOwnExecutionContract() {
@@ -173,7 +180,7 @@ final class RenderContractTests: XCTestCase {
         )
         XCTAssertEqual(
             RenderExecutionContract.strictCPULinearWorking.renderer,
-            .strictCPUV3
+            .strictCPUV4
         )
     }
 

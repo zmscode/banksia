@@ -154,9 +154,13 @@ gates. The active calibration-backed engine-v3 graph adds bounded green
 equalization, CFA-local hot-pixel cleanup, and camera/ISO anti-colour-alias
 strength and calibrated per-channel highlight headroom while engine v2 remains
 frozen. Eight reproducible legacy/candidate corpus pairs passed visual review,
-including the EOS R3 neutral fine-fabric case, so the macOS app and C manifest
-now select the immutable v3 reconstruction IDs. Phase 2D continues with the
-separately selectable nonlinear camera colour profile.
+including the EOS R3 neutral fine-fabric case, so those historical artifacts
+retain the immutable v3 reconstruction IDs. Engine v4 now adds separately
+selectable EOS-1D X Mark II/EOS R3 ProStandard nonlinear camera profiles before
+creative develop, with a strict tetrahedral ICC reference, explicit matrix
+fallback, immutable graph/renderer IDs, and eight reviewed matrix/profile corpus
+pairs. The macOS app and C manifest select v4; Phase 2D continues with separate
+camera film curves and baseline defaults.
 
 ### Foundation Phase 2E — safe sessions and import
 
