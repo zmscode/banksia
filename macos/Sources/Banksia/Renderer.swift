@@ -1,6 +1,7 @@
 import CBanksia
 import CoreGraphics
 import Foundation
+import ImageIO
 import os.signpost
 
 private func rendererShouldCancel(_ context: UnsafeMutableRawPointer?) -> Int32 {
@@ -12,6 +13,8 @@ private func rendererShouldCancel(_ context: UnsafeMutableRawPointer?) -> Int32 
 
 struct LoadTiming: Sendable {
     let coreLoadDecodeMS: Double
+    let sourceWidth: Int
+    let sourceHeight: Int
 }
 
 struct RenderTiming: Sendable {
@@ -69,6 +72,14 @@ actor Renderer {
         category: .pointsOfInterest
     )
     private var engine: OpaquePointer?
+    private var loadedPipelineManifest: PipelineManifest = .legacyV2
+    private static let calibrationDatabasePath: String = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appending(path: "data/calibration/banksia-calibration-v1.sqlite3")
+        .path
     private static let memoryBudgetBytes: UInt64 = {
         let headroom: UInt64 = 1 << 30
         let physical = ProcessInfo.processInfo.physicalMemory
@@ -95,7 +106,38 @@ actor Renderer {
             os_signpost(.end, log: Self.performanceLog, name: "RAW load and decode")
         }
         try check(bk_load_raw(engine, path), engine)
-        return LoadTiming(coreLoadDecodeMS: milliseconds(start.duration(to: clock.now)))
+        var sourceWidth: UInt32 = 0
+        var sourceHeight: UInt32 = 0
+        try check(bk_raw_dimensions(engine, &sourceWidth, &sourceHeight), engine)
+        precondition(sourceWidth > 0)
+        precondition(sourceHeight > 0)
+        guard let manifestJSON = bk_pipeline_manifest_json(
+            engine,
+            Self.calibrationDatabasePath
+        ) else {
+            throw lastError(engine, code: BK_ERR_RENDER)
+        }
+        let decoder = JSONDecoder()
+        do {
+            loadedPipelineManifest = try decoder.decode(
+                PipelineManifest.self,
+                from: Data(String(cString: manifestJSON).utf8)
+            )
+        } catch {
+            throw EngineError(
+                code: BK_ERR_DECODE,
+                message: "invalid pipeline manifest: \(error)"
+            )
+        }
+        return LoadTiming(
+            coreLoadDecodeMS: milliseconds(start.duration(to: clock.now)),
+            sourceWidth: Int(sourceWidth),
+            sourceHeight: Int(sourceHeight)
+        )
+    }
+
+    func currentPipelineManifest() -> PipelineManifest {
+        loadedPipelineManifest
     }
 
     /// Render through the current recipe; `edgeMax` bounds the longest
@@ -113,7 +155,8 @@ actor Renderer {
             recipeJSON: recipeJSON,
             edgeMax: edgeMax,
             intent: .compatibility,
-            execution: .strictCPUDisplay
+            execution: .strictCPUDisplay,
+            pipeline: loadedPipelineManifest
         ))
     }
 
@@ -123,6 +166,12 @@ actor Renderer {
             throw EngineError(
                 code: BK_ERR_INVALID_ARGUMENT,
                 message: "strict CPU renderer received an incompatible execution contract"
+            )
+        }
+        guard request.pipeline == loadedPipelineManifest else {
+            throw EngineError(
+                code: BK_ERR_INVALID_ARGUMENT,
+                message: "render request carries a stale pipeline manifest"
             )
         }
         let engine = try handle()
@@ -201,6 +250,12 @@ actor Renderer {
                 message: "linear CPU renderer received an incompatible execution contract"
             )
         }
+        guard request.pipeline == loadedPipelineManifest else {
+            throw EngineError(
+                code: BK_ERR_INVALID_ARGUMENT,
+                message: "linear render request carries a stale pipeline manifest"
+            )
+        }
         let engine = try handle()
         let clock = ContinuousClock()
         let totalStart = clock.now
@@ -266,6 +321,34 @@ actor Renderer {
         try load(path: path)
         try Task.checkCancellation()
         return try render(recipeJSON: recipeJSON, edgeMax: edgeMax)
+    }
+
+    /// Prefer the camera's embedded preview for filmstrip/culling latency. If
+    /// the container has no usable thumbnail, retain the neutral engine render
+    /// as a correctness fallback.
+    func loadAndRenderThumbnail(
+        path: String,
+        recipeJSON: String,
+        edgeMax: UInt32
+    ) throws -> CGImage {
+        try Task.checkCancellation()
+        let url = URL(fileURLWithPath: path) as CFURL
+        let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        if let source = CGImageSourceCreateWithURL(url, sourceOptions as CFDictionary) {
+            let thumbnailOptions: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: Int(edgeMax),
+                kCGImageSourceShouldCacheImmediately: true,
+            ]
+            if let thumbnail = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                0,
+                thumbnailOptions as CFDictionary
+            ) {
+                return thumbnail
+            }
+        }
+        return try loadAndRender(path: path, recipeJSON: recipeJSON, edgeMax: edgeMax)
     }
 
     private func handle() throws -> OpaquePointer {

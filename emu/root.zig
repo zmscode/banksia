@@ -9,6 +9,7 @@ pub const dng = @import("dng.zig");
 pub const dng_write = @import("dng_write.zig");
 pub const color = @import("color.zig");
 pub const calibration = @import("calibration.zig");
+pub const render_manifest = @import("render_manifest.zig");
 pub const geometry = @import("geometry.zig");
 pub const libraw = @import("libraw.zig");
 pub const raw = @import("raw.zig");
@@ -23,6 +24,7 @@ test {
     _ = dng_write;
     _ = color;
     _ = calibration;
+    _ = render_manifest;
     _ = geometry;
     _ = libraw;
     _ = raw;

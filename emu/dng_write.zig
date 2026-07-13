@@ -38,7 +38,12 @@ pub const Description = struct {
     model: []const u8 = "",
     unique_model: []const u8 = "",
     lens: []const u8 = "",
+    focal_length_mm: ?f32 = null,
+    aperture_f_number: ?f32 = null,
+    focus_distance_m: ?f32 = null,
     iso: ?u16 = null,
+    effective_iso: ?f32 = null,
+    gain_mode: ?u16 = null,
     orientation: dng.Orientation = .normal,
     /// Sensor-relative active pixels; null selects the full sensor.
     active_area: ?dng.Rect = null,
@@ -88,6 +93,17 @@ pub fn write(gpa: std.mem.Allocator, desc: Description) ![]u8 {
     text_assert(desc.model);
     text_assert(desc.unique_model);
     text_assert(desc.lens);
+    for ([_]?f32{
+        desc.focal_length_mm,
+        desc.aperture_f_number,
+        desc.focus_distance_m,
+        desc.effective_iso,
+    }) |value_optional| {
+        if (value_optional) |value| {
+            assert(value > 0);
+            assert(std.math.isFinite(value));
+        }
+    }
     const orientation = @intFromEnum(desc.orientation);
     assert(orientation >= 1 and orientation <= 8);
     const geometry = geometry_of(desc);
@@ -211,6 +227,10 @@ const Assembly = struct {
     camera_calibration_1_off: u32,
     analog_balance_off: u32,
     active_area_off: u32,
+    focal_length_off: u32,
+    aperture_off: u32,
+    focus_distance_off: u32,
+    effective_iso_off: u32,
     make_off: u32,
     model_off: u32,
     unique_model_off: u32,
@@ -228,6 +248,11 @@ fn assembly_plan(desc: Description, grid: Grid, payloads: []const []const u8) As
         if (value.len != 0) entry_count += 1;
     }
     if (desc.iso != null) entry_count += 1;
+    if (desc.focal_length_mm != null) entry_count += 1;
+    if (desc.aperture_f_number != null) entry_count += 1;
+    if (desc.focus_distance_m != null) entry_count += 1;
+    if (desc.effective_iso != null) entry_count += 1;
+    if (desc.gain_mode != null) entry_count += 1;
     const arrays = grid.count() > 1;
     const array_bytes: u64 = if (arrays) 4 * @as(u64, grid.count()) else 0;
     const values_off = @as(u64, ifd_off) + 2 + @as(u64, entry_count) * 12 + 4;
@@ -239,7 +264,11 @@ fn assembly_plan(desc: Description, grid: Grid, payloads: []const []const u8) As
     const camera_calibration_1_off = color_matrix_1_off + 72;
     const analog_balance_off = camera_calibration_1_off + 72;
     const active_area_off = analog_balance_off + 24;
-    var text_cursor = active_area_off + 16;
+    const focal_length_off = active_area_off + 16;
+    const aperture_off = focal_length_off + 8;
+    const focus_distance_off = aperture_off + 8;
+    const effective_iso_off = focus_distance_off + 8;
+    var text_cursor = effective_iso_off + 8;
     const make_off = text_offset(&text_cursor, desc.make);
     const model_off = text_offset(&text_cursor, desc.model);
     const unique_model_off = text_offset(&text_cursor, desc.unique_model);
@@ -264,6 +293,10 @@ fn assembly_plan(desc: Description, grid: Grid, payloads: []const []const u8) As
         .camera_calibration_1_off = @intCast(camera_calibration_1_off),
         .analog_balance_off = @intCast(analog_balance_off),
         .active_area_off = @intCast(active_area_off),
+        .focal_length_off = @intCast(focal_length_off),
+        .aperture_off = @intCast(aperture_off),
+        .focus_distance_off = @intCast(focus_distance_off),
+        .effective_iso_off = @intCast(effective_iso_off),
         .make_off = @intCast(make_off),
         .model_off = @intCast(model_off),
         .unique_model_off = @intCast(unique_model_off),
@@ -328,6 +361,10 @@ fn assemble(
     put_u32(out, plan.active_area_off + 4, active.x);
     put_u32(out, plan.active_area_off + 8, active.y + active.height);
     put_u32(out, plan.active_area_off + 12, active.x + active.width);
+    if (desc.focal_length_mm) |value| fraction_put(out, plan.focal_length_off, value);
+    if (desc.aperture_f_number) |value| fraction_put(out, plan.aperture_off, value);
+    if (desc.focus_distance_m) |value| fraction_put(out, plan.focus_distance_off, value);
+    if (desc.effective_iso) |value| fraction_put(out, plan.effective_iso_off, value);
     text_put(out, plan.make_off, desc.make);
     text_put(out, plan.model_off, desc.model);
     text_put(out, plan.unique_model_off, desc.unique_model);
@@ -402,7 +439,20 @@ fn entries_put(
     }
     sink.put(33421, type_short, 2, 2 | (2 << 16)); // CFARepeatPatternDim
     sink.put(33422, type_byte, 4, pattern); // CFAPattern
+    if (desc.aperture_f_number != null) {
+        sink.put(33437, type_rational, 1, plan.aperture_off); // FNumber
+    }
     if (desc.iso) |iso| sink.put(34855, type_short, 1, iso); // ISOSpeedRatings
+    if (desc.gain_mode) |mode| sink.put(34864, type_short, 1, mode); // SensitivityType
+    if (desc.effective_iso != null) {
+        sink.put(34867, type_rational, 1, plan.effective_iso_off); // ISOSpeed
+    }
+    if (desc.focus_distance_m != null) {
+        sink.put(37382, type_rational, 1, plan.focus_distance_off); // SubjectDistance
+    }
+    if (desc.focal_length_mm != null) {
+        sink.put(37386, type_rational, 1, plan.focal_length_off); // FocalLength
+    }
     if (desc.lens.len != 0) {
         sink.put(42036, type_ascii, @intCast(desc.lens.len + 1), plan.lens_off); // LensModel
     }
@@ -576,7 +626,12 @@ test "write/decode roundtrip preserves every field and every sample" {
         .model = "Fixture Camera",
         .unique_model = "Banksia Fixture Camera",
         .lens = "Fixture 50mm",
+        .focal_length_mm = 50,
+        .aperture_f_number = 2.8,
+        .focus_distance_m = 3.25,
         .iso = 800,
+        .effective_iso = 640,
+        .gain_mode = 3,
         .active_area = .{ .x = 1, .y = 1, .width = 4, .height = 2 },
         .default_crop = .{ .x = 2, .y = 1, .width = 2, .height = 2 },
         .bayer = &bayer,
@@ -612,6 +667,15 @@ test "write/decode roundtrip preserves every field and every sample" {
     try std.testing.expectEqualStrings("Banksia Fixture Camera", metadata.unique_model.slice());
     try std.testing.expectEqualStrings("Fixture 50mm", metadata.lens.slice());
     try std.testing.expectEqual(@as(?f32, 800), metadata.iso);
+    try std.testing.expectEqual(@as(?f32, 50), metadata.focal_length_mm);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 2.8),
+        metadata.aperture_f_number.?,
+        0.000001,
+    );
+    try std.testing.expectEqual(@as(?f32, 3.25), metadata.focus_distance_m);
+    try std.testing.expectEqual(@as(?f32, 640), metadata.effective_iso);
+    try std.testing.expectEqual(@as(?u16, 3), metadata.gain_mode);
 
     try std.testing.expectEqual(@as(u32, 6), sensor.width);
     try std.testing.expectEqual(@as(u32, 4), sensor.height);

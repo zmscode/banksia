@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 import SwiftUI
 
 /// Renders neutral-develop thumbnails on its own engine handle so the strip
@@ -18,6 +19,7 @@ final class ThumbnailStore {
     private var worker: Task<Void, Never>?
     private var applicationActive = true
     private var interactiveWorkActive = false
+    private var benchmarkTask: Task<Void, Never>?
 
     private var isPaused: Bool { !applicationActive || interactiveWorkActive }
 
@@ -42,6 +44,46 @@ final class ThumbnailStore {
         updateWorkerState()
     }
 
+    func runBenchmark(url: URL, sampleCount: Int) {
+        benchmarkTask?.cancel()
+        let count = min(101, max(2, sampleCount))
+        benchmarkTask = Task {
+            let clock = ContinuousClock()
+            var samples: [Double] = []
+            samples.reserveCapacity(count)
+            for _ in 0..<count where !Task.isCancelled {
+                let started = clock.now
+                do {
+                    let image = try await renderer.loadAndRenderThumbnail(
+                        path: url.path,
+                        recipeJSON: neutral,
+                        edgeMax: 220
+                    )
+                    guard !Task.isCancelled else { return }
+                    images[url] = image
+                    samples.append(Self.milliseconds(started.duration(to: clock.now)))
+                } catch {
+                    print("culling-benchmark failed: \(error)")
+                    return
+                }
+            }
+            guard !samples.isEmpty else { return }
+            let sorted = samples.sorted()
+            print(String(
+                format: "culling-benchmark samples=%d visible_p50=%.3f "
+                    + "visible_p95=%.3f visible_p99=%.3f",
+                sorted.count,
+                Self.percentile(sorted, 0.50),
+                Self.percentile(sorted, 0.95),
+                Self.percentile(sorted, 0.99)
+            ))
+            benchmarkTask = nil
+            if ProcessInfo.processInfo.environment["BANKSIA_EXIT_AFTER_BENCHMARK"] == "1" {
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
     private func updateWorkerState() {
         if isPaused {
             worker?.cancel()
@@ -62,7 +104,7 @@ final class ThumbnailStore {
             do {
                 // One atomic call — a concurrent request can't swap the loaded
                 // raw out from under this render, so each thumbnail is its own.
-                let image = try await renderer.loadAndRender(
+                let image = try await renderer.loadAndRenderThumbnail(
                     path: url.path, recipeJSON: neutral, edgeMax: 220
                 )
                 if !Task.isCancelled { images[url] = image }
@@ -73,6 +115,17 @@ final class ThumbnailStore {
         }
         worker = nil
         if !isPaused, !pending.isEmpty { startWorkerIfNeeded() }
+    }
+
+    private static func percentile(_ sorted: [Double], _ quantile: Double) -> Double {
+        let rank = max(1, Int(ceil(quantile * Double(sorted.count))))
+        return sorted[rank - 1]
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) * 1_000
+            + Double(components.attoseconds) / 1_000_000_000_000_000
     }
 }
 

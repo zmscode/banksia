@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const dng = @import("dng.zig");
 
 const c = @cImport({
     @cInclude("sqlite3.h");
@@ -79,6 +80,27 @@ pub const IsoValue = struct {
     value: f32,
     iso_record_id: Text,
     node_iso: f32,
+    upper_iso_record_id: ?Text = null,
+    upper_node_iso: ?f32 = null,
+    resolution: IsoResolution,
+};
+
+pub const IsoResolution = enum {
+    exact,
+    interpolated,
+    inherited,
+};
+
+const IsoPropertyBehavior = enum {
+    continuous,
+    discrete,
+};
+
+const IsoNode = struct {
+    value: f32,
+    iso_record_id: Text,
+    iso: f32,
+    ordinal: u32,
 };
 
 pub const LensSummary = struct {
@@ -86,6 +108,50 @@ pub const LensSummary = struct {
     full_name: Text,
     node_count: u32,
     attribute_count: u32,
+};
+
+pub const FallbackReason = enum {
+    capture_fact_missing,
+    unsupported_camera,
+    unsupported_lens,
+    ambiguous_record,
+    malformed_record,
+    iso_unavailable,
+    correction_disabled,
+};
+
+pub const CameraSelection = union(enum) {
+    resolved: CameraDefaults,
+    generic_fallback: FallbackReason,
+};
+
+pub const IsoSelection = union(enum) {
+    resolved: IsoDefaults,
+    skipped: FallbackReason,
+};
+
+pub const LensSelection = union(enum) {
+    resolved: LensSummary,
+    correction_off: FallbackReason,
+};
+
+pub const ResolutionState = enum {
+    resolved,
+    partial,
+    generic_fallback,
+};
+
+pub const ResolveOptions = struct {
+    lens_corrections_enabled: bool = true,
+};
+
+pub const ResolvedCalibration = struct {
+    bundle_id: Text,
+    processing_graph_id: Text,
+    camera: CameraSelection,
+    iso: IsoSelection,
+    lens: LensSelection,
+    state: ResolutionState,
 };
 
 pub const ProfileSummary = struct {
@@ -166,15 +232,52 @@ pub const Database = struct {
     }
 
     pub fn bundleId(database: *Database) Error!Text {
+        return database.metadataValue("bundle_id");
+    }
+
+    pub fn processingGraphId(database: *Database) Error!Text {
+        return database.metadataValue("processing_graph_id");
+    }
+
+    pub fn resolve(
+        database: *Database,
+        metadata: *const dng.Metadata,
+        options: ResolveOptions,
+    ) Error!ResolvedCalibration {
+        const camera = try database.resolveCamera(metadata);
+        const iso = try database.resolveIso(metadata, camera);
+        const lens = try database.resolveLens(metadata, options);
+        const state: ResolutionState = switch (camera) {
+            .generic_fallback => .generic_fallback,
+            .resolved => switch (iso) {
+                .skipped => .partial,
+                .resolved => switch (lens) {
+                    .correction_off => .partial,
+                    .resolved => .resolved,
+                },
+            },
+        };
+        return .{
+            .bundle_id = try database.bundleId(),
+            .processing_graph_id = try database.processingGraphId(),
+            .camera = camera,
+            .iso = iso,
+            .lens = lens,
+            .state = state,
+        };
+    }
+
+    fn metadataValue(database: *Database, key: []const u8) Error!Text {
         var statement = try database.prepare(
-            "SELECT value FROM bundle_metadata WHERE key = 'bundle_id'",
+            "SELECT value FROM bundle_metadata WHERE key = ?1",
         );
         defer statement.deinit();
+        try statement.bindText(1, key);
         if (try statement.step() != .row) return error.SchemaMismatch;
         const value = try statement.columnText(0);
-        const bundle_id = try Text.init(value);
+        const result = try Text.init(value);
         if (try statement.step() != .done) return error.SchemaMismatch;
-        return bundle_id;
+        return result;
     }
 
     pub fn cameraDefaults(
@@ -232,47 +335,61 @@ pub const Database = struct {
                 camera_id,
                 requested_iso,
                 "noiseFloorCoeff_ISO",
+                .continuous,
             ),
             .noise_poisson = try database.resolveIsoFloat(
                 camera_id,
                 requested_iso,
                 "noisePoissonCoeff_ISO",
+                .continuous,
             ),
-            .base_gain = try database.resolveIsoFloat(camera_id, requested_iso, "gain"),
+            .base_gain = try database.resolveIsoFloat(
+                camera_id,
+                requested_iso,
+                "gain",
+                .discrete,
+            ),
             .sensor_range_gain = try database.resolveIsoFloat(
                 camera_id,
                 requested_iso,
                 "sensorRangeGain",
+                .discrete,
             ),
             .sharpen_amount = try database.resolveIsoFloat(
                 camera_id,
                 requested_iso,
                 "USMAmount_default",
+                .discrete,
             ),
             .sharpen_radius = try database.resolveIsoFloat(
                 camera_id,
                 requested_iso,
                 "USMRadius_default",
+                .discrete,
             ),
             .sharpen_threshold = try database.resolveIsoFloat(
                 camera_id,
                 requested_iso,
                 "USMThreshold_default",
+                .discrete,
             ),
             .anti_color_aliasing = try database.resolveIsoFloat(
                 camera_id,
                 requested_iso,
                 "antiColorAliasingBlend",
+                .discrete,
             ),
             .long_exposure_cleanup = try database.resolveIsoFloat(
                 camera_id,
                 requested_iso,
                 "cleanLongExposureAmount_default",
+                .discrete,
             ),
             .fine_grain = try database.resolveIsoFloat(
                 camera_id,
                 requested_iso,
                 "FineGrain_default",
+                .discrete,
             ),
         };
     }
@@ -416,6 +533,63 @@ pub const Database = struct {
         return result;
     }
 
+    fn resolveCamera(
+        database: *Database,
+        metadata: *const dng.Metadata,
+    ) Error!CameraSelection {
+        if (metadata.make.len == 0 or metadata.model.len == 0) {
+            return .{ .generic_fallback = .capture_fact_missing };
+        }
+        const defaults = database.cameraDefaults(
+            metadata.make.slice(),
+            metadata.model.slice(),
+        ) catch |err| {
+            const reason = selectionFallbackReason(err, .unsupported_camera) orelse return err;
+            return .{ .generic_fallback = reason };
+        };
+        return .{ .resolved = defaults };
+    }
+
+    fn resolveIso(
+        database: *Database,
+        metadata: *const dng.Metadata,
+        camera: CameraSelection,
+    ) Error!IsoSelection {
+        const defaults = switch (camera) {
+            .generic_fallback => return .{ .skipped = .unsupported_camera },
+            .resolved => |value| value,
+        };
+        const requested_iso = metadata.effective_iso orelse metadata.iso orelse {
+            return .{ .skipped = .iso_unavailable };
+        };
+        const resolved = database.isoDefaults(
+            defaults.camera_id.slice(),
+            requested_iso,
+        ) catch |err| {
+            const reason = selectionFallbackReason(err, .iso_unavailable) orelse return err;
+            return .{ .skipped = reason };
+        };
+        return .{ .resolved = resolved };
+    }
+
+    fn resolveLens(
+        database: *Database,
+        metadata: *const dng.Metadata,
+        options: ResolveOptions,
+    ) Error!LensSelection {
+        if (!options.lens_corrections_enabled) {
+            return .{ .correction_off = .correction_disabled };
+        }
+        if (metadata.lens.len == 0) {
+            return .{ .correction_off = .capture_fact_missing };
+        }
+        const summary = database.lensSummary(metadata.lens.slice()) catch |err| {
+            const reason = selectionFallbackReason(err, .unsupported_lens) orelse return err;
+            return .{ .correction_off = reason };
+        };
+        return .{ .resolved = summary };
+    }
+
     fn validateSchema(database: *Database) Error!void {
         var statement = try database.prepare("PRAGMA user_version");
         defer statement.deinit();
@@ -432,9 +606,54 @@ pub const Database = struct {
         camera_id: []const u8,
         requested_iso: f32,
         property_name: []const u8,
+        behavior: IsoPropertyBehavior,
     ) Error!?IsoValue {
+        const lower = try database.isoNodeLower(camera_id, requested_iso, property_name) orelse {
+            return null;
+        };
+        if (lower.iso == requested_iso) return isoValueFromNode(lower, .exact);
+        if (behavior == .discrete) return isoValueFromNode(lower, .inherited);
+
+        const upper = try database.isoNodeUpper(camera_id, requested_iso, property_name) orelse {
+            return isoValueFromNode(lower, .inherited);
+        };
+        assert(lower.iso < requested_iso);
+        assert(upper.iso > requested_iso);
+        assert(lower.ordinal < upper.ordinal);
+        if (try database.isoRangeHasDiscontinuity(
+            camera_id,
+            lower.ordinal,
+            upper.ordinal,
+        )) {
+            return isoValueFromNode(lower, .inherited);
+        }
+
+        const range = upper.iso - lower.iso;
+        assert(range > 0);
+        const weight = (requested_iso - lower.iso) / range;
+        assert(weight > 0);
+        assert(weight < 1);
+        const value = lower.value + (upper.value - lower.value) * weight;
+        if (!std.math.isFinite(value)) return error.InvalidData;
+        return .{
+            .value = value,
+            .iso_record_id = lower.iso_record_id,
+            .node_iso = lower.iso,
+            .upper_iso_record_id = upper.iso_record_id,
+            .upper_node_iso = upper.iso,
+            .resolution = .interpolated,
+        };
+    }
+
+    fn isoNodeLower(
+        database: *Database,
+        camera_id: []const u8,
+        requested_iso: f32,
+        property_name: []const u8,
+    ) Error!?IsoNode {
         var statement = try database.prepare(
-            \\SELECT CAST(property.value AS REAL), node.iso_record_id, node.iso
+            \\SELECT CAST(property.value AS REAL), node.iso_record_id, node.iso,
+            \\       node.iso_ordinal
             \\FROM camera_iso_property AS property
             \\JOIN camera_iso AS node USING(camera_id, iso_ordinal)
             \\WHERE property.camera_id = ?1 AND node.iso <= ?2 AND property.name = ?3
@@ -445,13 +664,65 @@ pub const Database = struct {
         try statement.bindF64(2, requested_iso);
         try statement.bindText(3, property_name);
         if (try statement.step() == .done) return null;
-        const value = IsoValue{
+        const node = IsoNode{
             .value = try statement.columnF32(0),
             .iso_record_id = try Text.init(try statement.columnText(1)),
-            .node_iso = try statement.columnF32(2),
+            .iso = try statement.columnF32(2),
+            .ordinal = try statement.columnU32(3),
         };
         if (try statement.step() != .done) return error.Ambiguous;
-        return value;
+        return node;
+    }
+
+    fn isoNodeUpper(
+        database: *Database,
+        camera_id: []const u8,
+        requested_iso: f32,
+        property_name: []const u8,
+    ) Error!?IsoNode {
+        var statement = try database.prepare(
+            \\SELECT CAST(property.value AS REAL), node.iso_record_id, node.iso,
+            \\       node.iso_ordinal
+            \\FROM camera_iso_property AS property
+            \\JOIN camera_iso AS node USING(camera_id, iso_ordinal)
+            \\WHERE property.camera_id = ?1 AND node.iso > ?2 AND property.name = ?3
+            \\ORDER BY node.iso ASC, node.iso_ordinal ASC LIMIT 1
+        );
+        defer statement.deinit();
+        try statement.bindText(1, camera_id);
+        try statement.bindF64(2, requested_iso);
+        try statement.bindText(3, property_name);
+        if (try statement.step() == .done) return null;
+        const node = IsoNode{
+            .value = try statement.columnF32(0),
+            .iso_record_id = try Text.init(try statement.columnText(1)),
+            .iso = try statement.columnF32(2),
+            .ordinal = try statement.columnU32(3),
+        };
+        if (try statement.step() != .done) return error.Ambiguous;
+        return node;
+    }
+
+    fn isoRangeHasDiscontinuity(
+        database: *Database,
+        camera_id: []const u8,
+        ordinal_lower: u32,
+        ordinal_upper: u32,
+    ) Error!bool {
+        assert(ordinal_lower < ordinal_upper);
+        var statement = try database.prepare(
+            \\SELECT 1 FROM camera_iso_property
+            \\WHERE camera_id = ?1 AND iso_ordinal > ?2 AND iso_ordinal <= ?3
+            \\  AND name IN ('gain', 'sensorRangeGain') LIMIT 1
+        );
+        defer statement.deinit();
+        try statement.bindText(1, camera_id);
+        try statement.bindU32(2, ordinal_lower);
+        try statement.bindU32(3, ordinal_upper);
+        return switch (try statement.step()) {
+            .row => true,
+            .done => false,
+        };
     }
 
     fn prepare(database: *Database, sql: [*:0]const u8) Error!Statement {
@@ -494,6 +765,11 @@ const Statement = struct {
     fn bindF64(statement: *Statement, index: u8, value: f64) Error!void {
         if (!std.math.isFinite(value)) return error.InvalidData;
         const result = c.sqlite3_bind_double(statement.handle, index, value);
+        if (result != c.SQLITE_OK) return error.QueryFailed;
+    }
+
+    fn bindU32(statement: *Statement, index: u8, value: u32) Error!void {
+        const result = c.sqlite3_bind_int64(statement.handle, index, @intCast(value));
         if (result != c.SQLITE_OK) return error.QueryFailed;
     }
 
@@ -569,6 +845,28 @@ const Statement = struct {
         };
     }
 };
+
+fn isoValueFromNode(node: IsoNode, resolution: IsoResolution) IsoValue {
+    assert(resolution != .interpolated);
+    return .{
+        .value = node.value,
+        .iso_record_id = node.iso_record_id,
+        .node_iso = node.iso,
+        .resolution = resolution,
+    };
+}
+
+fn selectionFallbackReason(
+    err: Error,
+    not_found_reason: FallbackReason,
+) ?FallbackReason {
+    return switch (err) {
+        error.NotFound => not_found_reason,
+        error.Ambiguous => .ambiguous_record,
+        error.InvalidData, error.TextTooLong, error.BlobTooLarge => .malformed_record,
+        else => null,
+    };
+}
 
 fn normalizeIdentity(buffer: []u8, value: []const u8) Error![]const u8 {
     var len: u32 = 0;
@@ -671,6 +969,166 @@ test "ISO defaults inherit sparse changes without crossing upward" {
     try std.testing.expectEqual(@as(f32, 1), iso_6400.anti_color_aliasing.?.value);
     try std.testing.expectEqual(@as(f32, 6400), iso_6400.sharpen_amount.?.node_iso);
     try std.testing.expectEqual(@as(f32, 3200), iso_6400.anti_color_aliasing.?.node_iso);
+    try std.testing.expectEqual(IsoResolution.exact, iso_6400.sharpen_amount.?.resolution);
+    try std.testing.expectEqual(
+        IsoResolution.inherited,
+        iso_6400.anti_color_aliasing.?.resolution,
+    );
+}
+
+test "ISO resolution interpolates continuous fields but stops at gain boundaries" {
+    var database = try Database.open(database_path_default);
+    defer database.deinit();
+    const camera = try database.cameraDefaults("Canon", "EOS-1D X Mark II");
+
+    const iso_600 = try database.isoDefaults(camera.camera_id.slice(), 600);
+    const floor_600 = iso_600.noise_floor.?;
+    try std.testing.expectEqual(IsoResolution.interpolated, floor_600.resolution);
+    try std.testing.expectEqual(@as(f32, 400), floor_600.node_iso);
+    try std.testing.expectEqual(@as(?f32, 800), floor_600.upper_node_iso);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.02421125), floor_600.value, 0.0000001);
+
+    const iso_125 = try database.isoDefaults(camera.camera_id.slice(), 125);
+    const floor_125 = iso_125.noise_floor.?;
+    try std.testing.expectEqual(IsoResolution.inherited, floor_125.resolution);
+    try std.testing.expectEqual(@as(f32, 100), floor_125.node_iso);
+    try std.testing.expectEqual(@as(?f32, null), floor_125.upper_node_iso);
+}
+
+test "complete resolver distinguishes resolved partial fallback and correction-off states" {
+    var database = try Database.open(database_path_default);
+    defer database.deinit();
+
+    var metadata = testMetadata(
+        "Canon",
+        "EOS R3",
+        "Canon EF 24-70mm f/2.8L II USM",
+        100,
+    );
+    metadata.effective_iso = 1600;
+    const resolved = try database.resolve(&metadata, .{});
+    try std.testing.expectEqual(ResolutionState.resolved, resolved.state);
+    switch (resolved.iso) {
+        .skipped => return error.TestUnexpectedResult,
+        .resolved => |iso| {
+            try std.testing.expectEqual(@as(f32, 1600), iso.requested_iso);
+            try std.testing.expectEqual(IsoResolution.exact, iso.anti_color_aliasing.?.resolution);
+        },
+    }
+
+    const disabled = try database.resolve(&metadata, .{ .lens_corrections_enabled = false });
+    try std.testing.expectEqual(ResolutionState.partial, disabled.state);
+    switch (disabled.lens) {
+        .resolved => return error.TestUnexpectedResult,
+        .correction_off => |reason| {
+            try std.testing.expectEqual(FallbackReason.correction_disabled, reason);
+        },
+    }
+
+    const unknown = testMetadata("Unknown", "Camera", "", 100);
+    const fallback = try database.resolve(&unknown, .{});
+    try std.testing.expectEqual(ResolutionState.generic_fallback, fallback.state);
+    switch (fallback.camera) {
+        .resolved => return error.TestUnexpectedResult,
+        .generic_fallback => |reason| {
+            try std.testing.expectEqual(FallbackReason.unsupported_camera, reason);
+        },
+    }
+}
+
+test "initial camera and lens selection tables resolve every committed alias" {
+    var database = try Database.open(database_path_default);
+    defer database.deinit();
+
+    const cameras = [_]struct {
+        make: []const u8,
+        model: []const u8,
+        camera_id: []const u8,
+    }{
+        .{
+            .make = "Canon",
+            .model = "EOS-1D X Mark II",
+            .camera_id = "camera.capture-one.canon-eos-1d-x-mark-ii.v1",
+        },
+        .{
+            .make = "Canon Inc.",
+            .model = "EOS-1D X Mark II",
+            .camera_id = "camera.capture-one.canon-eos-1d-x-mark-ii.v1",
+        },
+        .{
+            .make = "Canon",
+            .model = "EOS R3",
+            .camera_id = "camera.capture-one.canon-eos-r3.v1",
+        },
+        .{
+            .make = "Canon Inc.",
+            .model = "EOS R3",
+            .camera_id = "camera.capture-one.canon-eos-r3.v1",
+        },
+    };
+    for (cameras) |camera_case| {
+        const camera = try database.cameraDefaults(camera_case.make, camera_case.model);
+        try std.testing.expectEqualStrings(camera_case.camera_id, camera.camera_id.slice());
+    }
+
+    const lenses = [_]struct {
+        alias: []const u8,
+        lens_id: []const u8,
+    }{
+        .{
+            .alias = "Canon EF 24-70mm f/2.8L II USM",
+            .lens_id = "lens.capture-one.66B9FA28-EFDB-4C38-ABEE-654C84967049.v1",
+        },
+        .{
+            .alias = "EF24-70mm f/2.8L II USM",
+            .lens_id = "lens.capture-one.66B9FA28-EFDB-4C38-ABEE-654C84967049.v1",
+        },
+        .{
+            .alias = "Canon EF 70-200mm f/4 L IS USM",
+            .lens_id = "lens.capture-one.A57EBD6F-86D3-47FC-A295-F75DC0EA3B7C.v1",
+        },
+        .{
+            .alias = "EF70-200mm f/4L IS USM",
+            .lens_id = "lens.capture-one.A57EBD6F-86D3-47FC-A295-F75DC0EA3B7C.v1",
+        },
+        .{
+            .alias = "Canon EF 24-105mm f/4L IS II USM",
+            .lens_id = "lens.capture-one.D52D61FC-82C8-4E2F-96AF-70BBA6538D40.v1",
+        },
+        .{
+            .alias = "EF24-105mm f/4L IS II USM",
+            .lens_id = "lens.capture-one.D52D61FC-82C8-4E2F-96AF-70BBA6538D40.v1",
+        },
+    };
+    for (lenses) |lens_case| {
+        const lens = try database.lensSummary(lens_case.alias);
+        try std.testing.expectEqualStrings(lens_case.lens_id, lens.lens_id.slice());
+    }
+}
+
+test "selection fallback mapping covers every recoverable record failure" {
+    try std.testing.expectEqual(
+        FallbackReason.unsupported_camera,
+        selectionFallbackReason(error.NotFound, .unsupported_camera).?,
+    );
+    try std.testing.expectEqual(
+        FallbackReason.unsupported_lens,
+        selectionFallbackReason(error.NotFound, .unsupported_lens).?,
+    );
+    try std.testing.expectEqual(
+        FallbackReason.ambiguous_record,
+        selectionFallbackReason(error.Ambiguous, .unsupported_camera).?,
+    );
+    for ([_]Error{ error.InvalidData, error.TextTooLong, error.BlobTooLarge }) |err| {
+        try std.testing.expectEqual(
+            FallbackReason.malformed_record,
+            selectionFallbackReason(err, .unsupported_camera).?,
+        );
+    }
+    try std.testing.expectEqual(
+        @as(?FallbackReason, null),
+        selectionFallbackReason(error.OpenFailed, .unsupported_camera),
+    );
 }
 
 test "profile curves and lens records are complete and bounded" {
@@ -700,4 +1158,23 @@ test "profile curves and lens records are complete and bounded" {
     try std.testing.expectEqual(@as(u32, 460), lens_wide.node_count);
     const lens_tele = try database.lensSummary("EF70-200mm f/4L IS USM");
     try std.testing.expectEqual(@as(u32, 190), lens_tele.node_count);
+}
+
+fn testMetadata(make: []const u8, model: []const u8, lens: []const u8, iso: f32) dng.Metadata {
+    return .{
+        .width = 2,
+        .height = 2,
+        .compression = .none,
+        .cfa = .{ .red, .green, .green, .blue },
+        .black_level = 0,
+        .white_level = 1023,
+        .wb_neutral = .{ 1, 1, 1 },
+        .orientation = .normal,
+        .active_area = .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+        .default_crop = .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+        .make = dng.Text.init(make),
+        .model = dng.Text.init(model),
+        .lens = dng.Text.init(lens),
+        .iso = iso,
+    };
 }

@@ -1,6 +1,6 @@
 //! The C ABI: everything the shell may touch, and nothing else.
 //!
-//! Nine exported functions, `bk_` prefixed, hand-documented in
+//! Eleven exported functions, `bk_` prefixed, hand-documented in
 //! `include/banksia.h` — the header changes in the same commit as this file,
 //! and the header-sync test below holds the two together.
 //!
@@ -36,7 +36,12 @@ const err_out_of_memory: i32 = -7;
 const err_cancelled: i32 = -8;
 
 const error_message_bytes_max = 256;
+const manifest_json_bytes_max = 16 * 1024;
 const raw_bytes_max = std.Io.Limit.limited(512 * 1024 * 1024);
+
+comptime {
+    assert(manifest_json_bytes_max > error_message_bytes_max);
+}
 
 const DebugAllocator = std.heap.DebugAllocator(.{});
 
@@ -53,6 +58,7 @@ const Engine = struct {
     linear_rendered: ?emu.pipeline.LinearRendered = null,
     /// Always NUL-terminated; index error_message_bytes_max is the fence.
     last_error: [error_message_bytes_max + 1]u8,
+    manifest_json: [manifest_json_bytes_max + 1]u8,
 };
 
 pub export fn bk_engine_create() ?*Engine {
@@ -61,6 +67,7 @@ pub export fn bk_engine_create() ?*Engine {
         .debug_allocator = if (verify) DebugAllocator.init else {},
         .gpa = undefined,
         .last_error = @splat(0),
+        .manifest_json = @splat(0),
     };
     engine.gpa = if (verify) engine.debug_allocator.allocator() else std.heap.smp_allocator;
     return engine;
@@ -89,6 +96,29 @@ pub export fn bk_load_raw(engine_maybe: ?*Engine, path_maybe: ?[*:0]const u8) i3
     return load_raw(engine, std.mem.span(path));
 }
 
+pub export fn bk_raw_dimensions(
+    engine_maybe: ?*Engine,
+    width_out: ?*u32,
+    height_out: ?*u32,
+) i32 {
+    const engine = engine_maybe orelse return err_invalid_argument;
+    const width_ptr = width_out orelse {
+        return fail(engine, err_invalid_argument, "width_out is null", .{});
+    };
+    const height_ptr = height_out orelse {
+        return fail(engine, err_invalid_argument, "height_out is null", .{});
+    };
+    const raw = &(engine.raw orelse {
+        return fail(engine, err_no_raw, "no raw loaded: bk_load_raw must succeed first", .{});
+    });
+    const dimensions = emu.geometry.Transform.init(raw.metadata).output_dimensions();
+    assert(dimensions.width > 0);
+    assert(dimensions.height > 0);
+    width_ptr.* = dimensions.width;
+    height_ptr.* = dimensions.height;
+    return succeed(engine);
+}
+
 fn load_raw(engine: *Engine, path: []const u8) i32 {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
@@ -110,6 +140,126 @@ fn load_raw(engine: *Engine, path: []const u8) i32 {
     if (engine.raw) |*old| old.deinit(engine.gpa);
     engine.raw = raw;
     return succeed(engine);
+}
+
+const PipelineStageJSON = struct {
+    stage_id: []const u8,
+    implementation_id: []const u8,
+    input_domain: []const u8,
+    output_domain: []const u8,
+    neutral_behavior: []const u8,
+    status: []const u8,
+};
+
+const PipelineManifestJSON = struct {
+    recipe_schema_id: []const u8,
+    active_graph_id: []const u8,
+    target_graph_id: []const u8,
+    renderer_id: []const u8,
+    backend_id: []const u8,
+    precision_id: []const u8,
+    resolution_state: []const u8,
+    camera_state: []const u8,
+    iso_state: []const u8,
+    lens_state: []const u8,
+    bundle_id: []const u8,
+    camera_record_id: ?[]const u8,
+    iso_record_ids: []const []const u8,
+    input_profile_id: ?[]const u8,
+    film_curve_id: ?[]const u8,
+    lens_profile_id: ?[]const u8,
+    first_affected_stage_id: []const u8,
+    stages: []const PipelineStageJSON,
+};
+
+pub export fn bk_pipeline_manifest_json(
+    engine_maybe: ?*Engine,
+    database_path_maybe: ?[*:0]const u8,
+) ?[*:0]const u8 {
+    const engine = engine_maybe orelse return null;
+    const database_path = database_path_maybe orelse {
+        _ = fail(engine, err_invalid_argument, "calibration database path is null", .{});
+        return null;
+    };
+    const raw = &(engine.raw orelse {
+        _ = fail(engine, err_no_raw, "no raw loaded: bk_load_raw must succeed first", .{});
+        return null;
+    });
+    var database = emu.calibration.Database.open(std.mem.span(database_path)) catch |err| {
+        _ = fail(engine, err_render, "cannot open calibration bundle: {s}", .{@errorName(err)});
+        return null;
+    };
+    defer database.deinit();
+    const resolved = database.resolve(&raw.metadata, .{}) catch |err| {
+        _ = fail(engine, err_render, "cannot resolve calibration: {s}", .{@errorName(err)});
+        return null;
+    };
+    const dependencies = emu.render_manifest.DependencyManifest.init(&resolved);
+
+    var iso_record_ids: [20][]const u8 = @splat("");
+    for (dependencies.isoRecordIds(), 0..) |*record_id, index| {
+        iso_record_ids[index] = record_id.slice();
+    }
+    var stages: [emu.render_manifest.calibrated_stages.len]PipelineStageJSON = undefined;
+    for (&stages, emu.render_manifest.calibrated_stages) |*target, stage| {
+        target.* = .{
+            .stage_id = stage.stage_id,
+            .implementation_id = stage.implementation_id,
+            .input_domain = @tagName(stage.input),
+            .output_domain = @tagName(stage.output),
+            .neutral_behavior = @tagName(stage.neutral),
+            .status = @tagName(stage.status),
+        };
+    }
+    const view = PipelineManifestJSON{
+        .recipe_schema_id = emu.render_manifest.recipe_schema_id_current,
+        .active_graph_id = emu.render_manifest.graph_id_legacy_v2,
+        .target_graph_id = resolved.processing_graph_id.slice(),
+        .renderer_id = emu.render_manifest.renderer_id_strict_cpu_v2,
+        .backend_id = "strict_cpu",
+        .precision_id = "float32",
+        .resolution_state = @tagName(resolved.state),
+        .camera_state = selectionState(resolved.camera),
+        .iso_state = selectionState(resolved.iso),
+        .lens_state = selectionState(resolved.lens),
+        .bundle_id = resolved.bundle_id.slice(),
+        .camera_record_id = optionalTextSlice(&dependencies.camera_record_id),
+        .iso_record_ids = iso_record_ids[0..dependencies.iso_record_count],
+        .input_profile_id = optionalTextSlice(&dependencies.input_profile_id),
+        .film_curve_id = optionalTextSlice(&dependencies.film_curve_id),
+        .lens_profile_id = optionalTextSlice(&dependencies.lens_profile_id),
+        .first_affected_stage_id = emu.render_manifest.calibrated_stages[0].stage_id,
+        .stages = &stages,
+    };
+
+    var writer: std.Io.Writer = .fixed(engine.manifest_json[0..manifest_json_bytes_max]);
+    std.json.Stringify.value(view, .{}, &writer) catch {
+        _ = fail(engine, err_render, "pipeline manifest exceeds fixed JSON capacity", .{});
+        return null;
+    };
+    const json = writer.buffered();
+    assert(json.len <= manifest_json_bytes_max);
+    engine.manifest_json[json.len] = 0;
+    _ = succeed(engine);
+    return @ptrCast(&engine.manifest_json);
+}
+
+fn optionalTextSlice(value: *const ?emu.calibration.Text) ?[]const u8 {
+    if (value.*) |*text| return text.slice();
+    return null;
+}
+
+fn selectionState(value: anytype) []const u8 {
+    return switch (value) {
+        inline else => |payload, tag| switch (@TypeOf(payload)) {
+            emu.calibration.CameraDefaults,
+            emu.calibration.IsoDefaults,
+            emu.calibration.LensSummary,
+            => @tagName(tag),
+            emu.calibration.FallbackReason => @tagName(payload),
+            else => comptime unreachable,
+        },
+    };
 }
 
 pub export fn bk_set_recipe_json(engine_maybe: ?*Engine, json_maybe: ?[*:0]const u8) i32 {
@@ -301,9 +451,9 @@ const exported_names = blk: {
 };
 
 comptime {
-    // The admitted linear call is the sole Phase 2C extension to the frozen
-    // eight-function surface.
-    assert(exported_names.len == 9);
+    // Linear admission, source geometry, and the immutable pipeline manifest
+    // are the extensions to the frozen eight-function Phase 1 surface.
+    assert(exported_names.len == 11);
 }
 
 test "the hand-written header declares exactly the exported surface" {
@@ -341,6 +491,8 @@ test "error paths set a code and a message; success clears it" {
     // Render before load: null pixels, a message, and untouched outputs.
     var width: u32 = 0;
     var height: u32 = 0;
+    try std.testing.expectEqual(err_no_raw, bk_raw_dimensions(engine, &width, &height));
+    try std.testing.expect(message_length(engine) > 0);
     try std.testing.expectEqual(null, bk_render(engine, 0, &width, &height));
     try std.testing.expect(message_length(engine) > 0);
     try std.testing.expectEqual(@as(u32, 0), width);
@@ -398,6 +550,29 @@ test "create/load/render/destroy round trip through a real DNG file" {
     defer bk_engine_destroy(engine);
 
     try std.testing.expectEqual(ok, bk_load_raw(engine, path));
+    var source_width: u32 = 0;
+    var source_height: u32 = 0;
+    try std.testing.expectEqual(
+        ok,
+        bk_raw_dimensions(engine, &source_width, &source_height),
+    );
+    try std.testing.expectEqual(@as(u32, 64), source_width);
+    try std.testing.expectEqual(@as(u32, 40), source_height);
+    const manifest_pointer = bk_pipeline_manifest_json(
+        engine,
+        emu.calibration.database_path_default,
+    ) orelse return error.TestUnexpectedResult;
+    const manifest_json = std.mem.span(manifest_pointer);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        manifest_json,
+        "\"active_graph_id\":\"graph.banksia.matrix.v2\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        manifest_json,
+        "\"resolution_state\":\"generic_fallback\"",
+    ) != null);
     var width: u32 = 0;
     var height: u32 = 0;
 

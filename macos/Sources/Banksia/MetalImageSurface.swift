@@ -96,6 +96,13 @@ private struct MetalPresentationResources {
     }()
 }
 
+enum MetalResourceMetrics {
+    static var currentAllocatedBytes: UInt64 {
+        guard case .ready(let resources) = MetalPresentationResources.shared else { return 0 }
+        return UInt64(max(0, resources.device.currentAllocatedSize))
+    }
+}
+
 struct LateDevelopUniforms {
     var exposureEV: Float
     var contrast: Float
@@ -468,8 +475,8 @@ private struct MetalLinearImageView: NSViewRepresentable {
         )
     }
 
-    func makeNSView(context: Context) -> DisplayLinkedMetalView {
-        let view = DisplayLinkedMetalView(
+    func makeNSView(context: Context) -> InteractiveMTKView {
+        let view = InteractiveMTKView(
             frame: .zero,
             device: resources.device,
             renderer: context.coordinator
@@ -479,7 +486,7 @@ private struct MetalLinearImageView: NSViewRepresentable {
         return view
     }
 
-    func updateNSView(_ view: DisplayLinkedMetalView, context: Context) {
+    func updateNSView(_ view: InteractiveMTKView, context: Context) {
         context.coordinator.update(
             preview: preview,
             previewGeneration: previewGeneration,
@@ -491,16 +498,17 @@ private struct MetalLinearImageView: NSViewRepresentable {
     }
 }
 
-/// A CAMetalDisplayLink-backed surface for interactive late develops. Unlike
-/// MTKView's on-demand draw scheduling, the display link provides the next
-/// display drawable in time for its target presentation interval. This avoids
-/// the extra-frame tail that an asynchronous main-queue `draw()` can add.
-private final class DisplayLinkedMetalView: NSView, CAMetalDisplayLinkDelegate {
-    private let device: any MTLDevice
+/// A short display-synchronised burst for active edits. MTKView stays paused
+/// while static, wakes for pending frames, then pauses after a small idle grace
+/// period so successive slider updates do not repeatedly cold-start the
+/// compositor.
+private final class InteractiveMTKView: MTKView, MTKViewDelegate {
+    private static let idleCallbackBudget = 8
+
+    private let renderDevice: any MTLDevice
     private let renderer: MetalLinearImageRenderer
-    private var displayLink: CAMetalDisplayLink?
     private var framePending = true
-    private var drawableSizeNeedsUpdate = true
+    private var idleCallbacksRemaining = idleCallbackBudget
 
     var nearestSampling = false
 
@@ -509,92 +517,88 @@ private final class DisplayLinkedMetalView: NSView, CAMetalDisplayLinkDelegate {
         device: any MTLDevice,
         renderer: MetalLinearImageRenderer
     ) {
-        self.device = device
+        self.renderDevice = device
         self.renderer = renderer
-        super.init(frame: frame)
-        wantsLayer = true
+        super.init(frame: frame, device: device)
+        delegate = self
+        colorPixelFormat = .bgra8Unorm_srgb
+        depthStencilPixelFormat = .invalid
+        framebufferOnly = true
+        autoResizeDrawable = true
+        preferredFramesPerSecond = 60
+        isPaused = true
+        enableSetNeedsDisplay = false
+        clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
     }
 
     @available(*, unavailable)
-    required init?(coder: NSCoder) {
+    required init(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
-    }
-
-    override func makeBackingLayer() -> CALayer {
-        CAMetalLayer()
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        guard window != nil else {
-            displayLink?.invalidate()
-            displayLink = nil
-            return
-        }
+        guard window != nil else { return }
+        preferredFramesPerSecond = window?.screen?.maximumFramesPerSecond ?? 60
         configureLayer()
-        updateDrawableSize()
-        startDisplayLinkIfNeeded()
         requestFrame()
     }
 
-    override func layout() {
-        super.layout()
-        drawableSizeNeedsUpdate = true
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
         requestFrame()
     }
 
     func requestFrame() {
         framePending = true
+        idleCallbacksRemaining = Self.idleCallbackBudget
         guard let window,
               window.occlusionState.contains(.visible),
               NSApp.isActive,
               bounds.width > 0,
               bounds.height > 0
         else { return }
-        displayLink?.isPaused = false
+        isPaused = false
     }
 
-    func metalDisplayLink(
-        _ link: CAMetalDisplayLink,
-        needsUpdate update: CAMetalDisplayLink.Update
-    ) {
-        guard framePending,
-              let window,
+    func draw(in view: MTKView) {
+        guard let window,
               window.occlusionState.contains(.visible),
               NSApp.isActive
         else {
-            link.isPaused = true
+            isPaused = true
             return
         }
-        guard metalLayer.drawableSize.width > 0, metalLayer.drawableSize.height > 0 else {
-            link.isPaused = true
+        guard framePending else {
+            if idleCallbacksRemaining > 0 {
+                idleCallbacksRemaining -= 1
+            } else {
+                isPaused = true
+            }
+            return
+        }
+        guard drawableSize.width > 0, drawableSize.height > 0 else { return }
+        guard let drawable = currentDrawable else {
+            if renderer.drawableUnavailable() {
+                requestFrame()
+            }
             return
         }
         framePending = false
-        link.isPaused = true
         renderer.draw(
-            drawable: update.drawable,
-            drawableSize: metalLayer.drawableSize,
+            drawable: drawable,
+            drawableSize: drawableSize,
             nearestSampling: nearestSampling,
             requestRetry: { [weak self] in self?.requestFrame() },
-            presentationCompleted: { [weak self] in
-                self?.applyPendingDrawableSizeAfterPresentation()
-            }
+            presentationCompleted: {}
         )
     }
 
-    private var metalLayer: CAMetalLayer {
-        guard let layer = layer as? CAMetalLayer else {
-            preconditionFailure("DisplayLinkedMetalView must use CAMetalLayer")
-        }
-        return layer
-    }
-
     private func configureLayer() {
-        let layer = metalLayer
-        layer.device = device
-        layer.pixelFormat = .bgra8Unorm_srgb
-        layer.framebufferOnly = true
+        guard let layer = layer as? CAMetalLayer else {
+            preconditionFailure("InteractiveMTKView must use CAMetalLayer")
+        }
+        layer.device = renderDevice
         layer.isOpaque = true
         layer.maximumDrawableCount = 2
         layer.displaySyncEnabled = MetalPresentationTuning.displaySyncEnabled
@@ -602,32 +606,6 @@ private final class DisplayLinkedMetalView: NSView, CAMetalDisplayLinkDelegate {
         layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         layer.presentsWithTransaction = false
         layer.magnificationFilter = nearestSampling ? .nearest : .linear
-        drawableSizeNeedsUpdate = true
-    }
-
-    private func startDisplayLinkIfNeeded() {
-        guard displayLink == nil else { return }
-        let link = CAMetalDisplayLink(metalLayer: metalLayer)
-        link.delegate = self
-        link.preferredFrameLatency = 1
-        link.isPaused = true
-        link.add(to: .main, forMode: .common)
-        displayLink = link
-    }
-
-    private func updateDrawableSize() {
-        let backingScale = window?.backingScaleFactor ?? 1
-        metalLayer.drawableSize = MetalDrawableSizing.pixels(
-            points: bounds.size,
-            backingScale: backingScale
-        )
-        drawableSizeNeedsUpdate = false
-    }
-
-    private func applyPendingDrawableSizeAfterPresentation() {
-        guard drawableSizeNeedsUpdate else { return }
-        updateDrawableSize()
-        requestFrame()
     }
 }
 
@@ -986,6 +964,16 @@ private final class MetalLinearImageRenderer: NSObject {
         }
         self.exposureEV = exposureEV
         self.contrast = contrast
+    }
+
+    func drawableUnavailable() -> Bool {
+        consecutiveNilDrawables += 1
+        guard consecutiveNilDrawables >= 3 else { return true }
+        reportFailure(MetalFailure(
+            stage: .drawable,
+            message: "Metal drawable acquisition repeatedly failed"
+        ))
+        return false
     }
 
     func draw(

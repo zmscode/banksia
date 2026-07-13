@@ -205,6 +205,49 @@ final class MetalPresentationTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testControllerRestoresOnlyTheSelectedAssetsDevelopRecipe() async throws {
+        let corpus = repositoryRoot.appendingPathComponent(
+            "tests/corpus/phase2b",
+            isDirectory: true
+        )
+        let first = corpus.appendingPathComponent("canon-r3-black-fabric.dng")
+        let second = corpus.appendingPathComponent("canon-r3-emerald-fabric.dng")
+        let firstState = DevelopRecipeState(
+            ev: 0.6,
+            temperature: -0.2,
+            tint: 0.3,
+            contrast: 0.45
+        )
+        let secondState = DevelopRecipeState(
+            ev: -0.5,
+            temperature: 0.15,
+            tint: -0.1,
+            contrast: 0.2
+        )
+        let controller = DevelopController()
+
+        controller.open(url: first)
+        try await waitUntil(timeoutSeconds: 10) { controller.linearPreview != nil }
+        controller.develop = DevelopModel(state: firstState)
+        controller.parameterChanged(.early)
+
+        controller.open(url: second)
+        XCTAssertEqual(controller.develop.state, .neutral)
+        try await waitUntil(timeoutSeconds: 10) { controller.linearPreview != nil }
+        controller.develop = DevelopModel(state: secondState)
+        controller.parameterChanged(.late)
+
+        controller.open(url: first)
+        XCTAssertEqual(controller.develop.state, firstState)
+        try await waitUntil(timeoutSeconds: 10) { controller.linearPreview != nil }
+
+        controller.open(url: second)
+        XCTAssertEqual(controller.develop.state, secondState)
+        try await waitUntil(timeoutSeconds: 10) { controller.linearPreview != nil }
+        XCTAssertEqual(controller.currentURL, second)
+    }
+
     func testRepeatedTextureAllocationAndMemoryPressureReleaseIsBounded() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("Metal is unavailable")
@@ -335,6 +378,7 @@ final class MetalPresentationTests: XCTestCase {
         var minimumSSIM = 1.0
         for (index, file) in files.enumerated() {
             try await renderer.load(path: file.path)
+            let pipeline = await renderer.currentPipelineManifest()
             let model = DevelopModel()
             model.ev = 0.5
             model.contrast = 0.35
@@ -343,14 +387,16 @@ final class MetalPresentationTests: XCTestCase {
                 recipeJSON: model.recipeJSON,
                 edgeMax: 512,
                 intent: .compatibility,
-                execution: .strictCPUDisplay
+                execution: .strictCPUDisplay,
+                pipeline: pipeline
             )
             let linearRequest = RenderRequest(
                 generation: UInt64(index * 2 + 2),
                 recipeJSON: model.recipeJSON,
                 edgeMax: 512,
                 intent: .compatibility,
-                execution: .strictCPULinearWorking
+                execution: .strictCPULinearWorking,
+                pipeline: pipeline
             )
             let cpu = try await renderer.render(request: cpuRequest)
             let linear = try await renderer.renderLinearPreview(request: linearRequest)

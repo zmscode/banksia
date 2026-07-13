@@ -212,7 +212,15 @@ fn metadata_from_context(context: *c.libraw_data_t) Error!dng.Metadata {
         .make = c_text(&context.idata.make),
         .model = c_text(&context.idata.model),
         .lens = c_text(&context.lens.Lens),
+        .lens_id = optional_identifier(context.lens.makernotes.LensID),
+        .focal_length_mm = optional_positive(context.other.focal_len),
+        .aperture_f_number = optional_positive(context.other.aperture),
         .iso = if (context.other.iso_speed > 0) context.other.iso_speed else null,
+        .effective_iso = optional_positive(context.makernotes.common.real_ISO),
+        .sensor_mode = if (context.makernotes.canon.SRAWQuality >= 0)
+            @intCast(context.makernotes.canon.SRAWQuality)
+        else
+            null,
         .capture_time = if (context.other.timestamp > 0)
             @intCast(context.other.timestamp)
         else
@@ -222,6 +230,18 @@ fn metadata_from_context(context: *c.libraw_data_t) Error!dng.Metadata {
         else
             try camera_to_xyz_read(context),
     };
+}
+
+fn optional_positive(value: anytype) ?f32 {
+    const converted: f32 = @floatCast(value);
+    if (!(converted > 0) or !std.math.isFinite(converted)) return null;
+    return converted;
+}
+
+fn optional_identifier(value: anytype) ?u64 {
+    const converted: u64 = @intCast(value);
+    if (converted == 0 or converted == std.math.maxInt(u64)) return null;
+    return converted;
 }
 
 fn default_crop_read(context: *const c.libraw_data_t) Error!dng.Rect {

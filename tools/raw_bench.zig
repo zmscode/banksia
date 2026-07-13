@@ -110,6 +110,7 @@ fn bench_file(
     path: []const u8,
     iterations: u32,
 ) !void {
+    const benchmark_started = std.Io.Clock.now(.awake, io);
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, file_bytes_max);
     defer gpa.free(bytes);
     var metadata_samples = Samples{};
@@ -222,10 +223,13 @@ fn bench_file(
     late_release_loupe_samples.report("late-release loupe backing crop and RGB read");
     full_samples.report("warm full v2 render");
     std.debug.print(
-        "  linear admission estimate (edge-1440): {d:.2} MiB\n",
-        .{@as(f64, @floatFromInt(
-            emu.pipeline.render_linear_memory_bytes_max(&raw, 1440),
-        )) / (1024 * 1024)},
+        "  linear admission estimate (edge-1440): {d:.2} MiB\n" ++ "  benchmark duration: {d:.3} s\n",
+        .{
+            @as(f64, @floatFromInt(
+                emu.pipeline.render_linear_memory_bytes_max(&raw, 1440),
+            )) / (1024 * 1024),
+            ms(elapsed_ns(benchmark_started, std.Io.Clock.now(.awake, io))) / 1_000,
+        },
     );
 }
 

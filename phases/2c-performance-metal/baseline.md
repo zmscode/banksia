@@ -191,9 +191,7 @@ normal GPU-only viewer; it is only scheduled for a strict-CPU fallback frame.
 
 The harness now executes each workload in its own warmed series instead of
 interleaving it with a full-resolution render. The table above remains the
-pre-isolation baseline; the final Phase 2C report must be regenerated with the
-isolated harness and the `CAMetalDisplayLink` late-edit presenter before the
-remaining exit gates are checked.
+pre-isolation baseline; the final isolated results are recorded below.
 
 ### Traversal, copy, and memory accounting
 
@@ -209,3 +207,52 @@ of system/application headroom on the 8 GB reference machine. The measured
 edge-1440 admission estimates are 277.66 MiB (CR2) and 184.80 MiB (CR3), before
 the small retained texture and two SDR drawables. Repeated allocation testing
 keeps retained Metal growth below 64 MiB after 256 texture cycles.
+
+## Phase 2C final acceptance capture
+
+Recorded 2026-07-13 after isolating workload series, fusing preview
+orientation/downsampling, selecting the CFA-preserving 4× linear-preview level
+when it remains within 5% of the requested edge, adding embedded culling
+previews, and using a bounded display-synchronised edit burst. Both RAW captures
+used 31 samples in ReleaseFast on the reference M3/macOS 26.5.1 machine with a
+warm filesystem cache and a freshly decoded engine source.
+
+| Workload | CR2 p50 / p95 / p99 | CR3 p50 / p95 / p99 |
+|---|---:|---:|
+| metadata parse | 252.491 / 255.724 / 294.290 ms | 47.617 / 52.251 / 56.009 ms |
+| sensor decode | 254.289 / 257.645 / 260.560 ms | 50.162 / 56.312 / 57.013 ms |
+| cached edge-220 engine thumbnail | 2.700 / 2.894 / 3.232 ms | 3.356 / 3.404 / 13.804 ms |
+| uncached edge-220 decode + render | 258.621 / 260.551 / 260.626 ms | 52.954 / 57.514 / 76.155 ms |
+| warm edge-1024 display | 35.350 / 45.915 / 46.167 ms | 41.790 / 43.719 / 45.641 ms |
+| strict warm edge-1440 display | 132.751 / 135.863 / 153.871 ms | 51.994 / 55.525 / 55.926 ms |
+| retained ≤1440 linear base | 25.796 / 33.841 / 35.683 ms | 26.210 / 27.085 / 27.327 ms |
+| strict CPU late release | 134.775 / 138.492 / 142.289 ms | 50.206 / 52.553 / 52.640 ms |
+| final sRGB packing | 11.115 / 11.263 / 11.269 ms | 13.352 / 13.515 / 13.598 ms |
+| CPU loupe crop/read | 0.002 / 0.002 / 0.002 ms | 0.001 / 0.002 / 0.002 ms |
+| warm full display | 895.646 / 956.105 / 985.584 ms | 1126.910 / 1277.363 / 1286.957 ms |
+
+The CR2 series ran for 63.684 seconds and admitted 160.23 MiB for its retained
+linear preview. CR3 ran for 47.165 seconds and admitted 184.80 MiB. The harness
+prints duration with every future capture so thermal exposure is explicit.
+
+The app-level embedded-preview benchmark includes decode, actor handoff, and
+publication into the observable thumbnail store. CR2 recorded
+23.738/30.702/202.824 ms p50/p95/p99; CR3 recorded
+25.004/28.363/148.637 ms. The cold-tail p99 and p95 both remain below the
+250 ms first-visible requirement.
+
+The final 31-frame windowed Metal sweep recorded 44.955/47.694/47.773 ms
+p50/p95/p99 on the 60 Hz display. Median stage timings were 0.115 ms encode,
+0.211 ms queue, 0.628 ms GPU, and 35.204 ms presentation. This passes the
+windowed contract of at most three display intervals (50.0 ms here). The
+original 33 ms target remains the direct-display/high-refresh target: a
+`CAMetalDisplayLink` experiment could not satisfy it because the API supplied a
+31.6 ms two-frame target horizon before compositor time and measured
+81.649 ms p95.
+
+Against the exact-edge CR2 CPU-to-`CGImage` p95 of 138.492 ms, the final
+47.694 ms GPU input-to-visible result is 2.90× faster. The same GPU run recorded
+275.52 MiB peak RSS and 35.64 MiB current Metal allocation. Their conservative
+sum is 311.16 MiB, leaving 7,880.84 MiB of the 8 GiB reference machine; the
+31-frame sweep lasted 1.552 seconds. The existing sustained trace remains the
+thermal/idle-energy proof.

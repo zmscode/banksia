@@ -7,6 +7,8 @@ import os.signpost
 /// can mirror them. Scroll zooms toward the pointer, drag pans at any zoom, and
 /// a split handle wipes between the neutral develop and the current one.
 struct PreviewCanvas: View {
+    @Environment(\.displayScale) private var displayScale
+
     let controller: DevelopController
     let viewer: ViewerState
     var onOpen: () -> Void
@@ -50,8 +52,8 @@ struct PreviewCanvas: View {
             openDropped(urls)
         } isTargeted: { isDropTargeted = $0 }
         .onChange(of: controller.fileName) { resetView() }
-        .onChange(of: controller.pixelWidth) {
-            viewer.imageSize = CGSize(width: controller.pixelWidth, height: controller.pixelHeight)
+        .onChange(of: sourceImageSize, initial: true) {
+            viewer.imageSize = sourceImageSize
         }
         .onChange(of: viewer.viewSize) { snapFitIfNeeded() }
         .onChange(of: viewer.insetLeading) { snapFitIfNeeded() }
@@ -77,6 +79,34 @@ struct PreviewCanvas: View {
                 signpostID: signpostID
             )
         }
+        .task(id: previewResolutionEdge) {
+            let edge = previewResolutionEdge
+            guard edge > 0 else { return }
+            do {
+                try await Task.sleep(for: .milliseconds(150))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            controller.requestPreviewResolution(edgeMax: edge)
+        }
+    }
+
+    private var sourceImageSize: CGSize {
+        CGSize(width: controller.pixelWidth, height: controller.pixelHeight)
+    }
+
+    private var previewResolutionEdge: UInt32 {
+        guard controller.linearPreview != nil else { return 0 }
+        let fitted = viewer.fittedSize()
+        return PreviewResolutionPolicy.edgeMax(
+            sourceWidth: controller.pixelWidth,
+            sourceHeight: controller.pixelHeight,
+            fittedWidth: fitted.width,
+            fittedHeight: fitted.height,
+            zoomScale: viewer.scale,
+            displayScale: displayScale
+        )
     }
 
     private struct ClipKey: Hashable {
@@ -156,7 +186,7 @@ struct PreviewCanvas: View {
             previewGeneration: controller.linearPreviewGeneration,
             exposureEV: controller.develop.ev,
             contrast: controller.develop.contrast,
-            nearestSampling: viewer.scale > 3,
+            nearestSampling: false,
             onTiming: controller.recordMetalTiming,
             onFailure: controller.handleMetalFailure
         )
@@ -172,7 +202,7 @@ struct PreviewCanvas: View {
         let fitted = viewer.fittedSize()
         return MetalImageSurface(
             image: cg,
-            nearestSampling: viewer.scale > 3
+            nearestSampling: false
         )
             .frame(width: fitted.width, height: fitted.height)
             .scaleEffect(viewer.scale)
@@ -184,7 +214,7 @@ struct PreviewCanvas: View {
         let fitted = viewer.fittedSize()
         return Image(decorative: cg, scale: 1, orientation: .up)
             .resizable()
-            .interpolation(viewer.scale > 3 ? .none : .high)
+            .interpolation(.high)
             .frame(width: fitted.width, height: fitted.height)
             .scaleEffect(viewer.scale)
             .offset(viewer.offset)
@@ -379,7 +409,8 @@ struct PreviewCanvas: View {
 
     @ViewBuilder
     private var renderingPill: some View {
-        if controller.isRendering, controller.displayImage != nil {
+        if controller.isRendering,
+           controller.linearPreview != nil || controller.displayImage != nil {
             HStack(spacing: 7) {
                 ProgressView().controlSize(.small)
                 Text("Rendering").font(.caption.weight(.medium))

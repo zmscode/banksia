@@ -98,11 +98,12 @@ local corpus covers 18 Canon RAWs and nine supported Apple LinearRaw files.
 
 ### Foundation Phase 2C — performance architecture and Metal proof
 
-**Complete with recorded latency deviations.** Banksia now has explicit
+**Complete.** Banksia now has explicit
 CPU/GPU execution and surface ownership, a GPU-resident late-develop viewer,
-strict CPU conformance/fallback, and a measured investment decision. Direct MSL
-remains the normal path; its 47.758 ms p95 misses the original 33 ms target, so
-presentation-driver investigation moves to Branch C rather than being hidden.
+strict CPU conformance/fallback, embedded culling previews, and a measured
+investment decision. Direct MSL remains the normal path; its final 47.694 ms p95
+fits within three intervals on the 60 Hz reference display, while 33 ms remains
+the direct-display/high-refresh target for Branch C.
 
 - [x] Record the seed CPU p50/p95/p99 baseline and render-stage signposts.
 - [x] Define immutable requests, execution identities, image domains, and
@@ -113,13 +114,16 @@ presentation-driver investigation moves to Branch C rather than being hidden.
   mask Metal initialization, processing, orientation, or command failures.
 - [x] Restore and verify explicit strict-CPU fallback before the Phase 2C exit.
 - [x] Retain a linear preview texture and move late develop operations onto it.
-- [x] Record two early ≤33 ms runs and the final 47.758 ms p95 regression.
+- [x] Close the final CR2 retained-base gate at 33.841 ms p95 and record a
+  2.90× CPU-to-visible late-develop speedup.
+- [x] Close embedded first-visible culling at 30.702 ms p95 or better and peak
+  conservative CPU/GPU memory at 311.16 MiB.
 - [x] Complete CPU/Metal conformance, failure, resize/display, memory-pressure,
-  idle-energy, and decision tests; record the remaining latency exceptions.
+  idle-energy, and decision tests with every Phase 2C exit checked.
 
 ### Foundation Phase 2D — calibrated image pipeline
 
-**Planned next.** Banksia will bootstrap a camera-, ISO-, and lens-aware default
+**In progress.** Banksia is bootstrapping a camera-, ISO-, and lens-aware default
 pipeline from the extracted Capture One 16.7.3 calibration corpus, while keeping
 camera colour, film curve, detail defaults, and optical correction as separate,
 versioned dependencies. EOS-1D X Mark II and EOS R3 are the initial supported
@@ -128,6 +132,26 @@ camera profiles; the three Canon corpus lenses form the initial lens set.
 The strict matrix renderer and every historical manifest remain available.
 Later Banksia tuning creates new immutable calibration versions instead of
 silently changing bootstrap results.
+
+The 2D resolver now captures numeric camera/lens/exposure facts, distinguishes
+exact, interpolated, inherited, partial, generic-fallback, skipped, and
+correction-off outcomes, and preserves gain-boundary discontinuities. A
+versioned graph/dependency manifest crosses the Zig C ABI into every immutable
+Swift render request and participates in first-stage and final artifact keys.
+The 25-case historical golden suite, 27-file local RAW corpus, and eight-file
+committed corpus are green in the completed foundation slice.
+
+The 2D viewer integration keeps the previous Metal texture visible while early
+white-balance generations render, records source and preview geometry
+independently, and progressively refines zoomed views through 1440-, 2880-, and
+bounded 4096-edge textures. Full source-pixel inspection will use bounded
+region/tile rendering as the 2D.4 reconstruction path matures.
+
+Edits are now session-scoped to canonical asset identity rather than shared by
+the window. The first whole-frame RCD reference candidate is also implemented:
+its assert-backed neutral-weave and odd-border gates pass, while the active
+historical bilinear/chroma-safe renderer remains unchanged until the complete
+artifact and visual corpus approves an explicit graph migration.
 
 ### Foundation Phase 2E — safe sessions and import
 

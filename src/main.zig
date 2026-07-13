@@ -9,6 +9,8 @@
 //!       parse metadata; optionally unpack the mosaic or complete a v2 render
 //!   banksia calibration-audit <raw>
 //!       report the immutable camera, ISO, profile, curve, and lens selection
+//!   banksia pipeline-audit <raw>
+//!       report calibration plus graph stages, domains, precision, and IDs
 //!
 //! The CLI reads inputs itself; emu stays a pure function over the bytes
 //! it is handed, and every output byte goes through wombat (which owns
@@ -53,7 +55,12 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, command, "calibration-audit")) {
         const raw_path = args.next() orelse return usage();
         if (args.next() != null) return usage();
-        return calibration_audit_file(gpa, io, raw_path);
+        return calibration_audit_file(gpa, io, raw_path, false);
+    }
+    if (std.mem.eql(u8, command, "pipeline-audit")) {
+        const raw_path = args.next() orelse return usage();
+        if (args.next() != null) return usage();
+        return calibration_audit_file(gpa, io, raw_path, true);
     }
     if (std.mem.eql(u8, command, "convert-dng")) {
         const raw_path = args.next() orelse return usage();
@@ -84,6 +91,7 @@ fn calibration_audit_file(
     gpa: std.mem.Allocator,
     io: std.Io,
     raw_path: []const u8,
+    include_pipeline: bool,
 ) !void {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, raw_path, gpa, file_bytes_max) catch |err| {
         return fail("cannot read raw '{s}': {s}", .{ raw_path, @errorName(err) });
@@ -99,61 +107,78 @@ fn calibration_audit_file(
     };
     defer database.deinit();
 
-    const bundle_id = database.bundleId() catch |err| {
-        return fail("cannot read calibration bundle identity: {s}", .{@errorName(err)});
+    const resolved = database.resolve(&metadata, .{}) catch |err| {
+        return fail("cannot resolve calibration: {s}", .{@errorName(err)});
     };
-    try status(io, "bundle: {s}\n", .{bundle_id.slice()});
-    const camera = database.cameraDefaults(
-        metadata.make.slice(),
-        metadata.model.slice(),
-    ) catch |err| {
-        try status(io, "camera: fallback ({s}) for {s} {s}\n", .{
-            @errorName(err),
-            metadata.make.slice(),
-            metadata.model.slice(),
-        });
-        return;
-    };
-    try status(io, "camera: {s}\n", .{camera.camera_id.slice()});
-    try status(io, "input profile: {s}\n", .{camera.input_profile_id.slice()});
-    try status(io, "film curve: {s}\n", .{camera.film_curve_id.slice()});
-    try status(io, "base gains: camera={d:.4} sensor-range={d:.4}\n", .{
-        camera.base_gain,
-        camera.sensor_range_gain,
-    });
-
-    if (metadata.iso) |iso| {
-        const defaults = database.isoDefaults(camera.camera_id.slice(), iso) catch |err| {
-            return fail("cannot resolve ISO calibration: {s}", .{@errorName(err)});
-        };
-        try status(io, "ISO: {d:.0}\n", .{iso});
-        try optional_status(io, "noise floor", defaults.noise_floor);
-        try optional_status(io, "noise Poisson", defaults.noise_poisson);
-        try optional_status(io, "anti-colour-alias", defaults.anti_color_aliasing);
-        try optional_status(io, "capture sharpen amount", defaults.sharpen_amount);
-        try optional_status(io, "capture sharpen radius", defaults.sharpen_radius);
-        try optional_status(io, "capture sharpen threshold", defaults.sharpen_threshold);
-        try optional_status(io, "long-exposure cleanup", defaults.long_exposure_cleanup);
-        try optional_status(io, "fine grain", defaults.fine_grain);
-    } else {
-        try status(io, "ISO: unavailable; ISO-dependent records skipped\n", .{});
-    }
-
-    if (metadata.lens.len != 0) {
-        const lens = database.lensSummary(metadata.lens.slice()) catch |err| {
-            try status(io, "lens: correction skipped ({s}) for {s}\n", .{
-                @errorName(err),
-                metadata.lens.slice(),
+    const dependencies = emu.render_manifest.DependencyManifest.init(&resolved);
+    try status(io, "bundle: {s}\n", .{resolved.bundle_id.slice()});
+    try status(io, "resolution: {s}\n", .{@tagName(resolved.state)});
+    switch (resolved.camera) {
+        .generic_fallback => |reason| {
+            try status(io, "camera: generic fallback ({s})\n", .{@tagName(reason)});
+        },
+        .resolved => |camera| {
+            try status(io, "camera: {s}\n", .{camera.camera_id.slice()});
+            try status(io, "input profile: {s}\n", .{camera.input_profile_id.slice()});
+            try status(io, "film curve: {s}\n", .{camera.film_curve_id.slice()});
+            try status(io, "base gains: camera={d:.4} sensor-range={d:.4}\n", .{
+                camera.base_gain,
+                camera.sensor_range_gain,
             });
-            return;
-        };
-        try status(io, "lens: {s}\n", .{lens.lens_id.slice()});
-        try status(io, "lens records: {d} nodes, {d} attributes\n", .{
-            lens.node_count,
-            lens.attribute_count,
-        });
-    } else {
-        try status(io, "lens: correction skipped (metadata unavailable)\n", .{});
+        },
+    }
+    switch (resolved.iso) {
+        .skipped => |reason| {
+            try status(io, "ISO: skipped ({s})\n", .{@tagName(reason)});
+        },
+        .resolved => |defaults| {
+            try status(io, "ISO: {d:.0}\n", .{defaults.requested_iso});
+            try optional_status(io, "noise floor", defaults.noise_floor);
+            try optional_status(io, "noise Poisson", defaults.noise_poisson);
+            try optional_status(io, "anti-colour-alias", defaults.anti_color_aliasing);
+            try optional_status(io, "capture sharpen amount", defaults.sharpen_amount);
+            try optional_status(io, "capture sharpen radius", defaults.sharpen_radius);
+            try optional_status(io, "capture sharpen threshold", defaults.sharpen_threshold);
+            try optional_status(io, "long-exposure cleanup", defaults.long_exposure_cleanup);
+            try optional_status(io, "fine grain", defaults.fine_grain);
+        },
+    }
+    switch (resolved.lens) {
+        .correction_off => |reason| {
+            try status(io, "lens: correction off ({s})\n", .{@tagName(reason)});
+        },
+        .resolved => |lens| {
+            try status(io, "lens: {s}\n", .{lens.lens_id.slice()});
+            try status(io, "lens records: {d} nodes, {d} attributes\n", .{
+                lens.node_count,
+                lens.attribute_count,
+            });
+        },
+    }
+    if (!include_pipeline) return;
+    try status(io, "recipe schema: {s}\n", .{emu.render_manifest.recipe_schema_id_current});
+    try status(io, "active graph: {s}\n", .{emu.render_manifest.graph_id_legacy_v2});
+    try status(io, "target graph: {s}\n", .{resolved.processing_graph_id.slice()});
+    try status(io, "renderer: {s}; backend=strict_cpu; precision=float32\n", .{
+        emu.render_manifest.renderer_id_strict_cpu_v2,
+    });
+    try status(io, "first affected stage: {s}; dependency IDs={d}\n", .{
+        emu.render_manifest.calibrated_stages[0].stage_id,
+        dependencies.dependencyCount(),
+    });
+    for (emu.render_manifest.calibrated_stages) |stage| {
+        try status(
+            io,
+            "stage: {s} [{s}] {s}->{s}; impl={s}; neutral={s}; fusion=none\n",
+            .{
+                stage.stage_id,
+                @tagName(stage.status),
+                @tagName(stage.input),
+                @tagName(stage.output),
+                stage.implementation_id,
+                @tagName(stage.neutral),
+            },
+        );
     }
 }
 
@@ -163,12 +188,20 @@ fn optional_status(
     value: ?emu.calibration.IsoValue,
 ) !void {
     if (value) |resolved| {
-        try status(io, "  {s}: {d:.6} ({s}; node ISO {d:.0})\n", .{
+        try status(io, "  {s}: {d:.6} ({s}; node ISO {d:.0}; {s})", .{
             name,
             resolved.value,
             resolved.iso_record_id.slice(),
             resolved.node_iso,
+            @tagName(resolved.resolution),
         });
+        if (resolved.upper_iso_record_id) |upper| {
+            try status(io, " -> {s}; node ISO {d:.0}", .{
+                upper.slice(),
+                resolved.upper_node_iso.?,
+            });
+        }
+        try status(io, "\n", .{});
     } else {
         try status(io, "  {s}: unavailable\n", .{name});
     }
@@ -253,7 +286,12 @@ fn corpus_dng_make(
         .model = raw.metadata.model.slice(),
         .unique_model = raw.metadata.unique_model.slice(),
         .lens = raw.metadata.lens.slice(),
+        .focal_length_mm = raw.metadata.focal_length_mm,
+        .aperture_f_number = raw.metadata.aperture_f_number,
+        .focus_distance_m = raw.metadata.focus_distance_m,
         .iso = if (raw.metadata.iso) |iso| @intFromFloat(@round(iso)) else null,
+        .effective_iso = raw.metadata.effective_iso,
+        .gain_mode = raw.metadata.gain_mode,
         .orientation = raw.metadata.orientation,
         .active_area = active,
         .default_crop = .{
@@ -334,7 +372,20 @@ fn inspect_file(
     if (metadata.unique_model.len != 0) {
         try status(io, "  unique model: {s}\n", .{metadata.unique_model.slice()});
     }
+    if (metadata.lens_id) |lens_id| try status(io, "  numeric lens ID: {d}\n", .{lens_id});
+    if (metadata.focal_length_mm) |focal| {
+        try status(io, "  focal length: {d:.2} mm\n", .{focal});
+    }
+    if (metadata.aperture_f_number) |aperture| {
+        try status(io, "  aperture: f/{d:.2}\n", .{aperture});
+    }
+    if (metadata.focus_distance_m) |distance| {
+        try status(io, "  focus distance: {d:.3} m\n", .{distance});
+    }
     if (metadata.iso) |iso| try status(io, "  ISO: {d:.0}\n", .{iso});
+    if (metadata.effective_iso) |iso| try status(io, "  effective ISO: {d:.0}\n", .{iso});
+    if (metadata.gain_mode) |mode| try status(io, "  gain mode: {d}\n", .{mode});
+    if (metadata.sensor_mode) |mode| try status(io, "  sensor mode: {d}\n", .{mode});
     if (metadata.capture_datetime.len != 0) {
         try status(io, "  captured: {s}.{s}\n", .{
             metadata.capture_datetime.slice(),
@@ -506,6 +557,7 @@ fn usage() error{Usage} {
         \\       banksia convert-dng <raw> <out.dng> <storage>
         \\       banksia inspect <raw> [--decode|--render]
         \\       banksia calibration-audit <raw>
+        \\       banksia pipeline-audit <raw>
         \\
     , .{});
     return error.Usage;

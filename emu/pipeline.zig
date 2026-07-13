@@ -198,11 +198,7 @@ pub fn render_linear_decoded(
     }
     const dimensions = geometry.Transform.init(raw.metadata).output_dimensions();
     const longest = @max(dimensions.width, dimensions.height);
-    const ratio = if (options.edge_px_max_out == 0)
-        0
-    else
-        longest / options.edge_px_max_out;
-    const factor = ratio & ~@as(u32, 1);
+    const factor = preview_factor(longest, options.edge_px_max_out);
     if (factor >= 2) {
         var preview = try preview_raw_make(gpa, raw, factor);
         defer preview.deinit(gpa);
@@ -215,8 +211,7 @@ pub fn render_linear_decoded(
 pub fn render_linear_memory_bytes_max(raw: *const dng.DecodedRaw, edge_px_max_out: u32) u64 {
     const dimensions = geometry.Transform.init(raw.metadata).output_dimensions();
     const longest = @max(dimensions.width, dimensions.height);
-    const ratio = if (edge_px_max_out == 0) 0 else longest / edge_px_max_out;
-    const factor = @max(1, ratio & ~@as(u32, 1));
+    const factor = @max(1, preview_factor(longest, edge_px_max_out));
     const work_width = (raw.sensor.width + factor - 1) / factor;
     const work_height = (raw.sensor.height + factor - 1) / factor;
     const oriented_width = (dimensions.width + factor - 1) / factor;
@@ -235,6 +230,23 @@ pub fn render_linear_memory_bytes_max(raw: *const dng.DecodedRaw, edge_px_max_ou
     const early_stage_bytes = work_pixels * @sizeOf(f32) * 7;
     const output_stage_bytes = output_pixels * 72;
     return cfa_bytes + early_stage_bytes + output_stage_bytes;
+}
+
+/// Choose an even CFA-preserving reduction level. Interactive previews may use
+/// the next coarser level when it stays within 5% of the requested maximum edge;
+/// small reference renders retain strict-CPU-compatible dimensions so the CPU
+/// and GPU conformance oracle compares the same pixels.
+fn preview_factor(longest: u32, edge_px_max_out: u32) u32 {
+    if (edge_px_max_out == 0 or edge_px_max_out >= longest) return 0;
+    const ratio = longest / edge_px_max_out;
+    const floor_even = ratio & ~@as(u32, 1);
+    if (edge_px_max_out < 1024 or floor_even < 2 or ratio & 1 == 0) return floor_even;
+    const ceil_even = floor_even + 2;
+    const reduced_longest = (longest + ceil_even - 1) / ceil_even;
+    if (@as(u64, reduced_longest) * 20 >= @as(u64, edge_px_max_out) * 19) {
+        return ceil_even;
+    }
+    return floor_even;
 }
 
 fn cancellation_check(cancellation: Cancellation) RenderError!void {
@@ -694,7 +706,8 @@ fn render_internal(
     errdefer gpa.free(rgba);
 
     const packing_ns = if (width_out == output_planes.width and
-        height_out == output_planes.height) blk: {
+        height_out == output_planes.height)
+    blk: {
         break :blk pack_srgb_timed(
             rgba,
             output_planes.r,
@@ -767,18 +780,17 @@ fn render_linear_internal(
     }
 
     try cancellation_check(options.cancellation);
-    const transformed = try planes_transform(arena, &planes, transform);
-    try cancellation_check(options.cancellation);
+    const dimensions = transform.output_dimensions();
     const width_out, const height_out = dims_out(
-        transformed.width,
-        transformed.height,
+        dimensions.width,
+        dimensions.height,
         options.edge_px_max_out,
     );
-    const output_planes = if (width_out == transformed.width and
-        height_out == transformed.height)
-        transformed
+    const output_planes = if (width_out == dimensions.width and
+        height_out == dimensions.height)
+        try planes_transform(arena, &planes, transform)
     else
-        try planes_downsample(arena, &transformed, width_out, height_out);
+        try planes_transform_downsample(arena, &planes, transform, width_out, height_out);
 
     try cancellation_check(options.cancellation);
     const count_out = @as(usize, width_out) * height_out;
@@ -809,6 +821,55 @@ fn planes_transform(
             };
             const sensor = transform.output_to_sensor(output);
             value.* = pair[1][@as(usize, sensor.y) * source.width + sensor.x];
+        }
+    }
+    return target;
+}
+
+/// Apply crop/orientation and box reduction in one traversal. Preview renders
+/// avoid allocating and filling a full-size oriented three-plane image only to
+/// read it once during the following downsample.
+fn planes_transform_downsample(
+    arena: std.mem.Allocator,
+    source: *const image.Planes,
+    transform: geometry.Transform,
+    width_out: u32,
+    height_out: u32,
+) RenderError!image.Planes {
+    const dimensions = transform.output_dimensions();
+    assert(width_out <= dimensions.width);
+    assert(height_out <= dimensions.height);
+    const target = try image.Planes.init(arena, width_out, height_out);
+
+    var y_target: u32 = 0;
+    while (y_target < height_out) : (y_target += 1) {
+        const y0: u32 = @intCast(@as(u64, y_target) * dimensions.height / height_out);
+        const y1: u32 = @intCast(
+            (@as(u64, y_target) + 1) * dimensions.height / height_out,
+        );
+        var x_target: u32 = 0;
+        while (x_target < width_out) : (x_target += 1) {
+            const x0: u32 = @intCast(@as(u64, x_target) * dimensions.width / width_out);
+            const x1: u32 = @intCast(
+                (@as(u64, x_target) + 1) * dimensions.width / width_out,
+            );
+            var sums: [3]f32 = @splat(0);
+            var y = y0;
+            while (y < y1) : (y += 1) {
+                var x = x0;
+                while (x < x1) : (x += 1) {
+                    const sensor = transform.output_to_sensor(.{ .x = x, .y = y });
+                    const source_index = @as(usize, sensor.y) * source.width + sensor.x;
+                    sums[0] += source.r[source_index];
+                    sums[1] += source.g[source_index];
+                    sums[2] += source.b[source_index];
+                }
+            }
+            const sample_count = @as(f32, @floatFromInt((x1 - x0) * (y1 - y0)));
+            const target_index = @as(usize, y_target) * width_out + x_target;
+            target.r[target_index] = sums[0] / sample_count;
+            target.g[target_index] = sums[1] / sample_count;
+            target.b[target_index] = sums[2] / sample_count;
         }
     }
     return target;
@@ -1435,6 +1496,436 @@ fn demosaic_bilinear(
     }
 }
 
+/// Whole-frame Ratio Corrected Demosaicing reference. This intentionally
+/// favors readable equations over tiling/SIMD: it is the semantic candidate
+/// that later CPU optimization and Metal kernels must match. The existing
+/// bilinear path remains active until this candidate clears the artifact
+/// corpus and an explicit graph migration selects its implementation ID.
+fn demosaic_rcd_reference(
+    arena: std.mem.Allocator,
+    comptime cfa: [4]dng.CfaColor,
+    mosaic: []const f32,
+    planes: *image.Planes,
+) RenderError!void {
+    const width = planes.width;
+    const height = planes.height;
+    const pixel_count = @as(usize, width) * height;
+    assert(mosaic.len == pixel_count);
+    assert(planes.r.len == pixel_count);
+    assert(planes.g.len == pixel_count);
+    assert(planes.b.len == pixel_count);
+
+    // RCD needs a four-pixel neighborhood. Bilinear is a deterministic border
+    // policy and the complete fallback for tiny images.
+    demosaic_bilinear(cfa, mosaic, planes);
+    const radius: u32 = 4;
+    if (width <= radius * 2 or height <= radius * 2) return;
+
+    const direction_vh = try arena.alloc(f32, pixel_count);
+    const low_pass_or_direction_pq = try arena.alloc(f32, pixel_count);
+    const high_pass_p = try arena.alloc(f32, pixel_count);
+    const high_pass_q = try arena.alloc(f32, pixel_count);
+    @memset(direction_vh, 0);
+    @memset(low_pass_or_direction_pq, 0);
+    @memset(high_pass_p, 0);
+    @memset(high_pass_q, 0);
+
+    const epsilon: f32 = 1e-5;
+    const epsilon_squared: f32 = epsilon * epsilon;
+
+    // Step 1: Discriminate vertical and horizontal structure from a
+    // six-neighbor high-pass response.
+    var y: u32 = radius;
+    while (y < height - radius) : (y += 1) {
+        var x: u32 = radius;
+        while (x < width - radius) : (x += 1) {
+            var vertical_stat: f32 = 0;
+            var horizontal_stat: f32 = 0;
+            var offset: i64 = -1;
+            while (offset <= 1) : (offset += 1) {
+                vertical_stat += squared(rcd_high_pass_vertical(
+                    mosaic,
+                    width,
+                    height,
+                    x,
+                    @intCast(@as(i64, y) + offset),
+                ));
+                horizontal_stat += squared(rcd_high_pass_horizontal(
+                    mosaic,
+                    width,
+                    height,
+                    @intCast(@as(i64, x) + offset),
+                    y,
+                ));
+            }
+            vertical_stat = @max(epsilon_squared, vertical_stat);
+            horizontal_stat = @max(epsilon_squared, horizontal_stat);
+            direction_vh[pixel_index(width, x, y)] =
+                vertical_stat / (vertical_stat + horizontal_stat);
+        }
+    }
+
+    // Step 2: Low-pass energy at red/blue sites supplies the ratio correction
+    // used to estimate green without crossing strong edges.
+    y = 2;
+    while (y < height - 2) : (y += 1) {
+        var x: u32 = 2;
+        while (x < width - 2) : (x += 1) {
+            if (site_color(cfa, x, y) == .green) continue;
+            low_pass_or_direction_pq[pixel_index(width, x, y)] =
+                fetch_u32(mosaic, width, x, y) +
+                0.5 * (fetch_u32(mosaic, width, x - 1, y) +
+                    fetch_u32(mosaic, width, x + 1, y) +
+                    fetch_u32(mosaic, width, x, y - 1) +
+                    fetch_u32(mosaic, width, x, y + 1)) +
+                0.25 * (fetch_u32(mosaic, width, x - 1, y - 1) +
+                    fetch_u32(mosaic, width, x + 1, y - 1) +
+                    fetch_u32(mosaic, width, x - 1, y + 1) +
+                    fetch_u32(mosaic, width, x + 1, y + 1));
+        }
+    }
+
+    // Step 3: Populate green at red/blue sites from ratio-corrected cardinal
+    // estimates, weighted toward the smoother direction.
+    y = radius;
+    while (y < height - radius) : (y += 1) {
+        var x: u32 = radius;
+        while (x < width - radius) : (x += 1) {
+            if (site_color(cfa, x, y) == .green) continue;
+            const center = fetch_u32(mosaic, width, x, y);
+            const north_gradient = epsilon +
+                @abs(fetch_u32(mosaic, width, x, y - 1) -
+                    fetch_u32(mosaic, width, x, y + 1)) +
+                @abs(center - fetch_u32(mosaic, width, x, y - 2)) +
+                @abs(fetch_u32(mosaic, width, x, y - 1) -
+                    fetch_u32(mosaic, width, x, y - 3)) +
+                @abs(fetch_u32(mosaic, width, x, y - 2) -
+                    fetch_u32(mosaic, width, x, y - 4));
+            const south_gradient = epsilon +
+                @abs(fetch_u32(mosaic, width, x, y - 1) -
+                    fetch_u32(mosaic, width, x, y + 1)) +
+                @abs(center - fetch_u32(mosaic, width, x, y + 2)) +
+                @abs(fetch_u32(mosaic, width, x, y + 1) -
+                    fetch_u32(mosaic, width, x, y + 3)) +
+                @abs(fetch_u32(mosaic, width, x, y + 2) -
+                    fetch_u32(mosaic, width, x, y + 4));
+            const west_gradient = epsilon +
+                @abs(fetch_u32(mosaic, width, x - 1, y) -
+                    fetch_u32(mosaic, width, x + 1, y)) +
+                @abs(center - fetch_u32(mosaic, width, x - 2, y)) +
+                @abs(fetch_u32(mosaic, width, x - 1, y) -
+                    fetch_u32(mosaic, width, x - 3, y)) +
+                @abs(fetch_u32(mosaic, width, x - 2, y) -
+                    fetch_u32(mosaic, width, x - 4, y));
+            const east_gradient = epsilon +
+                @abs(fetch_u32(mosaic, width, x - 1, y) -
+                    fetch_u32(mosaic, width, x + 1, y)) +
+                @abs(center - fetch_u32(mosaic, width, x + 2, y)) +
+                @abs(fetch_u32(mosaic, width, x + 1, y) -
+                    fetch_u32(mosaic, width, x + 3, y)) +
+                @abs(fetch_u32(mosaic, width, x + 2, y) -
+                    fetch_u32(mosaic, width, x + 4, y));
+
+            const low_pass = low_pass_or_direction_pq[pixel_index(width, x, y)];
+            const north = fetch_u32(mosaic, width, x, y - 1) * (2 * low_pass) /
+                (epsilon + low_pass +
+                    low_pass_or_direction_pq[pixel_index(width, x, y - 2)]);
+            const south = fetch_u32(mosaic, width, x, y + 1) * (2 * low_pass) /
+                (epsilon + low_pass +
+                    low_pass_or_direction_pq[pixel_index(width, x, y + 2)]);
+            const west = fetch_u32(mosaic, width, x - 1, y) * (2 * low_pass) /
+                (epsilon + low_pass +
+                    low_pass_or_direction_pq[pixel_index(width, x - 2, y)]);
+            const east = fetch_u32(mosaic, width, x + 1, y) * (2 * low_pass) /
+                (epsilon + low_pass +
+                    low_pass_or_direction_pq[pixel_index(width, x + 2, y)]);
+            const vertical = (south_gradient * north + north_gradient * south) /
+                (north_gradient + south_gradient);
+            const horizontal = (west_gradient * east + east_gradient * west) /
+                (west_gradient + east_gradient);
+            const direction = refined_direction(direction_vh, width, x, y);
+            planes.g[pixel_index(width, x, y)] =
+                @max(0, interpolate(direction, horizontal, vertical));
+        }
+    }
+
+    // Step 4.0: Diagonal high-pass responses for the red-at-blue and
+    // blue-at-red color-difference interpolation.
+    y = 3;
+    while (y < height - 3) : (y += 1) {
+        var x: u32 = 3;
+        while (x < width - 3) : (x += 1) {
+            const index = pixel_index(width, x, y);
+            high_pass_p[index] = squared(rcd_high_pass_diagonal_p(
+                mosaic,
+                width,
+                height,
+                x,
+                y,
+            ));
+            high_pass_q[index] = squared(rcd_high_pass_diagonal_q(
+                mosaic,
+                width,
+                height,
+                x,
+                y,
+            ));
+        }
+    }
+
+    @memset(low_pass_or_direction_pq, 0);
+    y = radius;
+    while (y < height - radius) : (y += 1) {
+        var x: u32 = radius;
+        while (x < width - radius) : (x += 1) {
+            if (site_color(cfa, x, y) == .green) continue;
+            const p_stat = @max(epsilon_squared, high_pass_p[pixel_index(width, x - 1, y - 1)] +
+                high_pass_p[pixel_index(width, x, y)] +
+                high_pass_p[pixel_index(width, x + 1, y + 1)]);
+            const q_stat = @max(epsilon_squared, high_pass_q[pixel_index(width, x + 1, y - 1)] +
+                high_pass_q[pixel_index(width, x, y)] +
+                high_pass_q[pixel_index(width, x - 1, y + 1)]);
+            low_pass_or_direction_pq[pixel_index(width, x, y)] =
+                p_stat / (p_stat + q_stat);
+        }
+    }
+
+    // Step 4.2: Reconstruct the opposite chroma at red/blue sites from
+    // diagonal color differences.
+    y = radius;
+    while (y < height - radius) : (y += 1) {
+        var x: u32 = radius;
+        while (x < width - radius) : (x += 1) {
+            const color_at_site = site_color(cfa, x, y);
+            if (color_at_site == .green) continue;
+            const opposite = if (color_at_site == .red) planes.b else planes.r;
+            const index = pixel_index(width, x, y);
+            const direction = refined_direction(
+                low_pass_or_direction_pq,
+                width,
+                x,
+                y,
+            );
+            const northwest_gradient = epsilon +
+                @abs(opposite[pixel_index(width, x - 1, y - 1)] -
+                    opposite[pixel_index(width, x + 1, y + 1)]) +
+                @abs(opposite[pixel_index(width, x - 1, y - 1)] -
+                    opposite[pixel_index(width, x - 3, y - 3)]) +
+                @abs(planes.g[index] - planes.g[pixel_index(width, x - 2, y - 2)]);
+            const northeast_gradient = epsilon +
+                @abs(opposite[pixel_index(width, x + 1, y - 1)] -
+                    opposite[pixel_index(width, x - 1, y + 1)]) +
+                @abs(opposite[pixel_index(width, x + 1, y - 1)] -
+                    opposite[pixel_index(width, x + 3, y - 3)]) +
+                @abs(planes.g[index] - planes.g[pixel_index(width, x + 2, y - 2)]);
+            const southwest_gradient = epsilon +
+                @abs(opposite[pixel_index(width, x + 1, y - 1)] -
+                    opposite[pixel_index(width, x - 1, y + 1)]) +
+                @abs(opposite[pixel_index(width, x - 1, y + 1)] -
+                    opposite[pixel_index(width, x - 3, y + 3)]) +
+                @abs(planes.g[index] - planes.g[pixel_index(width, x - 2, y + 2)]);
+            const southeast_gradient = epsilon +
+                @abs(opposite[pixel_index(width, x - 1, y - 1)] -
+                    opposite[pixel_index(width, x + 1, y + 1)]) +
+                @abs(opposite[pixel_index(width, x + 1, y + 1)] -
+                    opposite[pixel_index(width, x + 3, y + 3)]) +
+                @abs(planes.g[index] - planes.g[pixel_index(width, x + 2, y + 2)]);
+            const difference_northwest =
+                opposite[pixel_index(width, x - 1, y - 1)] -
+                planes.g[pixel_index(width, x - 1, y - 1)];
+            const difference_northeast =
+                opposite[pixel_index(width, x + 1, y - 1)] -
+                planes.g[pixel_index(width, x + 1, y - 1)];
+            const difference_southwest =
+                opposite[pixel_index(width, x - 1, y + 1)] -
+                planes.g[pixel_index(width, x - 1, y + 1)];
+            const difference_southeast =
+                opposite[pixel_index(width, x + 1, y + 1)] -
+                planes.g[pixel_index(width, x + 1, y + 1)];
+            const diagonal_p =
+                (northwest_gradient * difference_southeast +
+                    southeast_gradient * difference_northwest) /
+                (northwest_gradient + southeast_gradient);
+            const diagonal_q =
+                (northeast_gradient * difference_southwest +
+                    southwest_gradient * difference_northeast) /
+                (northeast_gradient + southwest_gradient);
+            opposite[index] = @max(
+                0,
+                planes.g[index] + interpolate(direction, diagonal_q, diagonal_p),
+            );
+        }
+    }
+
+    // Step 4.3: Reconstruct both chroma channels at green sites from cardinal
+    // color differences using the same vertical/horizontal discriminator.
+    y = radius;
+    while (y < height - radius) : (y += 1) {
+        var x: u32 = radius;
+        while (x < width - radius) : (x += 1) {
+            if (site_color(cfa, x, y) != .green) continue;
+            const index = pixel_index(width, x, y);
+            const green_center = planes.g[index];
+            const direction = refined_direction(direction_vh, width, x, y);
+            for ([_][]f32{ planes.r, planes.b }) |channel| {
+                const north_gradient = epsilon +
+                    @abs(green_center - planes.g[pixel_index(width, x, y - 2)]) +
+                    @abs(channel[pixel_index(width, x, y - 1)] -
+                        channel[pixel_index(width, x, y + 1)]) +
+                    @abs(channel[pixel_index(width, x, y - 1)] -
+                        channel[pixel_index(width, x, y - 3)]);
+                const south_gradient = epsilon +
+                    @abs(green_center - planes.g[pixel_index(width, x, y + 2)]) +
+                    @abs(channel[pixel_index(width, x, y - 1)] -
+                        channel[pixel_index(width, x, y + 1)]) +
+                    @abs(channel[pixel_index(width, x, y + 1)] -
+                        channel[pixel_index(width, x, y + 3)]);
+                const west_gradient = epsilon +
+                    @abs(green_center - planes.g[pixel_index(width, x - 2, y)]) +
+                    @abs(channel[pixel_index(width, x - 1, y)] -
+                        channel[pixel_index(width, x + 1, y)]) +
+                    @abs(channel[pixel_index(width, x - 1, y)] -
+                        channel[pixel_index(width, x - 3, y)]);
+                const east_gradient = epsilon +
+                    @abs(green_center - planes.g[pixel_index(width, x + 2, y)]) +
+                    @abs(channel[pixel_index(width, x - 1, y)] -
+                        channel[pixel_index(width, x + 1, y)]) +
+                    @abs(channel[pixel_index(width, x + 1, y)] -
+                        channel[pixel_index(width, x + 3, y)]);
+                const difference_north = channel[pixel_index(width, x, y - 1)] -
+                    planes.g[pixel_index(width, x, y - 1)];
+                const difference_south = channel[pixel_index(width, x, y + 1)] -
+                    planes.g[pixel_index(width, x, y + 1)];
+                const difference_west = channel[pixel_index(width, x - 1, y)] -
+                    planes.g[pixel_index(width, x - 1, y)];
+                const difference_east = channel[pixel_index(width, x + 1, y)] -
+                    planes.g[pixel_index(width, x + 1, y)];
+                const vertical =
+                    (north_gradient * difference_south +
+                        south_gradient * difference_north) /
+                    (north_gradient + south_gradient);
+                const horizontal =
+                    (east_gradient * difference_west +
+                        west_gradient * difference_east) /
+                    (east_gradient + west_gradient);
+                channel[index] = @max(
+                    0,
+                    green_center + interpolate(direction, horizontal, vertical),
+                );
+            }
+        }
+    }
+
+    for ([_][]const f32{ planes.r, planes.g, planes.b }) |plane| {
+        for (plane) |value| assert(std.math.isFinite(value));
+    }
+}
+
+fn pixel_index(width: u32, x: u32, y: u32) usize {
+    return @as(usize, y) * width + x;
+}
+
+fn fetch_u32(values: []const f32, width: u32, x: u32, y: u32) f32 {
+    const index = pixel_index(width, x, y);
+    assert(index < values.len);
+    return values[index];
+}
+
+fn squared(value: f32) f32 {
+    return value * value;
+}
+
+fn interpolate(weight: f32, first: f32, second: f32) f32 {
+    assert(weight >= 0);
+    assert(weight <= 1);
+    return weight * (first - second) + second;
+}
+
+fn refined_direction(values: []const f32, width: u32, x: u32, y: u32) f32 {
+    const central = values[pixel_index(width, x, y)];
+    const neighborhood = 0.25 *
+        (values[pixel_index(width, x - 1, y - 1)] +
+            values[pixel_index(width, x + 1, y - 1)] +
+            values[pixel_index(width, x - 1, y + 1)] +
+            values[pixel_index(width, x + 1, y + 1)]);
+    return if (@abs(0.5 - central) < @abs(0.5 - neighborhood))
+        neighborhood
+    else
+        central;
+}
+
+fn rcd_high_pass_vertical(
+    mosaic: []const f32,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+) f32 {
+    const xi: i64 = x;
+    const yi: i64 = y;
+    return (fetch(mosaic, width, height, xi, yi - 3) -
+        fetch(mosaic, width, height, xi, yi - 1) -
+        fetch(mosaic, width, height, xi, yi + 1) +
+        fetch(mosaic, width, height, xi, yi + 3)) -
+        3 * (fetch(mosaic, width, height, xi, yi - 2) +
+            fetch(mosaic, width, height, xi, yi + 2)) +
+        6 * fetch(mosaic, width, height, xi, yi);
+}
+
+fn rcd_high_pass_horizontal(
+    mosaic: []const f32,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+) f32 {
+    const xi: i64 = x;
+    const yi: i64 = y;
+    return (fetch(mosaic, width, height, xi - 3, yi) -
+        fetch(mosaic, width, height, xi - 1, yi) -
+        fetch(mosaic, width, height, xi + 1, yi) +
+        fetch(mosaic, width, height, xi + 3, yi)) -
+        3 * (fetch(mosaic, width, height, xi - 2, yi) +
+            fetch(mosaic, width, height, xi + 2, yi)) +
+        6 * fetch(mosaic, width, height, xi, yi);
+}
+
+fn rcd_high_pass_diagonal_p(
+    mosaic: []const f32,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+) f32 {
+    const xi: i64 = x;
+    const yi: i64 = y;
+    return (fetch(mosaic, width, height, xi - 3, yi - 3) -
+        fetch(mosaic, width, height, xi - 1, yi - 1) -
+        fetch(mosaic, width, height, xi + 1, yi + 1) +
+        fetch(mosaic, width, height, xi + 3, yi + 3)) -
+        3 * (fetch(mosaic, width, height, xi - 2, yi - 2) +
+            fetch(mosaic, width, height, xi + 2, yi + 2)) +
+        6 * fetch(mosaic, width, height, xi, yi);
+}
+
+fn rcd_high_pass_diagonal_q(
+    mosaic: []const f32,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+) f32 {
+    const xi: i64 = x;
+    const yi: i64 = y;
+    return (fetch(mosaic, width, height, xi + 3, yi - 3) -
+        fetch(mosaic, width, height, xi + 1, yi - 1) -
+        fetch(mosaic, width, height, xi - 1, yi + 1) +
+        fetch(mosaic, width, height, xi - 3, yi + 3)) -
+        3 * (fetch(mosaic, width, height, xi + 2, yi - 2) +
+            fetch(mosaic, width, height, xi - 2, yi + 2)) +
+        6 * fetch(mosaic, width, height, xi, yi);
+}
+
 fn site_color(comptime cfa: [4]dng.CfaColor, x: u32, y: u32) dng.CfaColor {
     return cfa[((y & 1) << 1) | (x & 1)];
 }
@@ -1511,6 +2002,93 @@ fn test_sensor(gpa: std.mem.Allocator, width: u32, height: u32) !dng.SensorData 
     };
 }
 
+test "RCD reference preserves samples and reduces neutral fine-fabric chroma" {
+    // An odd-sized neutral weave near the CFA Nyquist limit exposes false
+    // color immediately: the ground truth has identical RGB at every point,
+    // so any reconstructed channel difference is an artifact.
+    const gpa = std.testing.allocator;
+    const width: u32 = 65;
+    const height: u32 = 49;
+    const cfa = [4]dng.CfaColor{ .red, .green, .green, .blue };
+    const mosaic = try gpa.alloc(f32, @as(usize, width) * height);
+    defer gpa.free(mosaic);
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < width) : (x += 1) {
+            const weave = ((x + 2 * y) % 5) < 2;
+            mosaic[pixel_index(width, x, y)] = if (weave) 0.78 else 0.22;
+        }
+    }
+
+    var bilinear = try image.Planes.init(gpa, width, height);
+    defer bilinear.deinit(gpa);
+    demosaic_bilinear(cfa, mosaic, &bilinear);
+
+    var rcd = try image.Planes.init(gpa, width, height);
+    defer rcd.deinit(gpa);
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    try demosaic_rcd_reference(scratch.allocator(), cfa, mosaic, &rcd);
+
+    var bilinear_chroma_sum: f64 = 0;
+    var rcd_chroma_sum: f64 = 0;
+    var sample_count: u32 = 0;
+    y = 9;
+    while (y < height - 9) : (y += 1) {
+        var x: u32 = 9;
+        while (x < width - 9) : (x += 1) {
+            const index = pixel_index(width, x, y);
+            bilinear_chroma_sum += @abs(bilinear.r[index] - bilinear.g[index]);
+            bilinear_chroma_sum += @abs(bilinear.b[index] - bilinear.g[index]);
+            rcd_chroma_sum += @abs(rcd.r[index] - rcd.g[index]);
+            rcd_chroma_sum += @abs(rcd.b[index] - rcd.g[index]);
+            sample_count += 2;
+
+            switch (site_color(cfa, x, y)) {
+                .red => try std.testing.expectEqual(mosaic[index], rcd.r[index]),
+                .green => try std.testing.expectEqual(mosaic[index], rcd.g[index]),
+                .blue => try std.testing.expectEqual(mosaic[index], rcd.b[index]),
+            }
+        }
+    }
+    try std.testing.expect(sample_count > 0);
+    const bilinear_chroma_mean = bilinear_chroma_sum / sample_count;
+    const rcd_chroma_mean = rcd_chroma_sum / sample_count;
+    try std.testing.expect(rcd_chroma_mean < bilinear_chroma_mean);
+}
+
+test "RCD reference has finite deterministic borders for tiny and odd images" {
+    const gpa = std.testing.allocator;
+    const cfa = [4]dng.CfaColor{ .blue, .green, .green, .red };
+    const dimensions = [_][2]u32{ .{ 7, 5 }, .{ 19, 17 }, .{ 33, 25 } };
+    for (dimensions) |dimension| {
+        const width = dimension[0];
+        const height = dimension[1];
+        const mosaic = try gpa.alloc(f32, @as(usize, width) * height);
+        defer gpa.free(mosaic);
+        for (mosaic, 0..) |*value, index| {
+            value.* = @as(f32, @floatFromInt((index * 37) % 101)) / 100;
+        }
+        var first = try image.Planes.init(gpa, width, height);
+        defer first.deinit(gpa);
+        var second = try image.Planes.init(gpa, width, height);
+        defer second.deinit(gpa);
+        var first_scratch = std.heap.ArenaAllocator.init(gpa);
+        defer first_scratch.deinit();
+        var second_scratch = std.heap.ArenaAllocator.init(gpa);
+        defer second_scratch.deinit();
+        try demosaic_rcd_reference(first_scratch.allocator(), cfa, mosaic, &first);
+        try demosaic_rcd_reference(second_scratch.allocator(), cfa, mosaic, &second);
+        try std.testing.expectEqualSlices(f32, first.r, second.r);
+        try std.testing.expectEqualSlices(f32, first.g, second.g);
+        try std.testing.expectEqualSlices(f32, first.b, second.b);
+        for ([_][]const f32{ first.r, first.g, first.b }) |plane| {
+            for (plane) |value| try std.testing.expect(std.math.isFinite(value));
+        }
+    }
+}
+
 test "per-site black and white levels normalize each CFA site independently" {
     const source = [4]u16{ 60, 120, 180, 240 };
     const black = [4]f32{ 10, 20, 30, 40 };
@@ -1555,6 +2133,13 @@ test "downsampled render is deterministic and sized by the longest edge" {
     defer full.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 37), full.width);
     try std.testing.expectEqual(@as(u32, 23), full.height);
+}
+
+test "preview level may undershoot its edge bound by at most five percent" {
+    try std.testing.expectEqual(@as(u32, 4), preview_factor(5472, 1440));
+    try std.testing.expectEqual(@as(u32, 4), preview_factor(5472, 1024));
+    try std.testing.expectEqual(@as(u32, 10), preview_factor(5472, 512));
+    try std.testing.expectEqual(@as(u32, 0), preview_factor(1440, 1440));
 }
 
 test "engine v2 applies default crop and orientation before preview sizing" {

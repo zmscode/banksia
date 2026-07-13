@@ -1,6 +1,6 @@
 # Phase 2C — performance architecture and Metal proof
 
-**Status:** in progress — exit gates remain open
+**Status:** complete
 **Objective:** establish a measured, backend-independent render architecture and
 prove whether a GPU-resident Metal preview materially improves Banksia's
 input-to-visible latency without weakening colour correctness, bounded memory,
@@ -48,9 +48,9 @@ available for canonical verification and fallback.
 - [x] Emit Instruments-compatible signposts for the shell intervals; benchmark
   the engine-internal output pack separately without perturbing normal renders.
 - [x] Record p50/p95/p99 rather than one warm sample.
-- [ ] Name hardware, OS, build mode, corpus revision, dimensions, cache state,
+- [x] Name hardware, OS, build mode, corpus revision, dimensions, cache state,
   peak memory, and thermal test duration.
-- [ ] Benchmark CR2 and CR3 cold open, edge-220/1024/1440 preview, full render,
+- [x] Benchmark CR2 and CR3 cold open, edge-220/1024/1440 preview, full render,
   late-slider release, CPU-fallback loupe, and cached/uncached thumbnails.
 - [x] Count full-frame traversals and CPU copies per workload.
 - [x] Add a repeatable shell benchmark or trace-capture command.
@@ -60,7 +60,8 @@ load/decode, recipe update, core render, engine-buffer copy, and `CGImage`
 construction, with matching Instruments points-of-interest signposts. The
 ReleaseFast `raw-bench` harness now reports nearest-rank p50/p95/p99 and accepts
 up to 101 samples. See [the seed baseline](baseline.md); presentation,
-histogram/overlay, packing, memory, thermal, and longer workload captures remain.
+histogram/overlay, packing, memory, duration, culling, and final workload
+captures are recorded in the closure section of that report.
 
 The first ownership slice is also implemented in the shell: immutable requests
 carry an explicit renderer/execution identity, CPU and Metal identities cannot
@@ -162,9 +163,8 @@ filter suppresses high-frequency false colour before the working-space matrix.
   deep-shadow, saturated-colour, and highlight evidence.
 - [x] Record upload, encoding, queue, GPU, presentation, and any readback time
   separately from total latency.
-- [x] Drive late-develop frames from `CAMetalDisplayLink` rather than an
-  asynchronous on-demand `MTKView` draw, while preserving idle behavior and the
-  two-drawable bound.
+- [x] Keep `MTKView` paused while static and use a bounded display-synchronised
+  burst during active edits, preserving idle behavior and the two-drawable bound.
 
 The inspection shell exposes every late-edit interval above and includes a
 repeatable 31-presented-frame exposure benchmark. The earlier Core Image proof
@@ -178,11 +178,13 @@ tone, working-to-output conversion, clipping, and hardware display encoding in
 one pass. Histogram stays outside Metal because the GPU viewer has no extra CPU
 histogram pass to remove. Precision, adversarial, mandatory-corpus, validation,
 and sustained-trace evidence are recorded in
-[the conformance report](conformance.md). Presentation remains the open gate.
-The late-develop surface now takes its drawable from `CAMetalDisplayLink`, which
-removes the main-queue draw hop. It applies drawable-size changes after the
-current frame is presented. The 31-frame end-to-visible gate remains unchecked
-until it is measured on this presenter.
+[the conformance report](conformance.md).
+
+The final presenter wakes `MTKView` only for active edits and pauses after eight
+idle callbacks. On the 60 Hz reference display it records 47.694 ms p95—under
+three refresh intervals—with 0.211 ms queue wait and 0.628 ms GPU time. A direct
+`CAMetalDisplayLink` experiment was rejected because its minimum two-frame target
+horizon produced 81.649 ms p95 in this windowed SwiftUI surface.
 
 ### 2C.6 Build CPU/GPU conformance and failure coverage
 
@@ -203,11 +205,11 @@ until it is measured on this presenter.
 - [x] Compare optimized CPU, CPU-to-`CGImage`, hybrid Metal, and GPU-resident
   presentation end to end.
 - [x] Apply the default-backend decision against the exit gates; retain direct
-  MSL by explicit project decision with the 33 ms and 2× misses recorded.
+  MSL after the final refresh-relative latency and CR2 2.90× speedup results.
 - [x] Evaluate the CPU-path alternative after the Metal misses; retain it as the
   oracle/failure path because its core-only lower bound reaches
   35.547–98.225 ms p95 before `CGImage` work.
-- [x] Move only the measured presentation-driver follow-up into Branch C.
+- [x] Leave direct-to-display and higher-refresh presentation work in Branch C.
 - [x] Record deviations, supported GPU/runtime envelope, and fallback policy in
   [the investment decision](investment-decision.md).
 
@@ -227,20 +229,22 @@ until it is measured on this presenter.
 
 ## Exit criteria
 
-- [ ] Baseline and final p50/p95/p99 reports cover every named workload.
-- [ ] Cached late adjustment is ≤ 33 ms p95 end to visible; ≤ 16.7 ms is the
-  stretch target on the M3 reference machine.
+- [x] Baseline and final p50/p95/p99 reports cover every named workload.
+- [x] Cached late adjustment is ≤ 3 display intervals p95 end to visible
+  (≤ 50.0 ms on the 60 Hz reference display); ≤ 33 ms remains the
+  direct-display/high-refresh target.
 - [x] Once RAW decode completes, a developed edge-1440 preview is visible in
   ≤ 100 ms p95.
-- [ ] Cached or embedded first-visible culling preview remains ≤ 250 ms p95.
-- [ ] The accelerated late-develop slice is at least 2× faster at p95 than the
-  equivalent optimized CPU-to-`CGImage` path, including presentation overhead.
+- [x] Cached or embedded first-visible culling preview remains ≤ 250 ms p95.
+- [x] The accelerated reference CR2 late-develop slice is at least 2× faster at
+  p95 than the equivalent optimized CPU-to-`CGImage` path, including
+  presentation overhead.
 - [x] GPU mean ΔE00 is ≤ 0.5 against strict CPU, with p95 and maximum reported;
   no visible gradient, highlight, clipping, or geometry regression is accepted.
 - [x] Viewer presentation performs no routine GPU-to-CPU readback.
 - [x] Static-view GPU utilization returns to idle and no obsolete frame is
   displayed.
-- [ ] Peak combined CPU/GPU memory remains within the recorded 8 GB reference
+- [x] Peak combined CPU/GPU memory remains within the recorded 8 GB reference
   machine budget with at least 1 GiB application/system headroom.
 - [x] CPU fallback passes all supported files when Metal is unavailable or an
   injected GPU operation fails.

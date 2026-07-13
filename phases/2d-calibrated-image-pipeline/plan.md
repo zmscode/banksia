@@ -87,7 +87,7 @@ semantic stages even when they fuse kernels or use different execution plans.
   colour, curve, detail, and lens records for a RAW without rendering it.
 - [x] Define stable IDs for calibration bundle, camera record, ISO record, input
   profile, film curve, lens profile, and processing graph.
-- [ ] Include every selected dependency ID in the renderer manifest and first
+- [x] Include every selected dependency ID in the renderer manifest and first
   affected stage/cache key.
 - [x] Reject missing, ambiguous, non-finite, malformed, or unsupported records
   with an explicit fallback reason.
@@ -98,33 +98,42 @@ semantic stages even when they fuse kernels or use different execution plans.
 - [x] Convert the SQLite/XML extraction into compact canonical runtime records;
   runtime code must not query the Capture One installation.
 - [x] Match cameras by normalized stable identity, not display-name substring.
-- [ ] Extend capture facts with numeric lens identity, focal length, aperture,
+- [x] Extend capture facts with numeric lens identity, focal length, aperture,
   focus distance when present, sensor mode, and effective ISO/gain mode.
-- [ ] Resolve exact ISO nodes first; interpolate only fields whose extracted
+- [x] Resolve exact ISO nodes first; interpolate only fields whose extracted
   domain is continuous and preserve dual-gain/discontinuous boundaries.
-- [ ] Define explicit generic fallback, partial-match, and correction-off states.
+- [x] Define explicit generic fallback, partial-match, and correction-off states.
 - [x] Add a diagnostic explanation for every resolved or skipped calibration.
 
 ### 2D.3 Make the pipeline graph explicit and versioned
 
-- [ ] Separate recipe schema, semantic graph version, operation implementation
+- [x] Separate recipe schema, semantic graph version, operation implementation
   IDs, calibration dependencies, and CPU/GPU execution identity.
-- [ ] Make stage input/output domains explicit: CFA, camera RGB, profiled
+- [x] Make stage input/output domains explicit: CFA, camera RGB, profiled
   working RGB, developed linear RGB, and display/output RGB.
-- [ ] Define neutral states and legal ordering for every technical and creative
+- [x] Define neutral states and legal ordering for every technical and creative
   operation.
-- [ ] Keep camera defaults outside the user's adjustment recipe; a resolved
+- [x] Keep camera defaults outside the user's adjustment recipe; a resolved
   default set is an immutable dependency that the recipe may override.
-- [ ] Require explicit migration when a variant adopts a newer graph or tuned
+- [x] Require explicit migration when a variant adopts a newer graph or tuned
   profile.
-- [ ] Add a pipeline inspection dump showing stages, fusion, precision, and
+- [x] Add a pipeline inspection dump showing stages, fusion, precision, and
   dependency IDs for a render request.
+- [x] Scope mutable adjustment recipes to canonical asset identity within the
+  active session, restore them before rendering a new selection, and prove
+  switching assets cannot turn a local edit into an implicit batch edit.
 
 ### 2D.4 Replace provisional Bayer reconstruction
 
-- [ ] Implement a rights-unconstrained, maintainable edge-aware Bayer reference,
+- [x] Preserve the last valid retained preview while early white-balance work
+  coalesces, and publish only the newest completed generation without replacing
+  the image with a loading surface.
+- [x] Separate full-resolution source geometry from retained-preview geometry;
+  progressively request 1440, 2880, and bounded 4096-edge linear textures from
+  drawable density instead of enlarging one 1440-edge texture indefinitely.
+- [x] Implement a rights-unconstrained, maintainable edge-aware Bayer reference,
   initially RCD unless corpus evidence favors another method.
-- [ ] Preserve bilinear and the current chroma safety filter as diagnostic
+- [x] Preserve bilinear and the current chroma safety filter as diagnostic
   implementations with distinct IDs.
 - [ ] Add green equalization, hot/flagged-pixel cleanup, and bounded row/column
   correction before demosaic where calibration supplies parameters.
@@ -218,20 +227,22 @@ semantic stages even when they fuse kernels or use different execution plans.
 
 ## Tests
 
-- [ ] Engine-v1 exact hashes remain unchanged.
-- [ ] Historical engine-v2 manifests remain reproducible.
+- [x] Engine-v1 exact hashes remain unchanged.
+- [x] Historical engine-v2 manifests remain reproducible.
 - [x] Calibration import is deterministic and canonical.
-- [ ] Camera/ISO/lens selection and fallback tables are exhaustive.
+- [x] Camera/ISO/lens selection and fallback tables are exhaustive.
 - [ ] Extracted ICC shaper/CLUT known vectors match the source profile evaluator.
 - [ ] Film-curve control points and interpolation known vectors match extraction.
-- [ ] Noise interpolation preserves recorded discontinuities.
+- [x] Noise interpolation preserves recorded discontinuities.
 - [ ] Lens-node interpolation hits exact stored nodes and remains bounded between
   them.
 - [ ] RAW artefact fixtures cover false colour, moiré, zippering, diagonals,
   highlights, defects, deep shadows, and saturated edges.
-- [ ] Full 27-file local corpus and committed CI corpus remain green.
+- [x] Full 27-file local corpus and committed CI corpus remain green.
 - [ ] CPU/Metal conformance covers every default stage and failure fallback.
 - [ ] Repeated open/edit/close, memory pressure, cancellation, and resize soak.
+- [x] Per-asset recipe isolation covers canonical URL aliases and repeated
+  two-RAW selection with different early and late adjustments.
 
 ## Exit criteria
 
@@ -251,7 +262,7 @@ semantic stages even when they fuse kernels or use different execution plans.
 - [ ] Full-resolution 24MP default render is ≤2 seconds p95 and admitted peak
   combined memory remains ≤1.5 GiB with 1 GiB system headroom.
 - [ ] Static GPU work returns to idle; no obsolete frame is published.
-- [ ] Every artifact records graph, calibration, renderer, precision, backend,
+- [x] Every artifact records graph, calibration, renderer, precision, backend,
   source, recipe, and output identities.
 
 ## Risks
@@ -278,6 +289,31 @@ semantic stages even when they fuse kernels or use different execution plans.
 ## Phase close-out evidence
 
 - Calibration bundle revision and selected profile IDs.
+- `pipeline-audit` reports active and target graph IDs, domains, implementation
+  IDs, neutral behavior, precision, fusion, resolution states, and every selected
+  dependency for a RAW without rendering it.
+- The C ABI and Swift render contract snapshot the same bounded pipeline manifest;
+  dependency changes invalidate the first affected stage and final artifact key.
+- ISO resolver tests cover exact nodes, continuous interpolation, lower-node
+  inheritance, effective-ISO precedence, and refusal to interpolate across a
+  gain discontinuity.
+- Golden conformance passes all 25 historical cases. The full local 27-file RAW
+  corpus and committed eight-file native-DNG corpus pass in Debug, and the
+  committed gate also passes in ReleaseFast.
+- Early temperature/tint edits retain the currently presented Metal texture
+  until the accepted replacement is ready. Source dimensions now cross the C
+  ABI separately, zoom refinement is display-scale aware and debounced, active
+  early drags cap at the 2880 detail tier, and automatic nearest-neighbour
+  enlargement of undersized previews is removed.
+- Adjustment recipes are keyed by canonical asset URL for the active session;
+  two-RAW integration coverage proves early and late edits restore only for the
+  selected image. Session/catalog durability remains explicitly deferred.
+- The whole-frame RCD reference preserves measured CFA samples, reduces mean
+  false chroma versus bilinear on an odd-sized neutral fine-weave fixture, and
+  is finite and deterministic on tiny/odd borders. It remains a non-active
+  candidate until the broader diagonal, maze, colour-edge, highlight, preview,
+  and visual corpus gates pass; bilinear and bilinear-plus-chroma-safe retain
+  separate immutable implementation IDs.
 - Reference machine, OS, build modes, and Capture One oracle version.
 - Corpus and oracle hashes.
 - CPU/GPU conformance report.

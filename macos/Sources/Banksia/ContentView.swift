@@ -72,6 +72,18 @@ struct ContentView: View {
             // Environment form avoids AppKit treating a positional path as a
             // document-open launch during automated shell validation.
             if let path = ProcessInfo.processInfo.environment["BANKSIA_OPEN"] {
+                if ProcessInfo.processInfo.environment["BANKSIA_CULLING_BENCHMARK"] == "1" {
+                    let sampleCount = Int(
+                        ProcessInfo.processInfo.environment[
+                            "BANKSIA_CULLING_BENCHMARK_SAMPLES"
+                        ] ?? "31"
+                    ) ?? 31
+                    thumbs.runBenchmark(
+                        url: URL(fileURLWithPath: path),
+                        sampleCount: sampleCount
+                    )
+                    return
+                }
                 controller.open(url: URL(fileURLWithPath: path))
                 if ProcessInfo.processInfo.environment["BANKSIA_METAL_BENCHMARK"] == "1" {
                     controller.runMetalBenchmark()

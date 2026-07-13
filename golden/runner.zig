@@ -270,8 +270,16 @@ fn baseline_compare(gpa: std.mem.Allocator, io: std.Io, results: []const Result)
             fail += 1;
             continue;
         };
-        if (expected != .string or !std.mem.eql(u8, expected.string, &result.hash_hex)) {
-            std.debug.print("FAIL {s}: output drifted from baseline\n", .{result.name});
+        if (expected != .string) {
+            std.debug.print("FAIL {s}: baseline hash is not a string\n", .{result.name});
+            fail += 1;
+            continue;
+        }
+        if (!std.mem.eql(u8, expected.string, &result.hash_hex)) {
+            std.debug.print(
+                "FAIL {s}: output drifted\n  expected {s}\n  actual   {s}\n",
+                .{ result.name, expected.string, result.hash_hex },
+            );
             fail += 1;
             continue;
         }

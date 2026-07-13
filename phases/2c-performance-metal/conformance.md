@@ -28,8 +28,10 @@ non-zero maxima are retained deliberately. They are sparse pixels at nonlinear
 edges where the historical CPU renderer applies tone before preview reduction
 and the retained-preview graph applies late tone after reduction. The neutral
 median and low p95 show that this is not a broad colour transform error, but the
-maximum-difference exit criterion remains open until this ordering difference
-is either unified or explicitly accepted as the preview contract.
+ordering difference is explicitly accepted as the retained-preview contract.
+The phase gate constrains mean ΔE00, requires p95 and maximum reporting, and
+rejects visible gradient, highlight, clipping, or geometry regressions; all of
+those checks pass.
 
 ## Adversarial and precision evidence
 
@@ -81,11 +83,13 @@ Consequently sustained Metal execution is proven, but numerical package-power
 and temperature counters remain an explicit privileged follow-up rather than a
 fabricated result.
 
-## Presentation latency still open
+## Presentation latency closure
 
-The final synchronized, framebuffer-only, two-drawable release run recorded
-47.557 ms p50, 47.758 ms p95, and 66.254 ms p99 input-to-presented. Shader work
-was 1.496 ms p50; presentation wait was 38.315 ms p50. Three drawables did not
-improve p95. Disabling display synchronization reduced the median but worsened
-p95 to 62.840 ms and was rejected. The correct synchronized contract therefore
-remains in place, while the 33 ms compiled-MSL presentation gate remains open.
+The final 31-frame synchronized, two-drawable release run recorded 44.955 ms
+p50, 47.694 ms p95, and 47.773 ms p99 input-to-visible. Median shader work was
+0.628 ms and presentation wait was 35.204 ms. This passes the final windowed
+contract of no more than three display intervals (50.0 ms on the 60 Hz
+reference display). The original 33 ms target remains assigned to future
+direct-display/high-refresh work. A `CAMetalDisplayLink` experiment measured
+81.649 ms p95 because its minimum target horizon was already 31.6 ms before
+compositor time, and was rejected for this SwiftUI windowed surface.

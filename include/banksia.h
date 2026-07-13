@@ -62,6 +62,20 @@ void bk_engine_destroy(bk_engine *engine);
  * returns; the path is not retained. */
 int32_t bk_load_raw(bk_engine *engine, const char *path);
 
+/* Return the visible, orientation-correct full-resolution dimensions of the
+ * loaded RAW. These dimensions are independent of the edge bound used by a
+ * later preview render. Returns BK_ERR_NO_RAW before a successful load. */
+int32_t bk_raw_dimensions(bk_engine *engine, uint32_t *out_width,
+                          uint32_t *out_height);
+
+/* Return the immutable pipeline/calibration manifest for the loaded RAW as
+ * UTF-8 JSON. It records the active and target semantic graphs, every selected
+ * calibration dependency, stage domains, implementation IDs, neutral behavior,
+ * and explicit fallback states. Owned by the engine and valid until the next
+ * call on the same handle. Returns NULL on failure. */
+const char *bk_pipeline_manifest_json(bk_engine *engine,
+                                      const char *calibration_database_path);
+
 /* Set the develop recipe from NUL-terminated canonical-form JSON. The
  * string is parsed and copied before this returns; it is not retained.
  * Until the first successful call, renders use the engine default recipe.

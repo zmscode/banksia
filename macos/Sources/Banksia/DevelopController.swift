@@ -1,5 +1,7 @@
+import AppKit
 import CoreGraphics
 import CBanksia
+import Darwin
 import Foundation
 import Observation
 
@@ -46,6 +48,9 @@ final class DevelopController {
     private(set) var isMetalBenchmarking = false
     private(set) var pixelWidth = 0
     private(set) var pixelHeight = 0
+    private(set) var previewPixelWidth = 0
+    private(set) var previewPixelHeight = 0
+    private(set) var renderedPreviewEdgeMax: UInt32 = 0
     /// CPU analysis generation, dormant while automatic CPU rendering is off.
     private(set) var renderID: UInt = 0
 
@@ -75,9 +80,13 @@ final class DevelopController {
     private var metalBenchmarkSamples: [MetalDevelopTiming] = []
     private var metalFrameContinuation: CheckedContinuation<Void, Never>?
     private var benchmarkWhenReady = false
+    private var metalBenchmarkOriginalExposure: Double?
     private var applicationActive = true
+    private var pipelineManifest: PipelineManifest = .legacyV2
+    private var requestedPreviewEdgeMax = PreviewResolutionPolicy.fastEdge
+    private var assetDevelopStore = AssetDevelopStore()
 
-    static let linearPreviewEdgeMax: UInt32 = 1440
+    static let linearPreviewEdgeMax = PreviewResolutionPolicy.fastEdge
 
     func open(url: URL) {
         loadTask?.cancel()
@@ -85,6 +94,8 @@ final class DevelopController {
         benchmarkTask?.cancel()
         cpuFallbackTask?.cancel()
         benchmarkTask = nil
+        restoreMetalBenchmarkExposure()
+        saveCurrentDevelopState()
         metalFrameContinuation?.resume()
         metalFrameContinuation = nil
         isMetalBenchmarking = false
@@ -92,6 +103,7 @@ final class DevelopController {
         renderTask = nil
         requestedLinearRender = nil
         _ = generationClock.issue()
+        hasRaw = false
         baselineImage = nil
         image = nil
         useCPUFallback = false
@@ -100,8 +112,15 @@ final class DevelopController {
         lastLoadTiming = nil
         lastRenderTiming = nil
         lastLinearPreviewTiming = nil
+        pixelWidth = 0
+        pixelHeight = 0
+        previewPixelWidth = 0
+        previewPixelHeight = 0
+        renderedPreviewEdgeMax = 0
+        requestedPreviewEdgeMax = Self.linearPreviewEdgeMax
         fileName = url.lastPathComponent
         currentURL = url
+        develop = DevelopModel(state: assetDevelopStore.state(for: url))
         folderFiles = Self.listRawSiblings(of: url)
         statusText = "Opening \(url.lastPathComponent)…"
         isRendering = true
@@ -109,8 +128,12 @@ final class DevelopController {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             do {
-                lastLoadTiming = try await renderer.loadMeasured(path: url.path)
+                let timing = try await renderer.loadMeasured(path: url.path)
+                lastLoadTiming = timing
                 guard !Task.isCancelled else { return }
+                pixelWidth = timing.sourceWidth
+                pixelHeight = timing.sourceHeight
+                pipelineManifest = await renderer.currentPipelineManifest()
                 hasRaw = true
                 statusText = url.lastPathComponent
                 await renderLinearNow(makeRequest(
@@ -130,12 +153,12 @@ final class DevelopController {
 
     /// Early controls rebuild the linear base; late controls need no CPU work.
     func parameterChanged(_ domain: DevelopChangeDomain) {
+        if !isMetalBenchmarking { saveCurrentDevelopState() }
         if useCPUFallback {
             requestCPUFallbackRender()
             return
         }
         if domain == .early {
-            linearPreview = nil
             requestLinearRender()
         }
         // Late controls are rendered directly from the retained Metal texture.
@@ -158,10 +181,10 @@ final class DevelopController {
     func resetAdjustments() {
         guard develop.hasEdits else { return }
         develop.reset()
+        saveCurrentDevelopState()
         if useCPUFallback {
             requestCPUFallbackRender()
         } else {
-            linearPreview = nil
             requestLinearRender()
         }
     }
@@ -181,10 +204,10 @@ final class DevelopController {
 
     func recordMetalTiming(_ timing: MetalDevelopTiming) {
         lastMetalTiming = timing
-        guard isMetalBenchmarking else { return }
+        guard isMetalBenchmarking, let continuation = metalFrameContinuation else { return }
         metalBenchmarkSamples.append(timing)
-        metalFrameContinuation?.resume()
         metalFrameContinuation = nil
+        continuation.resume()
     }
 
     func setApplicationActive(_ active: Bool) {
@@ -200,7 +223,7 @@ final class DevelopController {
             cpuFallbackTask?.cancel()
         } else {
             requestedLinearRender = makeRequest(
-                edgeMax: Self.linearPreviewEdgeMax,
+                edgeMax: requestedPreviewEdgeMax,
                 intent: .settledPreview,
                 execution: .strictCPULinearWorking
             )
@@ -217,6 +240,7 @@ final class DevelopController {
         benchmarkWhenReady = false
         benchmarkTask?.cancel()
         let originalExposure = develop.ev
+        metalBenchmarkOriginalExposure = originalExposure
         metalBenchmarkSamples.removeAll(keepingCapacity: true)
         metalBenchmarkSummary = nil
         isMetalBenchmarking = true
@@ -225,6 +249,7 @@ final class DevelopController {
         ) ?? 31
         let sampleCount = min(10_000, max(2, requestedSamples))
         benchmarkTask = Task {
+            let benchmarkStartedAt = ProcessInfo.processInfo.systemUptime
             for index in 0..<sampleCount where !Task.isCancelled {
                 var exposure = (index.isMultiple(of: 2) ? -0.75 : 0.75)
                     + Double(index) * 0.001
@@ -234,7 +259,11 @@ final class DevelopController {
                     develop.ev = exposure
                 }
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else {
+                restoreMetalBenchmarkExposure()
+                benchmarkTask = nil
+                return
+            }
             metalBenchmarkSummary = MetalTimingSummary.make(samples: metalBenchmarkSamples)
             if let summary = metalBenchmarkSummary {
                 print(String(format:
@@ -250,23 +279,86 @@ final class DevelopController {
                     summary.gpuP50MS,
                     summary.presentWaitP50MS
                 ))
+                let peakRSS = Self.peakResidentBytes()
+                let metalBytes = MetalResourceMetrics.currentAllocatedBytes
+                let conservativeBytes = peakRSS + metalBytes
+                let physicalBytes = ProcessInfo.processInfo.physicalMemory
+                let headroomBytes = physicalBytes > conservativeBytes
+                    ? physicalBytes - conservativeBytes
+                    : 0
+                print(String(
+                    format: "metal-benchmark-context duration=%.3f s "
+                        + "peak_rss=%.2f MiB metal_current=%.2f MiB "
+                        + "conservative_combined=%.2f MiB headroom=%.2f MiB",
+                    ProcessInfo.processInfo.systemUptime - benchmarkStartedAt,
+                    Self.mebibytes(peakRSS),
+                    Self.mebibytes(metalBytes),
+                    Self.mebibytes(conservativeBytes),
+                    Self.mebibytes(headroomBytes)
+                ))
             }
             isMetalBenchmarking = false
             benchmarkTask = nil
+            metalBenchmarkOriginalExposure = nil
+            develop.ev = originalExposure
+            saveCurrentDevelopState()
+            if ProcessInfo.processInfo.environment["BANKSIA_EXIT_AFTER_BENCHMARK"] == "1" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    NSApp.terminate(nil)
+                }
+            }
+        }
+    }
+
+    private static func peakResidentBytes() -> UInt64 {
+        var usage = rusage()
+        guard getrusage(RUSAGE_SELF, &usage) == 0 else { return 0 }
+        return UInt64(max(0, usage.ru_maxrss))
+    }
+
+    private static func mebibytes(_ bytes: UInt64) -> Double {
+        Double(bytes) / 1_048_576
+    }
+
+    private func saveCurrentDevelopState() {
+        guard let currentURL else { return }
+        assetDevelopStore.save(develop.state, for: currentURL)
+    }
+
+    private func restoreMetalBenchmarkExposure() {
+        if let originalExposure = metalBenchmarkOriginalExposure {
             develop.ev = originalExposure
         }
+        metalBenchmarkOriginalExposure = nil
+        isMetalBenchmarking = false
     }
 
     /// Coalescing linear render loop: one render may execute and only the newest
     /// immutable request waits behind it.
     private func requestLinearRender() {
         guard hasRaw else { return }
+        let edgeMax = isDragging
+            ? PreviewResolutionPolicy.interactiveEdgeMax(
+                requestedEdgeMax: requestedPreviewEdgeMax
+            )
+            : requestedPreviewEdgeMax
         requestedLinearRender = makeRequest(
-            edgeMax: Self.linearPreviewEdgeMax,
+            edgeMax: edgeMax,
             intent: isDragging ? .interactivePreview : .settledPreview,
             execution: .strictCPULinearWorking
         )
         startRenderLoopIfNeeded()
+    }
+
+    func requestPreviewResolution(edgeMax: UInt32) {
+        precondition(edgeMax > 0)
+        guard hasRaw, edgeMax != requestedPreviewEdgeMax else { return }
+        requestedPreviewEdgeMax = edgeMax
+        if useCPUFallback {
+            requestCPUFallbackRender()
+        } else {
+            requestLinearRender()
+        }
     }
 
     private func startRenderLoopIfNeeded() {
@@ -295,7 +387,8 @@ final class DevelopController {
             recipeJSON: develop.recipeJSON,
             edgeMax: edgeMax,
             intent: intent,
-            execution: execution
+            execution: execution,
+            pipeline: pipelineManifest
         )
     }
 
@@ -307,10 +400,11 @@ final class DevelopController {
             else { return }
             linearPreview = rendered.preview
             linearPreviewGeneration = rendered.request.generation
+            renderedPreviewEdgeMax = rendered.request.edgeMax
             lastLinearPreviewTiming = rendered.timing
             lastRenderMS = rendered.timing.totalMS
-            pixelWidth = rendered.preview.width
-            pixelHeight = rendered.preview.height
+            previewPixelWidth = rendered.preview.width
+            previewPixelHeight = rendered.preview.height
             if benchmarkWhenReady { runMetalBenchmark() }
         } catch {
             guard !Task.isCancelled, generationClock.accepts(request.generation) else { return }
@@ -318,7 +412,7 @@ final class DevelopController {
                 return
             }
             // GPU-only mode has no automatic CPU presentation fallback.
-            if image == nil { statusText = "\(error)" }
+            if linearPreview == nil, image == nil { statusText = "\(error)" }
         }
     }
 
@@ -326,7 +420,7 @@ final class DevelopController {
         guard hasRaw, applicationActive else { return }
         cpuFallbackTask?.cancel()
         let request = makeRequest(
-            edgeMax: Self.linearPreviewEdgeMax,
+            edgeMax: requestedPreviewEdgeMax,
             intent: isDragging ? .interactivePreview : .settledPreview,
             execution: .strictCPUDisplay
         )
@@ -341,8 +435,8 @@ final class DevelopController {
                 renderID &+= 1
                 lastRenderTiming = rendered.timing
                 lastRenderMS = rendered.timing.rendererTotalMS
-                pixelWidth = rendered.image.width
-                pixelHeight = rendered.image.height
+                previewPixelWidth = rendered.image.width
+                previewPixelHeight = rendered.image.height
                 statusText = "\(fileName ?? "RAW") — CPU fallback"
                 isRendering = false
                 cpuFallbackTask = nil

@@ -77,7 +77,17 @@ pub const Metadata = struct {
     model: Text = .{},
     unique_model: Text = .{},
     lens: Text = .{},
+    lens_id: ?u64 = null,
+    focal_length_mm: ?f32 = null,
+    aperture_f_number: ?f32 = null,
+    focus_distance_m: ?f32 = null,
     iso: ?f32 = null,
+    effective_iso: ?f32 = null,
+    /// EXIF SensitivityType when present. This remains the source numeric value
+    /// until a calibrated camera record maps it to a named gain mode.
+    gain_mode: ?u16 = null,
+    /// Vendor sensor/readout mode when the backend exposes one.
+    sensor_mode: ?u16 = null,
     capture_time: ?i64 = null,
     capture_datetime: Text = .{},
     capture_subsecond: Text = .{},
@@ -219,11 +229,17 @@ const tag_tile_width: u16 = 322;
 const tag_tile_height: u16 = 323;
 const tag_tile_offsets: u16 = 324;
 const tag_tile_byte_counts: u16 = 325;
+const tag_f_number: u16 = 33437;
 const tag_cfa_repeat_dim: u16 = 33421;
 const tag_cfa_pattern: u16 = 33422;
 const tag_exif_ifd: u16 = 34665;
 const tag_iso_speed_ratings: u16 = 34855;
+const tag_sensitivity_type: u16 = 34864;
+const tag_recommended_exposure_index: u16 = 34866;
+const tag_iso_speed: u16 = 34867;
 const tag_datetime_original: u16 = 36867;
+const tag_subject_distance: u16 = 37382;
+const tag_focal_length: u16 = 37386;
 const tag_subsec_time_original: u16 = 37521;
 const tag_lens_model: u16 = 42036;
 const tag_unique_camera_model: u16 = 50708;
@@ -553,7 +569,36 @@ fn metadata_from_ifd(
             null,
         ),
         .lens = try text_from_ifds(r, tag_lens_model, exif_ptr, ifd0, ifd),
+        .focal_length_mm = try fraction_from_ifds(
+            r,
+            tag_focal_length,
+            exif_ptr,
+            ifd0,
+            ifd,
+        ),
+        .aperture_f_number = try fraction_from_ifds(r, tag_f_number, exif_ptr, ifd0, ifd),
+        .focus_distance_m = try fraction_from_ifds(
+            r,
+            tag_subject_distance,
+            exif_ptr,
+            ifd0,
+            ifd,
+        ),
         .iso = try fraction_from_ifds(r, tag_iso_speed_ratings, exif_ptr, ifd0, ifd),
+        .effective_iso = (try fraction_from_ifds(r, tag_iso_speed, exif_ptr, ifd0, ifd)) orelse
+            (try fraction_from_ifds(
+                r,
+                tag_recommended_exposure_index,
+                exif_ptr,
+                ifd0,
+                ifd,
+            )),
+        .gain_mode = try integer_from_ifds(
+            r,
+            tag_sensitivity_type,
+            exif_ptr,
+            ifd0,
+        ),
         .capture_datetime = try capture_datetime_read(r, exif_ptr, ifd0),
         .capture_subsecond = try text_from_ifds(
             r,
@@ -749,10 +794,10 @@ fn matrix_from_ifds(
 fn integer_from_ifds(
     r: *const Reader,
     tag: u16,
-    first: *const Ifd,
-    second: *const Ifd,
+    first: ?*const Ifd,
+    second: ?*const Ifd,
 ) Error!?u16 {
-    const entry = first.find(tag) orelse second.find(tag) orelse return null;
+    const entry = entry_from_ifds(tag, first, second, null) orelse return null;
     if (entry.typ != type_short or entry.count != 1) return error.Corrupt;
     const value = try value_scalar(r, entry, 0);
     if (value > std.math.maxInt(u16)) return error.Corrupt;
